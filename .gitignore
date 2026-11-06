@@ -1,0 +1,43 @@
+# Node & Package Managers
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+package-lock.json
+
+# Python & uv (for Harness2 adapter / local runs)
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Local RAG & Runtime State (derived views & ephemeral runtime state)
+.harness/index/
+.harness/runtime/
+.harness/snapshots/*.lock.json
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.gguf
+
+# Harness2 raw execution scratch (keep curated library/ in VCS)
+runs/
+.harness/scratch/
+
+# Antigravity & OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.log
+.env
+.env.local
+runtime.json
+server_info.json
