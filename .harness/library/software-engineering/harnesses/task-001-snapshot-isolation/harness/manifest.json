@@ -1,0 +1,31 @@
+{
+  "harness_id": "harness-swe-001-snapshot-isolation",
+  "task_id": "task-001-snapshot-isolation",
+  "domain": "software-engineering",
+  "adopted_at": "2026-11-07T02:56:45Z",
+  "git_revision": "74bf28e",
+  "mode": "parallel",
+  "candidates_evaluated": 2,
+  "components": {
+    "system_prompts": "Enforce pre-plan retrieval from project-knowledge and experiment-knowledge before editing code.",
+    "rules": "plugin/harness-ide/rules/AGENTS.md",
+    "skills": [
+      "plugin/harness-ide/skills/harness2-loop/SKILL.md",
+      "plugin/harness-ide/skills/qmd-knowledge-lifecycle/SKILL.md"
+    ],
+    "subagents": [
+      "harness-proposer",
+      "harness-prober (Workspace: branch)",
+      "harness-composer"
+    ],
+    "hooks": {
+      "SessionStart": "Inject active constraints and INDEX.md cues",
+      "PreInvocation": "Enforce snapshot_id cutoff when probe lock is active",
+      "PostToolUse": "Record telemetry and incrementally refresh local RAG index"
+    },
+    "memory": {
+      "backend": "qmd-hybrid",
+      "strict_snapshot_isolation": true
+    }
+  }
+}

@@ -1,0 +1,80 @@
+{
+  "version": "1.0.0",
+  "rag": {
+    "primaryBackend": "qmd-hybrid",
+    "enableQmdCliIfAvailable": true,
+    "enableBuiltinLocalEngine": true,
+    "autoIndexOnChange": true,
+    "defaultSearchMode": "hybrid",
+    "defaultTopK": 8,
+    "rrfK": 60,
+    "collections": {
+      "project-knowledge": {
+        "path": ".harness/knowledge/project",
+        "description": "Current project requirements, architecture decisions (ADRs), setup instructions, and active constraints."
+      },
+      "experiment-knowledge": {
+        "path": ".harness/library",
+        "extraPaths": [".harness/knowledge/experiments"],
+        "description": "Harness2 INDEX.md catalogs, EXPERIENCE.md lessons, failure analyses, and adopted harness configurations."
+      },
+      "reference-knowledge": {
+        "path": ".harness/knowledge/reference",
+        "description": "Selected external documentation, research paper summaries, API notes, and hardware/technical references."
+      }
+    },
+    "optionalBackends": {
+      "basicMemory": {
+        "enabled": false,
+        "command": "uvx",
+        "args": ["basic-memory", "mcp"]
+      },
+      "ragflow": {
+        "enabled": false,
+        "baseUrl": "http://127.0.0.1:9380",
+        "apiKey": ""
+      }
+    }
+  },
+  "externalDocs": {
+    "context7": {
+      "enabled": true,
+      "serverUrl": "https://mcp.context7.com/mcp",
+      "apiKey": ""
+    },
+    "googleDeveloperKnowledge": {
+      "enabled": false,
+      "serverUrl": "https://developers.google.com/knowledge/mcp"
+    }
+  },
+  "harness2": {
+    "executionLevel": "native-antigravity-swarm",
+    "supportedExecutors": [
+      "native-antigravity-swarm",
+      "harness2-python-sdk-adapter",
+      "harness2-cli-opencode",
+      "harness2-cli-codex"
+    ],
+    "defaultMode": "parallel",
+    "defaultCandidatesK": 2,
+    "strictSnapshotIsolation": true,
+    "autoRecordExperiencePrompt": true,
+    "editableComponents": [
+      "system_prompts",
+      "rules",
+      "skills",
+      "subagents",
+      "hooks",
+      "tools",
+      "scripts",
+      "plugins"
+    ]
+  },
+  "uiMonitor": {
+    "pollIntervalMs": 2500,
+    "maxSubagentDepthAlert": 3,
+    "enablePrePlanningRagHook": true,
+    "enablePostToolTelemetryHook": true,
+    "themeMode": "auto"
+  }
+}
