@@ -15,7 +15,9 @@
       },
       "experiment-knowledge": {
         "path": ".harness/library",
-        "extraPaths": [".harness/knowledge/experiments"],
+        "extraPaths": [
+          ".harness/knowledge/experiments"
+        ],
         "description": "Harness2 INDEX.md catalogs, EXPERIENCE.md lessons, failure analyses, and adopted harness configurations."
       },
       "reference-knowledge": {
@@ -27,7 +29,10 @@
       "basicMemory": {
         "enabled": false,
         "command": "uvx",
-        "args": ["basic-memory", "mcp"]
+        "args": [
+          "basic-memory",
+          "mcp"
+        ]
       },
       "ragflow": {
         "enabled": false,
@@ -49,16 +54,16 @@
   },
   "harness2": {
     "executionLevel": "native-antigravity-swarm",
+    "defaultMode": "parallel",
+    "defaultCandidatesK": 2,
+    "strictSnapshotIsolation": true,
+    "autoRecordExperiencePrompt": true,
     "supportedExecutors": [
       "native-antigravity-swarm",
       "harness2-python-sdk-adapter",
       "harness2-cli-opencode",
       "harness2-cli-codex"
     ],
-    "defaultMode": "parallel",
-    "defaultCandidatesK": 2,
-    "strictSnapshotIsolation": true,
-    "autoRecordExperiencePrompt": true,
     "editableComponents": [
       "system_prompts",
       "rules",

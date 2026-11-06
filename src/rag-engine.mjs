@@ -788,7 +788,7 @@ export class HarnessKnowledgeEngine {
           combinedScore
         };
       })
-      .filter((item) => item.bm25 > 0 || item.vecScore > 0.05)
+      .filter((item) => item.bm25 > 0 || item.vecScore >= 0.18)
       .sort((a, bItem) => bItem.combinedScore - a.combinedScore)
       .slice(0, topK)
       .map((item) =>
