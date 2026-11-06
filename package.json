@@ -1,0 +1,20 @@
+{
+  "name": "harness2-rag-antigravity",
+  "version": "1.0.0",
+  "description": "Comprehensive Google Antigravity plugin and Auxiliary Pane UI Sidecar turning Antigravity into a Recursive Agent Harnessing IDE (Google Research Harness² + QMD Local Hybrid RAG + Context7 + Subagent Swarm Monitor).",
+  "type": "module",
+  "private": false,
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "setup": "node setup.mjs",
+    "uninstall": "node setup.mjs --uninstall",
+    "start:sidecar": "node sidecars/harness-ide-monitor/server.mjs",
+    "start:mcp": "node mcp/harness-rag-server.mjs",
+    "test": "node --test test/harness-ide.test.mjs"
+  },
+  "dependencies": {
+    "antigravity-sidecar-kit": "^1.4.0"
+  }
+}

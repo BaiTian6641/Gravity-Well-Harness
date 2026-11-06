@@ -1,0 +1,25 @@
+{
+  "name": "antigravity-harness-ide-monitor",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Harness² Swarm Monitor, Propose-Probe-Compose Studio, Local RAG Explorer, and Settings Manager sidecar for Google Antigravity.",
+  "license": "Apache-2.0",
+  "files": [
+    "sidecar.json",
+    "hub-manifest.json",
+    "launch.mjs",
+    "server.mjs",
+    "rag-engine.mjs",
+    "ui"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "antigravity-sidecar-kit": "^1.4.0"
+  },
+  "scripts": {
+    "start": "node launch.mjs",
+    "direct": "node server.mjs"
+  }
+}

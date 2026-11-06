@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Harness² Swarm &amp; RAG Monitor</title>
+  <script src="/preload.js"></script>
+  <link rel="stylesheet" href="/compiled_tailwind.css" />
+  <link rel="stylesheet" href="/shell.css" />
+  <link rel="stylesheet" href="/ui.css" />
+  <link rel="stylesheet" href="/styles.css" />
+  <script defer src="/shell.js"></script>
+  <script defer src="/ui.js"></script>
+</head>
+<body>
+  <div class="app-container">
+    <!-- Top Header -->
+    <header class="top-bar">
+      <div class="brand-row">
+        <div class="brand-badge">H²</div>
+        <div>
+          <h1 class="brand-title">Harness² Swarm &amp; Local RAG IDE</h1>
+          <p class="brand-subtitle" id="workspace-label">Connecting to workspace…</p>
+        </div>
+      </div>
+      <div class="header-badges">
+        <span class="pill-badge" id="snapshot-header-badge">Snapshot: Unlocked</span>
+        <span class="pill-badge pill-ok" id="rag-header-badge">RAG: 0 docs</span>
+        <button class="icon-btn" id="btn-manual-refresh" title="Refresh Dashboard State">↻ Refresh</button>
+      </div>
+    </header>
+
+    <!-- Navigation Tabs -->
+    <nav class="tab-nav" role="tablist">
+      <button class="tab-btn active" data-tab="swarm" role="tab">
+        <span>1. Swarm Monitor</span>
+      </button>
+      <button class="tab-btn" data-tab="harness2" role="tab">
+        <span>2. Harness² Studio</span>
+      </button>
+      <button class="tab-btn" data-tab="rag" role="tab">
+        <span>3. Local RAG Explorer</span>
+      </button>
+      <button class="tab-btn" data-tab="settings" role="tab">
+        <span>4. Settings</span>
+      </button>
+    </nav>
+
+    <!-- Toast Banner -->
+    <div id="toast-banner" class="toast-banner hidden"></div>
+
+    <!-- TAB 1: SWARM & MAIN AGENT MONITOR -->
+    <section id="tab-swarm" class="tab-panel active">
+      <!-- Main Agent Card -->
+      <div class="card card-highlight">
+        <div class="card-header">
+          <div>
+            <span class="eyebrow">ROOT ORCHESTRATOR</span>
+            <h2 class="card-title" id="main-agent-role">Main Orchestrator Agent (Antigravity)</h2>
+          </div>
+          <span class="status-chip status-active" id="main-agent-status">ACTIVE</span>
+        </div>
+        <div class="metrics-row">
+          <div class="metric-box">
+            <span class="metric-label">Model</span>
+            <span class="metric-val" id="main-agent-model">Gemini 4 Argon</span>
+          </div>
+          <div class="metric-box">
+            <span class="metric-label">Trajectory Steps</span>
+            <span class="metric-val" id="main-agent-steps">0</span>
+          </div>
+          <div class="metric-box">
+            <span class="metric-label">Spawned Subagents</span>
+            <span class="metric-val" id="main-agent-subcount">0</span>
+          </div>
+          <div class="metric-box">
+            <span class="metric-label">LS Bridge</span>
+            <span class="metric-val" id="main-agent-ls">Local + RPC</span>
+          </div>
+        </div>
+        <div class="prompt-preview" id="main-agent-prompt">Waiting for active conversation telemetry…</div>
+      </div>
+
+      <!-- Subagent Swarm Topology -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <span class="eyebrow">HARNESS² SUBAGENT SWARM TOPOLOGY</span>
+            <h3 class="card-title">Propose → Probe (Branched Workspaces) → Compose</h3>
+          </div>
+          <span class="muted-text" id="swarm-isolation-note">Workspace: branch + Snapshot Lock</span>
+        </div>
+        <div id="swarm-roles-grid" class="swarm-grid"></div>
+      </div>
+
+      <!-- Live Invoked Subagents (if any in session) -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <span class="eyebrow">SESSION SUBAGENT INVOCATIONS</span>
+            <h3 class="card-title">Live Dispatched Subagents</h3>
+          </div>
+        </div>
+        <div id="live-subagents-list" class="stack-list"></div>
+      </div>
+
+      <!-- Connected MCP Servers & Tool Feed -->
+      <div class="two-col">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <span class="eyebrow">TOOL PROVIDERS</span>
+              <h3 class="card-title">Active MCP Servers</h3>
+            </div>
+          </div>
+          <div id="mcp-servers-list" class="stack-list"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <span class="eyebrow">LIVE EXECUTION TRACE</span>
+              <h3 class="card-title">Recent Agent &amp; Swarm Tool Calls</h3>
+            </div>
+          </div>
+          <div id="recent-events-list" class="stack-list scroll-box"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 2: HARNESS² PROPOSE-PROBE-COMPOSE STUDIO -->
+    <section id="tab-harness2" class="tab-panel">
+      <!-- Snapshot Isolation Lock Controller -->
+      <div class="card card-highlight">
+        <div class="card-header">
+          <div>
+            <span class="eyebrow">CONSISTENT CANDIDATE COMPARISONS</span>
+            <h2 class="card-title">Harness² Snapshot Isolation Lock</h2>
+          </div>
+          <span class="status-chip" id="studio-lock-badge">UNLOCKED</span>
+        </div>
+        <p class="help-text">
+          During a comparison of <em>K</em> candidate harnesses (<code>Propose → Probe → Compose</code>), locking a snapshot guarantees every candidate reads the exact same historical knowledge cutoff without cross-candidate contamination.
+        </p>
+        <div id="active-lock-details" class="lock-details-box"></div>
+        <div class="controls-row">
+          <input type="text" id="snap-domain-input" class="input-field" value="software-engineering" placeholder="Domain (e.g. software-engineering)" />
+          <select id="snap-mode-select" class="input-field select-compact">
+            <option value="parallel">Parallel Swarm</option>
+            <option value="sequential">Sequential</option>
+          </select>
+          <input type="number" id="snap-k-input" class="input-field input-tiny" value="2" min="1" max="6" title="Candidate count K" />
+          <button class="btn btn-primary" id="btn-lock-snapshot">🔒 Freeze Snapshot for Probe</button>
+          <button class="btn btn-secondary" id="btn-release-snapshot">🔓 Release Lock</button>
+        </div>
+      </div>
+
+      <!-- Per-Domain Experience Library (INDEX.md & EXPERIENCE.md) -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <span class="eyebrow">PER-DOMAIN EXPERIENCE LIBRARY (.harness/library/)</span>
+            <h3 class="card-title">Adopted Harness² Lessons (INDEX.md &amp; EXPERIENCE.md)</h3>
+          </div>
+        </div>
+        <div id="experiences-list" class="stack-list"></div>
+      </div>
+
+      <!-- Record New Harness² Experience Lesson -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <span class="eyebrow">RECORD EMPIRICAL PROVENANCE</span>
+            <h3 class="card-title">Save New Harness² Experience Lesson (EXPERIENCE.md)</h3>
+          </div>
+        </div>
+        <div class="form-grid">
+          <div>
+            <label class="field-label">Task ID *</label>
+            <input type="text" id="exp-task-id" class="input-field" placeholder="e.g. task-002-subagent-retry" />
+          </div>
+          <div>
+            <label class="field-label">Domain *</label>
+            <input type="text" id="exp-domain" class="input-field" value="software-engineering" />
+          </div>
+          <div class="full-span">
+            <label class="field-label">Title *</label>
+            <input type="text" id="exp-title" class="input-field" placeholder="e.g. EXPERIENCE: Enforcing Retry Backoff in Branched Subagents" />
+          </div>
+          <div class="full-span">
+            <label class="field-label">INDEX.md Conditional Cue ("When...") *</label>
+            <input type="text" id="exp-cue" class="input-field" placeholder="When a prober subagent encounters transient RPC timeouts, apply exponential backoff..." />
+          </div>
+          <div class="full-span">
+            <label class="field-label">1. What Task or Problem Produced It? *</label>
+            <textarea id="exp-problem" class="input-field textarea-compact" rows="2" placeholder="Describe the task, bottleneck, or failure condition..."></textarea>
+          </div>
+          <div class="full-span">
+            <label class="field-label">3. What Was Actually Observed Across Probes? *</label>
+            <textarea id="exp-observed" class="input-field textarea-compact" rows="2" placeholder="Contrast baseline behavior vs. candidate harness behavior with metrics..."></textarea>
+          </div>
+          <div>
+            <label class="field-label">4. Supporting Evidence Paths (comma-separated)</label>
+            <input type="text" id="exp-evidence" class="input-field" placeholder="test/harness-ide.test.mjs, docs/ARCHITECTURE.md" />
+          </div>
+          <div>
+            <label class="field-label">5. Currency Status</label>
+            <select id="exp-status" class="input-field">
+              <option value="active">active (Verified &amp; Adopted — Adds to INDEX.md)</option>
+              <option value="candidate">candidate (Unverified Probe Note — Hidden during Snapshot Lock)</option>
+              <option value="superseded">superseded (Historical Only)</option>
+            </select>
+          </div>
+          <div class="full-span actions-right">
+            <button class="btn btn-primary" id="btn-record-experience">💾 Record EXPERIENCE.md &amp; Update INDEX.md</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 3: LOCAL RAG & KNOWLEDGE EXPLORER -->
+    <section id="tab-rag" class="tab-panel">
+      <!-- Collection Health Summary -->
+      <div class="three-col" id="rag-collections-cards"></div>
+
+      <!-- Search Card -->
+      <div class="card card-highlight">
+        <div class="card-header">
+          <div>
+            <span class="eyebrow">QMD + BUILT-IN LOCAL HYBRID SEARCH (BM25 + VECTOR + RRF)</span>
+            <h2 class="card-title">Search Local Project &amp; Experiment Knowledge</h2>
+          </div>
+          <button class="btn btn-secondary" id="btn-reindex-rag">⚡ Re-Index &amp; Embed Now</button>
+        </div>
+        <div class="search-bar-row">
+          <input type="text" id="rag-query-input" class="input-field search-input" placeholder="Ask a question or search keywords (e.g., What evidence supported our memory architecture?)…" />
+          <select id="rag-mode-select" class="input-field select-compact">
+            <option value="hybrid">Hybrid (BM25 + Vector RRF)</option>
+            <option value="lex">Lexical (BM25)</option>
+            <option value="vec">Semantic (Dense Vector)</option>
+          </select>
+          <select id="rag-collection-select" class="input-field select-compact">
+            <option value="all">All Collections</option>
+            <option value="project-knowledge">Current Project Knowledge</option>
+            <option value="experiment-knowledge">Experiment Knowledge (Harness²)</option>
+            <option value="reference-knowledge">Reference Knowledge</option>
+          </select>
+          <button class="btn btn-primary" id="btn-run-search">Search</button>
+        </div>
+
+        <!-- Preset Benchmark Query Chips -->
+        <div class="preset-chips">
+          <span class="muted-text">Benchmark Queries:</span>
+          <button class="chip-btn" data-preset="What evidence supported our previous choice of memory architecture?">Memory Architecture Evidence</button>
+          <button class="chip-btn" data-preset="Which approaches failed in earlier training experiments, and under what conditions?">Failed Training Experiments</button>
+          <button class="chip-btn" data-preset="What constraints did we establish for the Android frontend and Linux backend?">Android &amp; Linux Constraints</button>
+          <button class="chip-btn" data-preset="Which earlier harness change helped with this type of task?">Helpful Harness² Changes</button>
+        </div>
+
+        <div id="rag-search-meta" class="muted-text" style="margin-top: 8px;"></div>
+        <div id="rag-results-list" class="stack-list" style="margin-top: 10px;"></div>
+      </div>
+
+      <!-- Document Reader Drawer -->
+      <div id="doc-viewer-card" class="card hidden">
+        <div class="card-header">
+          <div>
+            <span class="eyebrow" id="viewer-doc-meta">DOCUMENT SOURCE &amp; PROVENANCE</span>
+            <h3 class="card-title" id="viewer-doc-title">Document Title</h3>
+          </div>
+          <button class="btn btn-secondary" id="btn-close-viewer">✕ Close</button>
+        </div>
+        <pre id="viewer-doc-content" class="code-viewer"></pre>
+      </div>
+
+      <!-- Quick Add Markdown Knowledge Note -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <span class="eyebrow">CURATE VERSIONED MARKDOWN</span>
+            <h3 class="card-title">Add Project ADR / Reference Note</h3>
+          </div>
+        </div>
+        <div class="form-grid">
+          <div>
+            <label class="field-label">Target Collection</label>
+            <select id="note-collection" class="input-field">
+              <option value="project-knowledge">project-knowledge (.harness/knowledge/project)</option>
+              <option value="reference-knowledge">reference-knowledge (.harness/knowledge/reference)</option>
+              <option value="experiment-knowledge">experiment-knowledge (.harness/knowledge/experiments)</option>
+            </select>
+          </div>
+          <div>
+            <label class="field-label">Filename (.md)</label>
+            <input type="text" id="note-filename" class="input-field" placeholder="e.g. ADR-002-api-contract.md" />
+          </div>
+          <div class="full-span">
+            <label class="field-label">Title</label>
+            <input type="text" id="note-title" class="input-field" placeholder="e.g. ADR-002: Android &amp; Linux API Contract" />
+          </div>
+          <div>
+            <label class="field-label">Domain</label>
+            <input type="text" id="note-domain" class="input-field" value="architecture" />
+          </div>
+          <div>
+            <label class="field-label">Tags (comma-separated)</label>
+            <input type="text" id="note-tags" class="input-field" value="adr, architecture, constraints" />
+          </div>
+          <div class="full-span">
+            <label class="field-label">Markdown Content</label>
+            <textarea id="note-content" class="input-field textarea-compact" rows="4" placeholder="Write decision rationale, constraints, and supporting evidence..."></textarea>
+          </div>
+          <div class="full-span actions-right">
+            <button class="btn btn-primary" id="btn-save-note">➕ Save Markdown Note &amp; Refresh Index</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 4: EASY-TO-UNDERSTAND VISUAL SETTINGS MANAGER -->
+    <section id="tab-settings" class="tab-panel">
+      <div class="card card-highlight">
+        <div class="card-header">
+          <div>
+            <span class="eyebrow">LOCAL-FIRST CONFIGURATION (.harness/config.json)</span>
+            <h2 class="card-title">Easy-to-Understand Harness² &amp; RAG Settings</h2>
+          </div>
+          <button class="btn btn-primary" id="btn-save-settings">💾 Save All Settings</button>
+        </div>
+        <p class="help-text">
+          All settings are stored locally on your machine (<code>.harness/config.json</code> &amp; <code>~/.gemini/config/harness-ide-settings.json</code>) and automatically update your plugin's MCP wiring.
+        </p>
+      </div>
+
+      <!-- 1. Local RAG Backend Settings -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <span class="eyebrow">1. LOCAL KNOWLEDGE &amp; RAG LAYER</span>
+            <h3 class="card-title">Primary Retrieval Engine &amp; Indexing</h3>
+          </div>
+        </div>
+        <div class="settings-list">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">Primary Local Knowledge Backend</div>
+              <div class="setting-desc">
+                <strong>QMD + Built-in Hybrid</strong> indexes versioned Markdown &amp; Harness² <code>EXPERIENCE.md</code> files locally. Switch to <strong>Basic Memory</strong> for an actively linked notebook, or <strong>RAGFlow</strong> when ingesting heavy PDFs/hardware manuals.
+              </div>
+            </div>
+            <select id="set-rag-backend" class="input-field select-medium">
+              <option value="qmd-hybrid">QMD + Built-in Local Hybrid (Recommended)</option>
+              <option value="builtin-local">Built-in Zero-Dep Hybrid Only (SQLite/BM25+Vec)</option>
+              <option value="basic-memory">Basic Memory (Editable Notebook MCP)</option>
+              <option value="ragflow">RAGFlow (PDFs &amp; Hardware Manuals Backend)</option>
+            </select>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">Auto-Refresh RAG Index on File Save</div>
+              <div class="setting-desc">Automatically rebuilds the local search index whenever Markdown notes or <code>EXPERIENCE.md</code> files change.</div>
+            </div>
+            <input type="checkbox" id="set-auto-index" class="toggle-checkbox" checked />
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">Sync with QMD CLI When Installed (<code>tobi/qmd</code>)</div>
+              <div class="setting-desc">Runs <code>qmd update</code> alongside the built-in hybrid indexer when <code>qmd</code> is found on PATH.</div>
+            </div>
+            <input type="checkbox" id="set-qmd-cli" class="toggle-checkbox" checked />
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">Enable Basic Memory Companion MCP</div>
+              <div class="setting-desc">Adds <code>basic-memory mcp</code> to the plugin's MCP servers for bidirectional note linking.</div>
+            </div>
+            <input type="checkbox" id="set-basic-memory" class="toggle-checkbox" />
+          </div>
+        </div>
+      </div>
+
+      <!-- 2. External Documentation MCP Settings -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <span class="eyebrow">2. CURRENT EXTERNAL DOCUMENTATION</span>
+            <h3 class="card-title">Context7 &amp; Google Developer Knowledge</h3>
+          </div>
+        </div>
+        <div class="settings-list">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">Enable Context7 MCP (<code>mcp.context7.com</code>)</div>
+              <div class="setting-desc">Fetches up-to-date, version-specific documentation and code examples for external libraries and frameworks.</div>
+            </div>
+            <input type="checkbox" id="set-context7-enabled" class="toggle-checkbox" checked />
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">Context7 API Key (Optional)</div>
+              <div class="setting-desc">Optional Bearer token from context7.com/dashboard for higher rate limits (stored locally only).</div>
+            </div>
+            <input type="password" id="set-context7-key" class="input-field select-medium" placeholder="Optional API key…" />
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">Enable Google Developer Knowledge MCP</div>
+              <div class="setting-desc">Connects <code>https://developers.google.com/knowledge/mcp</code> for official Android, Firebase, and Google Cloud documentation.</div>
+            </div>
+            <input type="checkbox" id="set-google-dev-enabled" class="toggle-checkbox" />
+          </div>
+        </div>
+      </div>
+
+      <!-- 3. Harness² Engine & Snapshot Isolation Settings -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <span class="eyebrow">3. GOOGLE RESEARCH HARNESS² CONFIGURATION</span>
+            <h3 class="card-title">Propose–Probe–Compose &amp; Snapshot Isolation</h3>
+          </div>
+        </div>
+        <div class="settings-list">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">Harness² Execution Integration Level</div>
+              <div class="setting-desc">Choose whether Antigravity executes candidate probes directly via branched subagent swarms or delegates to the Python <code>AntigravityExecutor</code> / upstream <code>harness2</code> CLI.</div>
+            </div>
+            <select id="set-h2-level" class="input-field select-medium">
+              <option value="native-antigravity-swarm">Native Antigravity Branched Subagent Swarm</option>
+              <option value="harness2-python-sdk-adapter">Python AntigravityExecutor Adapter</option>
+              <option value="harness2-cli-opencode">Upstream Harness² CLI (OpenCode/Codex)</option>
+            </select>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">Strict Snapshot Isolation During Candidate Probes</div>
+              <div class="setting-desc">Guarantees that during a comparison of <em>K</em> candidate harnesses, later candidates cannot read notes written during earlier candidates' execution.</div>
+            </div>
+            <input type="checkbox" id="set-strict-snapshot" class="toggle-checkbox" checked />
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">Default Recursion Mode &amp; Candidate Count (<em>K</em>)</div>
+              <div class="setting-desc">Parallel explores <em>K</em> candidates concurrently in branched workspaces; Sequential refines through <em>K</em> steps.</div>
+            </div>
+            <div class="inline-pair">
+              <select id="set-h2-mode" class="input-field select-compact">
+                <option value="parallel">Parallel</option>
+                <option value="sequential">Sequential</option>
+              </select>
+              <input type="number" id="set-h2-k" class="input-field input-tiny" value="2" min="1" max="6" />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 4. Lifecycle Hooks & Monitor Settings -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <span class="eyebrow">4. LIFECYCLE HOOKS &amp; SWARM TELEMETRY</span>
+            <h3 class="card-title">Automated Context Injection &amp; UI Polling</h3>
+          </div>
+        </div>
+        <div class="settings-list">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">Pre-Planning RAG Context Hook (<code>SessionStart</code>)</div>
+              <div class="setting-desc">Injects active local knowledge counts and Snapshot Isolation lock status at session start.</div>
+            </div>
+            <input type="checkbox" id="set-hook-preplan" class="toggle-checkbox" checked />
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">Live Swarm Telemetry Hook (<code>PostToolUse</code>)</div>
+              <div class="setting-desc">Streams subagent invocations and tool execution events to the Swarm Monitor in real time.</div>
+            </div>
+            <input type="checkbox" id="set-hook-telemetry" class="toggle-checkbox" checked />
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
