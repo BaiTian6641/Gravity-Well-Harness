@@ -580,7 +580,11 @@ export class HarnessKnowledgeEngine {
       .toUpperCase()}`;
 
     const eligibleDocIds = index.documents
-      .filter((d) => d.status !== 'candidate' && d.created_at <= cutoff)
+      .filter((d) => {
+        if (d.status === 'candidate') return false;
+        if (cutoffTimestamp && d.created_at > cutoffTimestamp) return false;
+        return true;
+      })
       .map((d) => d.docid);
 
     const lockPayload = {
@@ -662,8 +666,8 @@ export class HarnessKnowledgeEngine {
       return true;
     }
     if (doc.status === 'candidate') return false;
-    if (Array.isArray(snapLock.eligibleDocIds) && !snapLock.eligibleDocIds.includes(doc.docid)) {
-      return false;
+    if (Array.isArray(snapLock.eligibleDocIds)) {
+      return snapLock.eligibleDocIds.includes(doc.docid);
     }
     if (snapLock.cutoffTimestamp && doc.created_at > snapLock.cutoffTimestamp) {
       return false;

@@ -1,0 +1,15 @@
+{
+  "name": "harness-ide",
+  "displayName": "Harness² & Local RAG IDE",
+  "version": "1.0.0",
+  "description": "Transforms Antigravity into a Recursive Agent Harnessing IDE with Google Research Harness² (Propose-Probe-Compose), QMD Local Hybrid RAG, Snapshot Isolation, Context7 external docs, and a live Subagent Swarm Monitor UI Sidecar.",
+  "author": {
+    "name": "Harness2-RAG-Antigravity"
+  },
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Run a Harness² Propose-Probe-Compose loop (K=2 parallel branched subagents) to optimize our current workflow",
+    "Search our local project and experiment knowledge for prior architecture decisions and failed approaches",
+    "Open the Harness² Swarm & RAG Monitor sidecar and check our knowledge collection status"
+  ]
+}
