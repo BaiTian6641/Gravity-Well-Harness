@@ -222,10 +222,10 @@ test('5. Auxiliary Pane UI Sidecar Server responds on /, /api/status, /api/dashb
   }
 });
 
-test('6. Python AntigravityExecutor adapter completes Propose-Probe-Compose self-test', () => {
+test('6. Python AntigravityExecutor adapter completes Propose-Probe-Compose self-test across reasoning depths', () => {
   const pyRes = spawnSync(
     'python',
-    [path.join(REPO_ROOT, 'adapters', 'harness2_antigravity_executor.py'), '--self-test'],
+    [path.join(REPO_ROOT, 'adapters', 'harness2_antigravity_executor.py'), '--reasoning-depth', 'balanced', '--self-test'],
     {
       cwd: REPO_ROOT,
       encoding: 'utf8',
@@ -236,4 +236,118 @@ test('6. Python AntigravityExecutor adapter completes Propose-Probe-Compose self
   const out = JSON.parse(pyRes.stdout.trim());
   assert.equal(out.winner.candidate_id, 'candidate-2-harness2-rag-branched');
   assert.equal(out.winner.passed_verification, true);
+  assert.equal(out.reasoningProfile.reasoning_depth, 'balanced');
+  assert.equal(out.reasoningProfile.thinking_budget_tokens, 2048);
+  assert.ok(out.tokenEfficiency.totalTokensSaved > 0);
+  assert.ok(out.tokenEfficiency.totalTokensSavedPct >= 40);
+
+  const ecoRes = spawnSync(
+    'python',
+    [path.join(REPO_ROOT, 'adapters', 'harness2_antigravity_executor.py'), '--reasoning-depth', 'eco', '--self-test'],
+    {
+      cwd: REPO_ROOT,
+      encoding: 'utf8',
+      timeout: 15000,
+    }
+  );
+  assert.equal(ecoRes.status, 0, `Python adapter eco failed: ${ecoRes.stderr}`);
+  const ecoOut = JSON.parse(ecoRes.stdout.trim());
+  assert.equal(ecoOut.reasoningProfile.reasoning_depth, 'eco');
+  assert.equal(ecoOut.reasoningProfile.thinking_budget_tokens, 1024);
+  assert.ok(
+    ecoOut.tokenEfficiency.totalActualTokens < out.tokenEfficiency.totalActualTokens,
+    'Eco reasoning depth must use fewer tokens than balanced'
+  );
+});
+
+test('7. Google Harness2 end-to-end Propose-Probe-Compose loop & Adaptive Reasoning Depth token efficiency', async () => {
+  const engine = new HarnessKnowledgeEngine(REPO_ROOT);
+
+  // Run Eco, Balanced, and Deep without writing permanent library entries during comparison
+  const ecoRun = engine.runHarness2Loop({
+    taskId: 'test-harness2-eco',
+    domain: 'software-engineering',
+    problem: 'Optimize agent harness with bounded reasoning depth and snapshot isolation',
+    k: 3,
+    mode: 'parallel',
+    reasoningDepth: 'eco',
+    earlyStopOnFirstPass: false,
+    adoptWinner: false,
+  });
+
+  const balancedRun = engine.runHarness2Loop({
+    taskId: 'test-harness2-balanced',
+    domain: 'software-engineering',
+    problem: 'Optimize agent harness with bounded reasoning depth and snapshot isolation',
+    k: 3,
+    mode: 'parallel',
+    reasoningDepth: 'balanced',
+    earlyStopOnFirstPass: false,
+    adoptWinner: false,
+  });
+
+  const deepRun = engine.runHarness2Loop({
+    taskId: 'test-harness2-deep',
+    domain: 'software-engineering',
+    problem: 'Optimize agent harness with bounded reasoning depth and snapshot isolation',
+    k: 3,
+    mode: 'parallel',
+    reasoningDepth: 'deep',
+    earlyStopOnFirstPass: false,
+    adoptWinner: false,
+  });
+
+  assert.equal(ecoRun.ok, true);
+  assert.equal(balancedRun.ok, true);
+  assert.equal(deepRun.ok, true);
+
+  // Verify two-front proposals (Invariant + Domain-Specific + Hybrid)
+  assert.equal(balancedRun.proposals.length, 3);
+  assert.equal(balancedRun.proposals[0].front, 'invariant');
+  assert.equal(balancedRun.proposals[1].front, 'domain-specific');
+  assert.equal(balancedRun.proposals[2].front, 'hybrid');
+
+  // Verify strict token ordering: eco < balanced < deep
+  assert.ok(
+    ecoRun.tokenEfficiency.totalActualTokens < balancedRun.tokenEfficiency.totalActualTokens,
+    `Expected eco (${ecoRun.tokenEfficiency.totalActualTokens}) < balanced (${balancedRun.tokenEfficiency.totalActualTokens})`
+  );
+  assert.ok(
+    balancedRun.tokenEfficiency.totalActualTokens < deepRun.tokenEfficiency.totalActualTokens,
+    `Expected balanced (${balancedRun.tokenEfficiency.totalActualTokens}) < deep (${deepRun.tokenEfficiency.totalActualTokens})`
+  );
+  assert.ok(balancedRun.tokenEfficiency.totalTokensSavedPct >= 45);
+
+  // Verify sequential mode with earlyStopOnFirstPass skips remaining candidates once verified
+  const seqEarlyRun = engine.runHarness2Loop({
+    taskId: 'test-harness2-seq-early',
+    domain: 'software-engineering',
+    problem: 'Verify sequential early-stop on first passing candidate',
+    k: 3,
+    mode: 'sequential',
+    reasoningDepth: 'balanced',
+    earlyStopOnFirstPass: true,
+    adoptWinner: false,
+  });
+  assert.equal(seqEarlyRun.tokenEfficiency.earlyStopped, true);
+  assert.ok(seqEarlyRun.trajectories.some((t) => t.earlyStopped === true));
+
+  // Verify snapshot lock was cleanly released after runHarness2Loop
+  assert.equal(engine.getActiveSnapshotLock(), null);
+
+  // Verify MCP tool harness_run_loop
+  const mcpLoop = await handleToolCall('harness_run_loop', {
+    workspace_root: REPO_ROOT,
+    task_id: 'test-mcp-harness2-loop',
+    domain: 'software-engineering',
+    problem: 'Validate MCP harness_run_loop tool with balanced reasoning depth',
+    k: 3,
+    mode: 'sequential',
+    reasoning_depth: 'balanced',
+    early_stop: true,
+    record_to_library: false,
+  });
+  assert.equal(mcpLoop.ok, true);
+  assert.equal(mcpLoop.reasoningProfile.reasoningDepth, 'balanced');
+  assert.ok(mcpLoop.winner.score >= 0.85);
 });

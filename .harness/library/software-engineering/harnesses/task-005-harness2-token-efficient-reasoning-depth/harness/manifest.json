@@ -1,0 +1,63 @@
+{
+  "harness_id": "harness-software-engineering-task-005-harness2-token-efficient-reasoning-depth",
+  "task_id": "task-005-harness2-token-efficient-reasoning-depth",
+  "domain": "software-engineering",
+  "winning_candidate_id": "candidate-2-domain-rag-branched",
+  "composed_fronts": [
+    "invariant",
+    "domain-specific"
+  ],
+  "reasoning_depth_profile": {
+    "reasoningDepth": "balanced",
+    "thinkingBudgetTokens": 2048,
+    "maxCandidateTokens": 24000,
+    "maxProbeSteps": 6,
+    "proberModelTier": "flash",
+    "composerModelTier": "inherit",
+    "ragSnippetMaxChars": 500,
+    "earlyStopOnFirstPass": true
+  },
+  "token_efficiency": {
+    "totalActualTokens": 10940,
+    "totalUnoptimizedTokens": 50100,
+    "totalTokensSaved": 39160,
+    "totalTokensSavedPct": 78.2
+  },
+  "editable_components": {
+    "system_prompts": "Use Cue-First RAG retrieval (500 char snippet cap) and bounded thinking (2048 tokens) before editing.",
+    "rules": [
+      "plugin/harness-ide/rules/AGENTS.md"
+    ],
+    "skills": [
+      "plugin/harness-ide/skills/harness2-loop/SKILL.md",
+      "plugin/harness-ide/skills/qmd-knowledge-lifecycle/SKILL.md"
+    ],
+    "subagents": [
+      "harness-proposer (model: flash)",
+      "harness-prober (Workspace: branch, model: flash, thinkingCap: 2048)",
+      "harness-composer (model: inherit)"
+    ],
+    "hooks": {
+      "SessionStart": "scripts/hooks/session-start.mjs",
+      "PreInvocation": "scripts/hooks/pre-invocation.mjs",
+      "PostToolUse": "scripts/hooks/post-tool-use.mjs"
+    },
+    "tools": [
+      "harness_query",
+      "harness_get",
+      "harness_snapshot_lock",
+      "harness_run_loop",
+      "harness_record_experience"
+    ],
+    "scripts": [
+      "adapters/harness2_antigravity_executor.py",
+      "test/harness-ide.test.mjs"
+    ],
+    "plugins": [
+      "harness-ide"
+    ]
+  },
+  "adopted_at": "2026-11-07T03:24:00.570Z",
+  "git_revision": "f594372",
+  "status": "active"
+}

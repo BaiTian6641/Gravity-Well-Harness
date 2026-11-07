@@ -32,3 +32,7 @@ Tasks within `software-engineering` execute in order and may read only earlier `
 - **[task-004-realtime-telemetry-and-hot-reload](./harnesses/task-004-realtime-telemetry-and-hot-reload/EXPERIENCE.md)** (`2026-11-07T03:03:31.034Z`, `status: active`)
   - **Cue**: *When Auxiliary Pane sidecar statistics appear frozen or fail to update after setup.mjs, ensure apiFetch injects X-Sidecar-Token from script src token fallback, format compact tokens with 3 decimals (>=5M) and seconds on multi-hour durations, advance all RUNNING nodes and context analytics via a 1s wall-clock ticker, and use a zero-downtime /api/reload + launcher retry loop.*
   - **Adopted Harness**: [`./harnesses/task-004-realtime-telemetry-and-hot-reload/harness/manifest.json`](./harnesses/task-004-realtime-telemetry-and-hot-reload/harness/manifest.json)
+
+- **[task-005-harness2-token-efficient-reasoning-depth](./harnesses/task-005-harness2-token-efficient-reasoning-depth/EXPERIENCE.md)** (`2026-11-07T03:24:00.721Z`, `status: active`)
+  - **Cue**: *When tackling 'Validate Google Research Harness2 Propose-Probe-Compose loop with Adaptive Reasoning Depth' in 'software-engineering', use candidate-2-domain-rag-branched with balanced reasoning depth (thinkingCap=2048, model=flash, Workspace=branch) to achieve score=0.95 while saving 78.2% tokens.*
+  - **Adopted Harness**: [`./harnesses/task-005-harness2-token-efficient-reasoning-depth/harness/manifest.json`](./harnesses/task-005-harness2-token-efficient-reasoning-depth/harness/manifest.json)

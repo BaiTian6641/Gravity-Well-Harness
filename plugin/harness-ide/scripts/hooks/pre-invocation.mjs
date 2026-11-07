@@ -26,9 +26,10 @@ function main() {
   try {
     const engine = new HarnessKnowledgeEngine(workspaceRoot);
     const snapLock = engine.getActiveSnapshotLock();
+    const profile = engine.resolveReasoningProfile();
 
     if (snapLock && snapLock.active) {
-      const warning = `[Harness² Snapshot Isolation Guard] Active Snapshot Lock '${snapLock.snapshotId}' (cutoff: ${snapLock.cutoffTimestamp}, domain: ${snapLock.domain}, K=${snapLock.k} ${snapLock.mode}). During candidate probing, all RAG queries are automatically locked to this snapshot. Do NOT promote notes to 'status: active' until Compose finishes.`;
+      const warning = `[Harness² Snapshot Isolation & Token Guardrail] Active Snapshot Lock '${snapLock.snapshotId}' (cutoff: ${snapLock.cutoffTimestamp}, domain: ${snapLock.domain}, K=${snapLock.k} ${snapLock.mode}) | Reasoning Depth: '${profile.reasoningDepth}' (thinkingCap=${profile.thinkingBudgetTokens}, proberModel=${profile.proberModelTier}, maxSteps=${profile.maxProbeSteps}). All RAG queries are locked to this snapshot. Do NOT promote notes to 'status: active' until Compose finishes.`;
       process.stdout.write(
         JSON.stringify({
           injectSteps: [

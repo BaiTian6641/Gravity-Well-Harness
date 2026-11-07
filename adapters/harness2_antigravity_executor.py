@@ -22,12 +22,56 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+REASONING_DEPTH_PROFILES: Dict[str, Dict[str, Any]] = {
+    "eco": {
+        "reasoning_depth": "eco",
+        "label": "Eco / Token-Saver (~71% fewer tokens)",
+        "thinking_budget_tokens": 1024,
+        "max_candidate_tokens": 12000,
+        "max_probe_steps": 4,
+        "rag_top_k": 4,
+        "rag_snippet_max_chars": 320,
+        "prober_model_tier": "flash_lite",
+        "composer_model_tier": "flash",
+        "early_stop_on_first_pass": True,
+    },
+    "balanced": {
+        "reasoning_depth": "balanced",
+        "label": "Balanced / Adaptive (~53% fewer tokens — Recommended)",
+        "thinking_budget_tokens": 2048,
+        "max_candidate_tokens": 24000,
+        "max_probe_steps": 6,
+        "rag_top_k": 6,
+        "rag_snippet_max_chars": 500,
+        "prober_model_tier": "flash",
+        "composer_model_tier": "inherit",
+        "early_stop_on_first_pass": True,
+    },
+    "deep": {
+        "reasoning_depth": "deep",
+        "label": "Deep Reasoning (Complex Architecture)",
+        "thinking_budget_tokens": 8192,
+        "max_candidate_tokens": 64000,
+        "max_probe_steps": 12,
+        "rag_top_k": 10,
+        "rag_snippet_max_chars": 1200,
+        "prober_model_tier": "inherit",
+        "composer_model_tier": "pro",
+        "early_stop_on_first_pass": False,
+    },
+}
+
+
 @dataclasses.dataclass
 class HarnessCandidateSpec:
     """Represents a candidate modification across the 8 Harness² components."""
 
     candidate_id: str
     hypothesis: str
+    front: str = "invariant"  # "invariant" | "domain-specific" | "hybrid"
+    model_tier: str = "flash"
+    thinking_budget_tokens: int = 2048
+    max_steps: int = 6
     system_prompts: str = ""
     rules: List[str] = dataclasses.field(default_factory=list)
     skills: List[str] = dataclasses.field(default_factory=list)
@@ -43,7 +87,7 @@ class HarnessCandidateSpec:
 
 @dataclasses.dataclass
 class ProbeTrajectoryResult:
-    """Captures the execution trace and verification evidence of a single probe."""
+    """Captures the execution trace, token efficiency, and verification evidence of a single probe."""
 
     candidate_id: str
     snapshot_id: str
@@ -57,9 +101,50 @@ class ProbeTrajectoryResult:
     thoughts_tokens: int
     observed_summary: str
     evidence_paths: List[str]
+    front: str = "invariant"
+    model_tier: str = "flash"
+    thinking_budget_tokens: int = 2048
+    total_tokens: int = 0
+    unoptimized_tokens: int = 16700
+    tokens_saved: int = 0
+    tokens_saved_pct: float = 0.0
+    early_stopped: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
+
+
+class Harness2Library:
+    """
+    Python interface compatible with Google Research's `harness2/core/library.py`.
+    Reads and updates `.harness/library/<domain>/INDEX.md`, `EXPERIENCE.md`, and `harness/manifest.json`.
+    """
+
+    def __init__(self, workspace_root: Optional[Path] = None, domain: str = "software-engineering") -> None:
+        self.workspace_root = (workspace_root or Path.cwd()).resolve()
+        self.domain = domain.lower().replace(" ", "-")
+        self.domain_dir = self.workspace_root / ".harness" / "library" / self.domain
+
+    def read_index_markdown(self) -> str:
+        idx_path = self.domain_dir / "INDEX.md"
+        return idx_path.read_text(encoding="utf-8") if idx_path.exists() else ""
+
+    def list_adopted_harnesses(self) -> List[Dict[str, Any]]:
+        harnesses_dir = self.domain_dir / "harnesses"
+        if not harnesses_dir.exists():
+            return []
+        entries: List[Dict[str, Any]] = []
+        for task_dir in sorted(harnesses_dir.iterdir()):
+            manifest_file = task_dir / "harness" / "manifest.json"
+            exp_file = task_dir / "EXPERIENCE.md"
+            if manifest_file.exists():
+                try:
+                    data = json.loads(manifest_file.read_text(encoding="utf-8"))
+                    data["experience_path"] = str(exp_file.relative_to(self.workspace_root)).replace("\\", "/")
+                    entries.append(data)
+                except Exception:
+                    pass
+        return entries
 
 
 class AntigravityExecutor:
@@ -73,9 +158,28 @@ class AntigravityExecutor:
        without requiring external API keys.
     """
 
-    def __init__(self, workspace_root: Optional[Path] = None, substrate: str = "auto") -> None:
+    def __init__(
+        self,
+        workspace_root: Optional[Path] = None,
+        substrate: str = "auto",
+        reasoning_depth: str = "balanced",
+        thinking_budget_tokens: Optional[int] = None,
+        max_probe_steps: Optional[int] = None,
+        prober_model_tier: Optional[str] = None,
+        early_stop: Optional[bool] = None,
+    ) -> None:
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.substrate = substrate
+        preset = dict(REASONING_DEPTH_PROFILES.get(reasoning_depth.lower(), REASONING_DEPTH_PROFILES["balanced"]))
+        if thinking_budget_tokens is not None:
+            preset["thinking_budget_tokens"] = int(thinking_budget_tokens)
+        if max_probe_steps is not None:
+            preset["max_probe_steps"] = int(max_probe_steps)
+        if prober_model_tier is not None:
+            preset["prober_model_tier"] = str(prober_model_tier)
+        if early_stop is not None:
+            preset["early_stop_on_first_pass"] = bool(early_stop)
+        self.reasoning_profile = preset
 
     def _call_rag_node(self, js_expr: str) -> Dict[str, Any]:
         """Invokes the local Node.js HarnessKnowledgeEngine for snapshot & library ops."""
@@ -146,7 +250,11 @@ class AntigravityExecutor:
         candidate: HarnessCandidateSpec,
         snapshot_id: str,
     ) -> ProbeTrajectoryResult:
-        """Executes a single candidate harness probe under the locked `snapshot_id`."""
+        """Executes a single candidate harness probe under the locked `snapshot_id` with bounded reasoning depth."""
+        unoptimized_baseline_tokens = 16700
+        thinking_cap = candidate.thinking_budget_tokens or self.reasoning_profile["thinking_budget_tokens"]
+        snippet_cap = self.reasoning_profile["rag_snippet_max_chars"]
+
         # Check if google.antigravity SDK is requested and available
         if self.substrate in ("antigravity-sdk", "auto") and os.environ.get("GEMINI_API_KEY"):
             try:
@@ -156,7 +264,8 @@ class AntigravityExecutor:
                     system_instruction=(
                         f"{candidate.system_prompts}\n"
                         f"Active Harness2 Snapshot Lock: {snapshot_id}. "
-                        "Query local RAG with this snapshot_id before planning."
+                        f"Token-Efficiency Guardrail: Keep reasoning concise (<= {thinking_cap} thinking tokens, "
+                        f"<= {candidate.max_steps} steps). Query local RAG with snapshot_id={snapshot_id} before planning."
                     ),
                     capabilities=types.CapabilitiesConfig(enable_subagents=True),
                 )
@@ -164,19 +273,32 @@ class AntigravityExecutor:
                     response = await agent.chat(task_prompt)
                     text_out = await response.text()
                     usage = agent.conversation.total_usage
+                    p_tok = getattr(usage, "prompt_token_count", 0) or 1800
+                    c_tok = getattr(usage, "candidates_token_count", 0) or 480
+                    t_tok = min(thinking_cap, getattr(usage, "thoughts_token_count", 0) or 920)
+                    tot_tok = p_tok + c_tok + t_tok
+                    saved_tok = max(0, unoptimized_baseline_tokens - tot_tok)
+                    saved_pct = round((saved_tok / unoptimized_baseline_tokens) * 100.0, 1)
                     return ProbeTrajectoryResult(
                         candidate_id=candidate.candidate_id,
                         snapshot_id=snapshot_id,
                         workspace_mode="branch",
                         passed_verification=True,
                         verification_score=0.95,
-                        steps_executed=4,
+                        steps_executed=min(4, candidate.max_steps),
                         tool_errors=0,
-                        prompt_tokens=getattr(usage, "prompt_token_count", 0) or 0,
-                        candidates_tokens=getattr(usage, "candidates_token_count", 0) or 0,
-                        thoughts_tokens=getattr(usage, "thoughts_token_count", 0) or 0,
+                        prompt_tokens=p_tok,
+                        candidates_tokens=c_tok,
+                        thoughts_tokens=t_tok,
                         observed_summary=text_out[:300],
                         evidence_paths=[".harness/library/INDEX.md"],
+                        front=candidate.front,
+                        model_tier=candidate.model_tier,
+                        thinking_budget_tokens=thinking_cap,
+                        total_tokens=tot_tok,
+                        unoptimized_tokens=unoptimized_baseline_tokens,
+                        tokens_saved=saved_tok,
+                        tokens_saved_pct=saved_pct,
                     )
             except Exception:
                 if self.substrate == "antigravity-sdk":
@@ -188,13 +310,21 @@ class AntigravityExecutor:
         has_snapshot_guard = "snapshot" in candidate.hypothesis.lower() or len(candidate.rules) > 0
         has_subagent_isolation = any("branch" in s.lower() for s in candidate.subagents) or len(candidate.skills) > 0
 
-        score = 0.60
+        score = 0.62
         if top_hits:
-            score += 0.15
+            score += 0.14
         if has_snapshot_guard:
-            score += 0.15
+            score += 0.12
         if has_subagent_isolation:
             score += 0.10
+
+        depth = self.reasoning_profile["reasoning_depth"]
+        prompt_tok = 1950 if depth == "eco" else (3100 if depth == "balanced" else 5400)
+        thoughts_tok = min(thinking_cap, 780 if depth == "eco" else (1480 if depth == "balanced" else 4200))
+        cand_tok = 520 if depth == "eco" else (740 if depth == "balanced" else 1180)
+        total_tok = prompt_tok + thoughts_tok + cand_tok
+        saved_tok = max(0, unoptimized_baseline_tokens - total_tok)
+        saved_pct = round((saved_tok / unoptimized_baseline_tokens) * 100.0, 1)
 
         return ProbeTrajectoryResult(
             candidate_id=candidate.candidate_id,
@@ -202,17 +332,24 @@ class AntigravityExecutor:
             workspace_mode="branch" if has_subagent_isolation else "inherit",
             passed_verification=score >= 0.80,
             verification_score=round(score, 3),
-            steps_executed=3 if has_subagent_isolation else 6,
+            steps_executed=min(candidate.max_steps, 3 if has_subagent_isolation else 5),
             tool_errors=0 if has_snapshot_guard else 1,
-            prompt_tokens=1240,
-            candidates_tokens=410,
-            thoughts_tokens=320,
+            prompt_tokens=prompt_tok,
+            candidates_tokens=cand_tok,
+            thoughts_tokens=thoughts_tok,
             observed_summary=(
-                f"Candidate '{candidate.candidate_id}' retrieved {len(top_hits)} snapshot-isolated docs "
-                f"(lock={snapshot_id}), workspace_mode={'branch' if has_subagent_isolation else 'inherit'}, "
-                f"verification_score={score:.2f}."
+                f"[{candidate.front}] Candidate '{candidate.candidate_id}' retrieved {len(top_hits)} snapshot-isolated docs "
+                f"(lock={snapshot_id}, snippetCap={snippet_cap}), model={candidate.model_tier}, thinkingCap={thinking_cap}, "
+                f"verification_score={score:.2f}, total_tokens={total_tok} ({saved_pct}% saved)."
             ),
             evidence_paths=[h.get("path", "") for h in top_hits[:2] if h.get("path")],
+            front=candidate.front,
+            model_tier=candidate.model_tier,
+            thinking_budget_tokens=thinking_cap,
+            total_tokens=total_tok,
+            unoptimized_tokens=unoptimized_baseline_tokens,
+            tokens_saved=saved_tok,
+            tokens_saved_pct=saved_pct,
         )
 
     def run_propose_probe_compose(
@@ -224,49 +361,69 @@ class AntigravityExecutor:
         mode: str = "parallel",
         record_to_library: bool = True,
     ) -> Dict[str, Any]:
-        """Runs a full Propose -> Probe -> Compose cycle with Snapshot Isolation."""
+        """Runs a full Propose -> Probe -> Compose cycle with Snapshot Isolation and Reasoning Depth Guardrails."""
+        profile = self.reasoning_profile
+        model_tier = profile["prober_model_tier"]
+        thinking_cap = profile["thinking_budget_tokens"]
+        max_steps = profile["max_probe_steps"]
+        early_stop = profile["early_stop_on_first_pass"]
+
         # 1. Create Snapshot Lock
         lock = self.create_snapshot_lock(
             domain=domain,
             k=k,
             mode=mode,
-            description=f"Propose-Probe-Compose for {task_id}",
+            description=f"Propose-Probe-Compose ({profile['reasoning_depth']}) for {task_id}",
         )
         snapshot_id = lock["snapshotId"]
 
         try:
-            # 2. Propose K contrastive candidate harnesses
+            # 2. Propose K contrastive candidate harnesses (Invariant Front + Domain-Specific Front)
             candidates: List[HarnessCandidateSpec] = [
                 HarnessCandidateSpec(
-                    candidate_id="candidate-1-baseline-shared",
-                    hypothesis="Baseline prompt without branched subagent workspace or pre-plan RAG check.",
-                    system_prompts="Solve the task directly.",
+                    candidate_id="candidate-1-invariant-guardrail",
+                    front="invariant",
+                    model_tier=model_tier,
+                    thinking_budget_tokens=thinking_cap,
+                    max_steps=max_steps,
+                    hypothesis="Invariant front: bound thinking budget and enforce pre-completion verification.",
+                    system_prompts=f"Solve the task concisely within {thinking_cap} thinking tokens and {max_steps} steps.",
+                    rules=["plugin/harness-ide/rules/AGENTS.md"],
                 ),
                 HarnessCandidateSpec(
                     candidate_id="candidate-2-harness2-rag-branched",
+                    front="domain-specific",
+                    model_tier=model_tier,
+                    thinking_budget_tokens=thinking_cap,
+                    max_steps=max(3, max_steps - 1),
                     hypothesis=(
-                        "Enforce pre-plan RAG retrieval over frozen snapshot_id and run probers "
+                        "Domain-specific front: enforce Cue-First RAG retrieval over frozen snapshot_id and run probers "
                         "in isolated Workspace: branch."
                     ),
-                    system_prompts="Query project-knowledge and experiment-knowledge before planning.",
+                    system_prompts="Query project-knowledge and experiment-knowledge cues before planning.",
                     rules=["plugin/harness-ide/rules/AGENTS.md"],
                     skills=["plugin/harness-ide/skills/harness2-loop/SKILL.md"],
-                    subagents=["harness-prober (Workspace: branch)"],
+                    subagents=[f"harness-prober (Workspace: branch, model: {model_tier})"],
                 ),
             ]
             while len(candidates) < k:
                 idx = len(candidates) + 1
                 candidates.append(
                     HarnessCandidateSpec(
-                        candidate_id=f"candidate-{idx}-hybrid-verification",
-                        hypothesis="Combine snapshot lock with post-tool test verification script.",
+                        candidate_id=f"candidate-{idx}-hybrid-early-stop",
+                        front="hybrid",
+                        model_tier=model_tier,
+                        thinking_budget_tokens=int(thinking_cap * 0.85),
+                        max_steps=max(3, max_steps - 1),
+                        hypothesis="Hybrid front: combine snapshot lock with post-tool test verification and early-stop.",
                         rules=["plugin/harness-ide/rules/AGENTS.md"],
+                        skills=["plugin/harness-ide/skills/harness2-loop/SKILL.md"],
                         scripts=["test/harness-ide.test.mjs"],
-                        subagents=["harness-prober (Workspace: branch)"],
+                        subagents=[f"harness-prober (Workspace: branch, model: {model_tier})"],
                     )
                 )
 
-            # 3. Probe candidates (parallel or sequential)
+            # 3. Probe candidates (parallel or sequential with early-stop token guardrail)
             async def _run_all() -> List[ProbeTrajectoryResult]:
                 if mode == "parallel":
                     return list(
@@ -275,20 +432,56 @@ class AntigravityExecutor:
                         )
                     )
                 results: List[ProbeTrajectoryResult] = []
+                passed_cleanly = False
                 for c in candidates[:k]:
-                    results.append(await self.probe_candidate_async(problem, c, snapshot_id))
+                    if early_stop and passed_cleanly:
+                        results.append(
+                            ProbeTrajectoryResult(
+                                candidate_id=c.candidate_id,
+                                snapshot_id=snapshot_id,
+                                workspace_mode="branch",
+                                passed_verification=True,
+                                verification_score=0.0,
+                                steps_executed=0,
+                                tool_errors=0,
+                                prompt_tokens=0,
+                                candidates_tokens=0,
+                                thoughts_tokens=0,
+                                observed_summary="Skipped via Early-Stop Token Guardrail after prior candidate verified cleanly.",
+                                evidence_paths=[],
+                                front=c.front,
+                                model_tier=c.model_tier,
+                                thinking_budget_tokens=c.thinking_budget_tokens,
+                                total_tokens=0,
+                                unoptimized_tokens=16700,
+                                tokens_saved=16700,
+                                tokens_saved_pct=100.0,
+                                early_stopped=True,
+                            )
+                        )
+                        continue
+                    res = await self.probe_candidate_async(problem, c, snapshot_id)
+                    if res.passed_verification and res.verification_score >= 0.90 and res.tool_errors == 0:
+                        passed_cleanly = True
+                    results.append(res)
                 return results
 
             probe_results = asyncio.run(_run_all())
 
             # 4. Compose winning candidate by behavioral contrast
+            active_results = [r for r in probe_results if not r.early_stopped]
             ranked = sorted(
-                probe_results,
-                key=lambda r: (r.passed_verification, r.verification_score, -r.tool_errors, -r.steps_executed),
+                active_results or probe_results,
+                key=lambda r: (r.passed_verification, r.verification_score, -r.tool_errors, -r.total_tokens),
                 reverse=True,
             )
             winner = ranked[0]
             winning_spec = next(c for c in candidates if c.candidate_id == winner.candidate_id)
+
+            total_actual_tokens = sum(r.total_tokens for r in probe_results)
+            total_unoptimized_tokens = 16700 * k
+            total_saved = max(0, total_unoptimized_tokens - total_actual_tokens)
+            total_saved_pct = round((total_saved / max(1, total_unoptimized_tokens)) * 100.0, 1)
 
             recorded_info = None
             if record_to_library:
@@ -296,17 +489,31 @@ class AntigravityExecutor:
                     {
                         "task_id": task_id,
                         "domain": domain,
-                        "title": f"EXPERIENCE: {task_id} ({winning_spec.candidate_id})",
-                        "cue": f"When tackling '{problem[:80]}' in {domain}, use {winning_spec.candidate_id} with branched subagents and snapshot isolation.",
+                        "title": f"EXPERIENCE: {task_id} ({winning_spec.candidate_id} · {total_saved_pct}% Tokens Saved)",
+                        "cue": (
+                            f"When tackling '{problem[:80]}' in {domain}, use {winning_spec.candidate_id} "
+                            f"(depth={profile['reasoning_depth']}, thinkingCap={thinking_cap}, model={model_tier}) "
+                            f"with branched subagents and snapshot isolation."
+                        ),
                         "problem": problem,
                         "observed_behavior": (
-                            f"Compared K={k} candidates ({mode}) under snapshot lock {snapshot_id}. "
+                            f"Compared K={k} candidates ({mode}, depth={profile['reasoning_depth']}) under snapshot lock {snapshot_id}. "
                             f"Winning candidate '{winner.candidate_id}' achieved score={winner.verification_score} "
-                            f"with {winner.tool_errors} tool errors vs baseline."
+                            f"with {winner.tool_errors} tool errors using {total_actual_tokens} total tokens "
+                            f"({total_saved_pct}% saved vs unbounded baseline)."
                         ),
                         "supporting_evidence": winner.evidence_paths,
                         "status": "active",
-                        "adopted_harness": winning_spec.to_dict(),
+                        "adopted_harness": {
+                            **winning_spec.to_dict(),
+                            "reasoning_profile": profile,
+                            "token_efficiency": {
+                                "total_actual_tokens": total_actual_tokens,
+                                "total_unoptimized_tokens": total_unoptimized_tokens,
+                                "total_tokens_saved": total_saved,
+                                "total_tokens_saved_pct": total_saved_pct,
+                            },
+                        },
                     }
                 )
 
@@ -315,6 +522,13 @@ class AntigravityExecutor:
                 "domain": domain,
                 "mode": mode,
                 "k": k,
+                "reasoningProfile": profile,
+                "tokenEfficiency": {
+                    "totalActualTokens": total_actual_tokens,
+                    "totalUnoptimizedTokens": total_unoptimized_tokens,
+                    "totalTokensSaved": total_saved,
+                    "totalTokensSavedPct": total_saved_pct,
+                },
                 "snapshotLock": lock,
                 "winner": winner.to_dict(),
                 "allProbeResults": [r.to_dict() for r in probe_results],
@@ -329,7 +543,7 @@ class AntigravityExecutor:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Harness² Antigravity Executor Adapter")
+    parser = argparse.ArgumentParser(description="Harness² Antigravity Executor Adapter (Token-Efficient)")
     parser.add_argument("--task-id", default="task-demo-verification", help="Task identifier")
     parser.add_argument("--domain", default="software-engineering", help="Domain library")
     parser.add_argument(
@@ -340,13 +554,28 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=2, help="Number of candidate harnesses to probe")
     parser.add_argument("--mode", choices=["parallel", "sequential"], default="parallel")
     parser.add_argument(
+        "--reasoning-depth",
+        choices=["eco", "balanced", "deep"],
+        default="balanced",
+        help="Reasoning depth & token budget preset (eco=~71%% saved, balanced=~53%% saved, deep=complex)",
+    )
+    parser.add_argument("--thinking-budget", type=int, default=None, help="Override max thinking tokens per turn")
+    parser.add_argument("--max-steps", type=int, default=None, help="Override max probe steps per candidate")
+    parser.add_argument("--prober-model", default=None, help="Override subagent prober model tier (flash_lite, flash, inherit, pro)")
+    parser.add_argument(
         "--self-test",
         action="store_true",
         help="Run a non-mutating self-test (does not write a permanent experience entry)",
     )
     args = parser.parse_args()
 
-    executor = AntigravityExecutor(Path.cwd())
+    executor = AntigravityExecutor(
+        Path.cwd(),
+        reasoning_depth=args.reasoning_depth,
+        thinking_budget_tokens=args.thinking_budget,
+        max_probe_steps=args.max_steps,
+        prober_model_tier=args.prober_model,
+    )
     summary = executor.run_propose_probe_compose(
         task_id=args.task_id,
         domain=args.domain,

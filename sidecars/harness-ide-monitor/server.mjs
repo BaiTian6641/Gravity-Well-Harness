@@ -2333,6 +2333,8 @@ export function createHarnessMonitorApp() {
         activeSnapshotLock: status.snapshotIsolationLock,
         snapshots,
         experiences,
+        reasoningProfile: engine.resolveReasoningProfile(),
+        lastRun: engine.getLastHarness2Run(),
         editableComponents: settings.harness2?.editableComponents || [
           'system_prompts',
           'rules',
@@ -2605,6 +2607,28 @@ export function createHarnessMonitorApp() {
     },
     'POST'
   );
+
+  const handleHarness2Run = async (reqData = {}) => {
+    const payload = reqData?.body || reqData || {};
+    const wsCtx = await resolveWorkspaceContext(payload);
+    const engine = new HarnessKnowledgeEngine(wsCtx.workspaceRoot);
+    const report = engine.runHarness2Loop({
+      task_id: payload.task_id || payload.taskId || `task-${Date.now()}`,
+      domain: payload.domain || 'software-engineering',
+      problem: payload.problem || 'Optimize execution harness with token-efficient reasoning depth.',
+      k: Number(payload.k || 2),
+      mode: payload.mode || 'parallel',
+      reasoning_depth: payload.reasoning_depth || payload.reasoningDepth,
+      thinking_budget_tokens: payload.thinking_budget_tokens ?? payload.thinkingBudgetTokens,
+      max_probe_steps: payload.max_probe_steps ?? payload.maxProbeSteps,
+      prober_model_tier: payload.prober_model_tier || payload.proberModelTier,
+      early_stop: payload.early_stop ?? payload.earlyStopOnFirstPass,
+      record_to_library: payload.record_to_library !== false,
+    });
+    return { ok: true, ...report };
+  };
+  app.api('/api/harness2/run', handleHarness2Run, 'POST');
+  app.api('/api/harness2/run', handleHarness2Run, 'GET');
 
   app.api(
     '/api/settings/save',

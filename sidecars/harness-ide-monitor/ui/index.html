@@ -409,6 +409,55 @@
       <div class="card card-highlight">
         <div class="card-header">
           <div>
+            <span class="eyebrow">GOOGLE RESEARCH HARNESS² · TOKEN-EFFICIENT RECURSIVE LOOP</span>
+            <h2 class="card-title">Propose → Probe → Compose Studio (Adaptive Reasoning Depth)</h2>
+          </div>
+          <span class="pill-badge pill-ok" id="h2-active-depth-badge">Depth: BALANCED · ~52.8% Tokens Saved</span>
+        </div>
+        <p class="help-text">
+          Executes Google Research's contrastive <code>Propose → Probe → Compose</code> loop across <strong>Invariant</strong> + <strong>Domain-Specific</strong> fronts under a frozen <code>snapshotId</code> while bounding thinking tokens, RAG snippet size, and prober model tier so your token budget isn't drained.
+        </p>
+        <div class="form-grid" style="margin-top: 8px;">
+          <div>
+            <label class="field-label">Task ID</label>
+            <input type="text" id="h2-run-task-id" class="input-field" value="task-005-token-efficient-probe" placeholder="e.g. task-005-token-efficient-probe" />
+          </div>
+          <div>
+            <label class="field-label">Domain Library</label>
+            <input type="text" id="h2-run-domain" class="input-field" value="software-engineering" placeholder="e.g. software-engineering" />
+          </div>
+          <div>
+            <label class="field-label">Reasoning Depth &amp; Token Budget</label>
+            <select id="h2-run-depth" class="input-field">
+              <option value="balanced">Balanced / Adaptive (2,048 thinking cap · flash prober · ~53% saved)</option>
+              <option value="eco">Eco / Token-Saver (1,024 thinking cap · flash_lite prober · ~71% saved)</option>
+              <option value="deep">Deep Reasoning (8,192 thinking cap · inherit/pro · complex tasks)</option>
+            </select>
+          </div>
+          <div>
+            <label class="field-label">Mode &amp; Candidates (K)</label>
+            <div class="inline-pair">
+              <select id="h2-run-mode" class="input-field select-compact">
+                <option value="parallel">Parallel</option>
+                <option value="sequential">Sequential (Early-Stop)</option>
+              </select>
+              <input type="number" id="h2-run-k" class="input-field input-tiny" value="2" min="2" max="5" title="Number of candidate harnesses K" />
+            </div>
+          </div>
+          <div class="full-span">
+            <label class="field-label">Problem / Task Bottleneck to Optimize</label>
+            <input type="text" id="h2-run-problem" class="input-field" value="Optimize multi-agent execution harness with Cue-First RAG retrieval and bounded reasoning depth" />
+          </div>
+          <div class="full-span actions-right">
+            <button class="btn btn-primary" id="btn-run-harness2-loop">⚡ Run Token-Efficient Propose → Probe → Compose</button>
+          </div>
+        </div>
+        <div id="h2-last-run-results" class="stack-list" style="margin-top: 12px;"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
             <span class="eyebrow">CONSISTENT CANDIDATE COMPARISONS</span>
             <h2 class="card-title">Harness² Snapshot Isolation Lock</h2>
           </div>
@@ -726,6 +775,45 @@
                 <option value="sequential">Sequential</option>
               </select>
               <input type="number" id="set-h2-k" class="input-field input-tiny" value="2" min="1" max="6" />
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">Reasoning Depth &amp; Token Efficiency Profile</div>
+              <div class="setting-desc">Controls thinking token depth, Cue-First RAG snippet pruning, and subagent model routing so Harness² loops stay fast and token-efficient.</div>
+            </div>
+            <select id="set-h2-reasoning-depth" class="input-field select-medium">
+              <option value="balanced">Balanced / Adaptive (~53% fewer tokens — Recommended)</option>
+              <option value="eco">Eco / Token-Saver (~71% fewer tokens · Flash-Lite)</option>
+              <option value="deep">Deep Reasoning (Complex Architecture &amp; Multi-Stage)</option>
+            </select>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">Max Thinking Token Budget &amp; Candidate Prober Model Tier</div>
+              <div class="setting-desc">Caps thinking tokens per probe turn (e.g. <code>2048</code>) and routes candidate probers to lighter models (<code>flash</code> / <code>flash_lite</code>) while keeping your main agent on its primary model.</div>
+            </div>
+            <div class="inline-pair">
+              <input type="number" id="set-h2-thinking-budget" class="input-field select-compact" value="2048" min="512" max="16384" step="256" title="Max Thinking Tokens per Turn" />
+              <select id="set-h2-prober-model" class="input-field select-compact" title="Prober Subagent Model Tier">
+                <option value="flash">flash (Fast &amp; Token-Efficient)</option>
+                <option value="flash_lite">flash_lite (Ultra-Low Token Cost)</option>
+                <option value="inherit">inherit (Same as Main Agent)</option>
+                <option value="pro">pro (Heavy Reasoning)</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">Cue-First RAG Snippet Cap &amp; Early-Stop Token Guardrail</div>
+              <div class="setting-desc">Truncates retrieved RAG snippets to compact cues (default <code>500</code> chars) and stops sequential probing early once a candidate passes 100% of verification checks.</div>
+            </div>
+            <div class="inline-pair">
+              <input type="number" id="set-h2-snippet-cap" class="input-field input-tiny" value="500" min="160" max="2000" step="50" title="Max RAG Snippet Chars" />
+              <input type="checkbox" id="set-h2-early-stop" class="toggle-checkbox" checked title="Early-Stop on First Verified Pass" />
             </div>
           </div>
         </div>

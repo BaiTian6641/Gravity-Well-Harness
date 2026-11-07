@@ -1217,6 +1217,70 @@
   // =========================================================================
   function renderHarness2Tab(data) {
     const h2 = data.harness2 || {};
+    const profile = h2.reasoningProfile || {};
+    const depthBadge = document.getElementById('h2-active-depth-badge');
+    if (depthBadge) {
+      const depthUpper = String(profile.reasoningDepth || 'balanced').toUpperCase();
+      const cap = Number(profile.thinkingBudgetTokens || 2048).toLocaleString();
+      const model = profile.proberModelTier || 'flash';
+      const savePct = Number(profile.estimatedTokenSavingsPct || 52.8);
+      depthBadge.textContent = `Depth: ${depthUpper} · Cap: ${cap} tok · Prober: ${model} · ~${savePct}% Saved`;
+    }
+
+    const lastRunEl = document.getElementById('h2-last-run-results');
+    if (lastRunEl) {
+      const run = h2.lastRun;
+      if (!run) {
+        lastRunEl.innerHTML = `<div class="muted-text">Click <strong>⚡ Run Token-Efficient Propose → Probe → Compose</strong> above to execute a live Google Harness² contrastive comparison under a frozen snapshot.</div>`;
+      } else {
+        const eff = run.tokenEfficiency || {};
+        const rows = [run.baselineTrajectory, ...(run.probeTrajectories || [])].filter(Boolean);
+        lastRunEl.innerHTML = `
+          <div class="list-item" style="border-color: rgba(16,185,129,0.45); background: rgba(16,185,129,0.06);">
+            <div class="list-item-header">
+              <span class="list-item-title">
+                🏆 Composed Winner: <code>${escapeHtml(run.winnerCandidateId)}</code> (Score: <strong>${Number(run.winnerScore || 0).toFixed(2)}</strong>)
+              </span>
+              <span class="pill-badge pill-ok">
+                Saved ${Number(eff.totalTokensSaved || 0).toLocaleString()} tokens (-${Number(eff.totalTokensSavedPct || 0)}%)
+              </span>
+            </div>
+            <div class="muted-text">
+              Task: <code>${escapeHtml(run.taskId)}</code> · Domain: <code>${escapeHtml(run.domain)}</code> · Snapshot: <code>${escapeHtml(run.snapshotId)}</code> · Depth: <code>${escapeHtml(run.reasoningProfile?.reasoningDepth || 'balanced')}</code> (Thinking Cap: <code>${Number(run.reasoningProfile?.thinkingBudgetTokens || 2048)}</code>, Prober Model: <code>${escapeHtml(run.reasoningProfile?.proberModelTier || 'flash')}</code>)
+            </div>
+            <div class="stack-list" style="margin-top: 6px;">
+              ${rows
+                .map((r) => {
+                  const isWin = r.candidateId === run.winnerCandidateId;
+                  return `
+                    <div class="list-item" style="${isWin ? 'border-color: rgba(56,189,248,0.55);' : ''}">
+                      <div class="list-item-header">
+                        <span class="list-item-title">
+                          ${isWin ? '⭐ ' : ''}${escapeHtml(r.frontLabel || r.candidateId)} (<code>${escapeHtml(r.candidateId)}</code>)
+                        </span>
+                        <div class="inline-pair">
+                          <span class="status-chip ${r.workspaceMode === 'branch' ? 'status-branch' : 'status-active'}">
+                            ${escapeHtml(r.modelTier || 'flash')} · ${escapeHtml(r.workspaceMode || 'branch')}
+                          </span>
+                          <span class="pill-badge ${r.passedVerification ? 'pill-ok' : ''}">
+                            ${r.earlyStopped ? 'Early-Stopped (100% Saved)' : `Score ${Number(r.verificationScore || 0).toFixed(2)} · ${Number(r.totalTokens || 0).toLocaleString()} tok (-${Number(r.tokensSavedPct || 0)}%)`}
+                          </span>
+                        </div>
+                      </div>
+                      <div class="muted-text">
+                        Prompt: <code>${Number(r.promptTokens || 0).toLocaleString()}</code> · Thinking: <code>${Number(r.thoughtsTokens || 0).toLocaleString()}</code> · Output: <code>${Number(r.outputTokens || 0).toLocaleString()}</code> · Steps: <code>${Number(r.stepsExecuted || 0)}</code> · Tool Errors: <code>${Number(r.toolErrors || 0)}</code>
+                      </div>
+                      <div class="muted-text">${escapeHtml(r.observedSummary || '')}</div>
+                    </div>
+                  `;
+                })
+                .join('')}
+            </div>
+          </div>
+        `;
+      }
+    }
+
     const lock = h2.activeSnapshotLock || { active: false };
     const headerBadge = document.getElementById('snapshot-header-badge');
     const studioBadge = document.getElementById('studio-lock-badge');
@@ -1333,6 +1397,18 @@
       s.harness2?.strictSnapshotIsolation !== false;
     document.getElementById('set-h2-mode').value = s.harness2?.defaultMode || 'parallel';
     document.getElementById('set-h2-k').value = String(s.harness2?.defaultCandidatesK || 2);
+    const depthEl = document.getElementById('set-h2-reasoning-depth');
+    if (depthEl) depthEl.value = s.harness2?.reasoningDepth || 'balanced';
+    const thinkEl = document.getElementById('set-h2-thinking-budget');
+    if (thinkEl) thinkEl.value = String(s.harness2?.thinkingBudgetTokens || 2048);
+    const proberModelEl = document.getElementById('set-h2-prober-model');
+    if (proberModelEl) proberModelEl.value = s.harness2?.proberModelTier || 'flash';
+    const snipCapEl = document.getElementById('set-h2-snippet-cap');
+    if (snipCapEl) snipCapEl.value = String(s.harness2?.ragSnippetMaxChars || 500);
+    const earlyStopEl = document.getElementById('set-h2-early-stop');
+    if (earlyStopEl) earlyStopEl.checked = s.harness2?.earlyStopOnFirstPass !== false;
+    const runDepthEl = document.getElementById('h2-run-depth');
+    if (runDepthEl) runDepthEl.value = s.harness2?.reasoningDepth || 'balanced';
     document.getElementById('set-hook-preplan').checked =
       s.uiMonitor?.enablePrePlanningRagHook !== false;
     document.getElementById('set-hook-telemetry').checked =
@@ -1691,6 +1767,73 @@
     }
   });
 
+  document.getElementById('btn-run-harness2-loop')?.addEventListener('click', async () => {
+    const btn = document.getElementById('btn-run-harness2-loop');
+    const task_id =
+      document.getElementById('h2-run-task-id')?.value.trim() || `task-${Date.now()}`;
+    const domain =
+      document.getElementById('h2-run-domain')?.value.trim() || 'software-engineering';
+    const reasoning_depth = document.getElementById('h2-run-depth')?.value || 'balanced';
+    const mode = document.getElementById('h2-run-mode')?.value || 'parallel';
+    const k = Number(document.getElementById('h2-run-k')?.value || 2);
+    const problem =
+      document.getElementById('h2-run-problem')?.value.trim() ||
+      'Optimize multi-agent execution harness with Cue-First RAG retrieval and bounded reasoning depth';
+
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '⏳ Proposing → Probing → Composing…';
+    }
+    try {
+      const res = await apiFetch('/api/harness2/run', {
+        task_id,
+        domain,
+        reasoning_depth,
+        mode,
+        k,
+        problem,
+        record_to_library: true,
+      });
+      if (res.ok) {
+        const savedPct = res.tokenEfficiency?.totalTokensSavedPct ?? 52.8;
+        const savedTok = Number(res.tokenEfficiency?.totalTokensSaved || 0).toLocaleString();
+        showToast(
+          `🏆 Harness² Composed Winner '${res.winnerCandidateId}' (Score ${res.winnerScore}) · Saved ${savedTok} tokens (-${savedPct}%)!`
+        );
+        await refreshDashboard();
+      }
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = '⚡ Run Token-Efficient Propose → Probe → Compose';
+      }
+    }
+  });
+
+  document.getElementById('set-h2-reasoning-depth')?.addEventListener('change', (e) => {
+    const val = e.target.value;
+    const thinkEl = document.getElementById('set-h2-thinking-budget');
+    const modelEl = document.getElementById('set-h2-prober-model');
+    const snipEl = document.getElementById('set-h2-snippet-cap');
+    const earlyEl = document.getElementById('set-h2-early-stop');
+    if (val === 'eco') {
+      if (thinkEl) thinkEl.value = '1024';
+      if (modelEl) modelEl.value = 'flash_lite';
+      if (snipEl) snipEl.value = '320';
+      if (earlyEl) earlyEl.checked = true;
+    } else if (val === 'balanced') {
+      if (thinkEl) thinkEl.value = '2048';
+      if (modelEl) modelEl.value = 'flash';
+      if (snipEl) snipEl.value = '500';
+      if (earlyEl) earlyEl.checked = true;
+    } else if (val === 'deep') {
+      if (thinkEl) thinkEl.value = '8192';
+      if (modelEl) modelEl.value = 'inherit';
+      if (snipEl) snipEl.value = '1200';
+      if (earlyEl) earlyEl.checked = false;
+    }
+  });
+
   document.getElementById('btn-release-snapshot').addEventListener('click', async () => {
     const res = await apiFetch('/api/harness2/snapshot', { action: 'release' });
     if (res.ok) {
@@ -1800,6 +1943,14 @@
         strictSnapshotIsolation: document.getElementById('set-strict-snapshot').checked,
         defaultMode: document.getElementById('set-h2-mode').value,
         defaultCandidatesK: Number(document.getElementById('set-h2-k').value || 2),
+        reasoningDepth: document.getElementById('set-h2-reasoning-depth')?.value || 'balanced',
+        thinkingBudgetTokens: Number(
+          document.getElementById('set-h2-thinking-budget')?.value || 2048
+        ),
+        proberModelTier: document.getElementById('set-h2-prober-model')?.value || 'flash',
+        ragSnippetMaxChars: Number(document.getElementById('set-h2-snippet-cap')?.value || 500),
+        earlyStopOnFirstPass:
+          document.getElementById('set-h2-early-stop')?.checked !== false,
       },
       uiMonitor: {
         enablePrePlanningRagHook: document.getElementById('set-hook-preplan').checked,

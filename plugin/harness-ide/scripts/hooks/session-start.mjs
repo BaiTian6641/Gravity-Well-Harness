@@ -126,12 +126,14 @@ function main() {
       // ignore
     }
 
+    const profile = engine.resolveReasoningProfile();
     const msg = [
       `[Gravity Well Harness — Harness² & Local RAG IDE Active]`,
       `- Active Workspace: ${workspaceRoot}`,
       `- Indexed Local Documents: ${status.totalDocuments} across project-knowledge, experiment-knowledge, and reference-knowledge.`,
       `- Snapshot Isolation Status: ${lockInfo}`,
-      `- Lifecycle Rule: Query 'harness_query' before planning architectural or experimental changes; record lessons via 'harness_record_experience'; surface [Harness² Swarm & RAG Monitor](sidecar://harness-ide-monitor/) when inspecting swarm or RAG state.`
+      `- Token-Efficiency & Reasoning Depth Guardrail: profile='${profile.reasoningDepth}' (max thinking budget: ${profile.thinkingBudgetTokens} tokens/turn, prober model: '${profile.proberModelTier}', max probe steps: ${profile.maxProbeSteps}, RAG snippet cap: ${profile.ragSnippetMaxChars} chars, early-stop: ${profile.earlyStopOnFirstPass}). Query 'harness_query' (Cue-First) before calling 'harness_get' so user tokens are conserved.`,
+      `- Lifecycle Rule: Query 'harness_query' before planning; run 'harness_run_loop' for Propose-Probe-Compose refinement; record lessons via 'harness_record_experience'; surface [Harness² Swarm & RAG Monitor](sidecar://harness-ide-monitor/) when inspecting swarm or RAG state.`
     ].join('\n');
 
     process.stdout.write(

@@ -327,6 +327,68 @@ const TOOL_DEFINITIONS = [
         }
       }
     }
+  },
+  {
+    name: 'harness_run_loop',
+    description:
+      'Execute a complete, token-efficient Google Research Harness² Propose -> Probe -> Compose cycle with Snapshot Isolation, Invariant + Domain-Specific candidate proposals, bounded Reasoning Depth (eco/balanced/deep), and automatic EXPERIENCE.md + INDEX.md adoption.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: {
+          type: 'string',
+          description: 'Unique identifier for the task/experiment (e.g. task-005-token-efficiency).'
+        },
+        domain: {
+          type: 'string',
+          description: 'Domain library name (default: software-engineering).'
+        },
+        problem: {
+          type: 'string',
+          description: 'Problem statement or task bottleneck to optimize.'
+        },
+        k: {
+          type: 'number',
+          description: 'Number of candidate harnesses to probe (2 to 6, default: 2).'
+        },
+        mode: {
+          type: 'string',
+          enum: ['parallel', 'sequential'],
+          description: 'Probe execution mode (default: parallel).'
+        },
+        reasoning_depth: {
+          type: 'string',
+          enum: ['eco', 'balanced', 'deep'],
+          description: 'Reasoning depth & token budget preset: eco (~71% tokens saved), balanced (~53% tokens saved, default), or deep.'
+        },
+        thinking_budget_tokens: {
+          type: 'number',
+          description: 'Optional max thinking tokens per turn override (e.g. 1024, 2048, 8192).'
+        },
+        max_probe_steps: {
+          type: 'number',
+          description: 'Optional max steps per candidate probe override.'
+        },
+        prober_model_tier: {
+          type: 'string',
+          enum: ['flash_lite', 'flash', 'inherit', 'pro'],
+          description: 'Optional model tier for candidate probers (default: flash for balanced, flash_lite for eco).'
+        },
+        early_stop: {
+          type: 'boolean',
+          description: 'Stop remaining sequential candidates once a candidate passes 100% of verification checks (default: true).'
+        },
+        record_to_library: {
+          type: 'boolean',
+          description: 'Record the composed winner into .harness/library/<domain>/ (default: true).'
+        },
+        workspace_root: {
+          type: 'string',
+          description: 'Optional workspace root override.'
+        }
+      },
+      required: ['task_id', 'problem']
+    }
   }
 ];
 
@@ -374,6 +436,8 @@ export async function handleToolCall(name, args = {}) {
         qmdStatus: idx.qmdStatus
       };
     }
+    case 'harness_run_loop':
+      return engine.runHarness2Loop(args);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
