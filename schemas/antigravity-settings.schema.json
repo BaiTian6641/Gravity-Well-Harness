@@ -1,0 +1,107 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Gravity Well Harness — Antigravity IDE Settings Schema",
+  "description": "Native Antigravity IDE configuration for Gravity Well Harness (Models, Reasoning Depth, Harness², Local RAG, and Multi-Engine Web Search). API keys are never stored here; they are stored encrypted in ~/.gemini/config/.secrets.vault.enc (AES-256-GCM) or ~/.env.",
+  "type": "object",
+  "properties": {
+    "antigravity.harness.activeModel": {
+      "type": "string",
+      "default": "deepseek-v4-pro",
+      "enum": [
+        "deepseek-v4-pro",
+        "deepseek-flash",
+        "deepseek-reasoner",
+        "deepseek-chat",
+        "opencode-go/grok-4.7",
+        "opencode-go/gpt-6-luna",
+        "opencode-go/gpt-5.6-luna",
+        "opencode-go/claude-haiku-5-5",
+        "opencode-go/gemini-4-argon",
+        "opencode-go/kimi-k3.1-pro",
+        "opencode-go/kimi-k3",
+        "opencode-go/kimi-k2.7-code",
+        "opencode-go/glm-5.3",
+        "opencode-go/glm-5.3-flash",
+        "opencode-go/glm-5.2",
+        "opencode-go/mimo-v2.6-pro",
+        "opencode-go/mimo-v2.6-flash",
+        "opencode-go/minimax-m3.1-flash",
+        "opencode-go/qwen3.7-max",
+        "opencode-go/longcat-2.0",
+        "opencode-go/step-5-preview",
+        "opencode-go/muse-spark-1.3",
+        "gemini-4-argon-high",
+        "gemini-4-flash",
+        "claude-sonnet-5-5",
+        "claude-opus-5-5"
+      ],
+      "description": "Active primary model across DeepSeek Official (1M), OpenCode Go Coding Plan, and Antigravity Native."
+    },
+    "antigravity.harness.reasoningDepth": {
+      "type": "string",
+      "default": "balanced",
+      "enum": ["eco", "balanced", "deep"],
+      "description": "Reasoning depth & token-efficiency preset (eco = 1024 thinking cap / effort=low; balanced = 2048 cap / effort=high; deep = 8192 cap / effort=max)."
+    },
+    "antigravity.harness.reasoningEffort": {
+      "type": "string",
+      "default": "high",
+      "enum": ["none", "low", "high", "max"],
+      "description": "Official DeepSeek / OpenCode Go reasoning_effort parameter."
+    },
+    "antigravity.harness.deepseek.baseUrl": {
+      "type": "string",
+      "default": "https://api.deepseek.com",
+      "description": "DeepSeek Official API base URL (/chat/completions, /responses, /anthropic, /v1/tools/search). Store DEEPSEEK_API_KEY in ~/.env or AES-256-GCM Secret Vault."
+    },
+    "antigravity.harness.opencodeGo.baseUrl": {
+      "type": "string",
+      "default": "https://opencode.ai/inference/go/openai/v1",
+      "description": "OpenCode Go Coding Plan gateway URL. Store OPENCODE_API_KEY in ~/.env or AES-256-GCM Secret Vault."
+    },
+    "antigravity.harness.search.defaultEngine": {
+      "type": "string",
+      "default": "multi-fusion",
+      "enum": [
+        "multi-fusion",
+        "deepseek-search",
+        "parallel",
+        "tavily",
+        "duckduckgo",
+        "jina",
+        "wikipedia",
+        "hn-algolia"
+      ],
+      "description": "Default web search engine or Multi-Engine Reciprocal Rank Fusion (RRF)."
+    },
+    "antigravity.harness.rag.primaryBackend": {
+      "type": "string",
+      "default": "qmd-hybrid",
+      "enum": ["qmd-hybrid", "builtin-local", "basic-memory", "ragflow"],
+      "description": "Primary Local RAG backend for .harness/ collections."
+    },
+    "antigravity.harness.harness2.strictSnapshotIsolation": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enforce strict Snapshot Isolation during K-candidate Propose -> Probe -> Compose comparisons."
+    },
+    "antigravity.harness.harness2.thinkingBudgetTokens": {
+      "type": "number",
+      "default": 2048,
+      "description": "Maximum thinking token budget per probe turn."
+    },
+    "antigravity.harness.swarmRoleModels": {
+      "type": "object",
+      "default": {
+        "proposerModelId": "deepseek-v4-pro",
+        "ragResearcherModelId": "deepseek-flash",
+        "proberAModelId": "opencode-go/kimi-k2.7-code",
+        "proberBModelId": "opencode-go/glm-5.3",
+        "proberCModelId": "opencode-go/gpt-6-luna",
+        "verifierModelId": "opencode-go/minimax-m3.1-flash",
+        "composerModelId": "opencode-go/grok-4.7"
+      },
+      "description": "Per-role subagent model routing across DeepSeek Official and OpenCode Go Coding Plan."
+    }
+  }
+}

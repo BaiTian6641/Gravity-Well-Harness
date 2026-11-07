@@ -2,6 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { REASONING_DEPTH_PROFILES } from './rag-engine.mjs';
+import {
+  getSecretVaultStatusSummary,
+  resolveSecretCredential,
+  setSecretInVault,
+} from './secret-vault.mjs';
 
 /**
  * Reasoning Depth & DeepSeek/OpenCode Effort Mapping:
@@ -653,9 +658,25 @@ export function resolveModelMeta(modelId) {
   return DEFAULT_MODEL_CATALOG[0];
 }
 
+function getVscodeSettingsFile(workspaceRoot) {
+  return path.join(workspaceRoot, '.vscode', 'settings.json');
+}
+
+function loadIdeSettings(workspaceRoot) {
+  const vsFile = getVscodeSettingsFile(workspaceRoot);
+  if (!fs.existsSync(vsFile)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(vsFile, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
 /**
  * Loads the persisted Model, OpenCode Go, DeepSeek, and Search Engine configuration
- * for the given workspace, merging with environment variables.
+ * from Antigravity IDE Settings (`.vscode/settings.json`) and `.harness/runtime/model-search-hub.json`.
+ * API keys are resolved via `src/secret-vault.mjs` (AES-256-GCM Vault / `~/.env` / env)
+ * and NEVER included as plaintext in returned config objects.
  */
 export function loadHubConfig(workspaceRoot) {
   const file = getHubConfigFile(workspaceRoot);
@@ -667,21 +688,39 @@ export function loadHubConfig(workspaceRoot) {
       saved = {};
     }
   }
+  const ideSettings = loadIdeSettings(workspaceRoot);
 
-  const deepseekApiKey =
-    saved.providers?.deepseek?.apiKey || process.env.DEEPSEEK_API_KEY || '';
-  const opencodeGoApiKey =
-    saved.providers?.opencodeGo?.apiKey ||
-    process.env.OPENCODE_GO_API_KEY ||
-    process.env.OPENCODE_API_KEY ||
-    process.env.OPENCODE_ZEN_API_KEY ||
-    '';
-  const tavilyApiKey =
-    saved.search?.tavilyApiKey || process.env.TAVILY_API_KEY || '';
-  const parallelApiKey =
-    saved.search?.parallelApiKey || process.env.PARALLEL_API_KEY || '';
-  const jinaApiKey =
-    saved.search?.jinaApiKey || process.env.JINA_API_KEY || '';
+  // Migrate any legacy plaintext keys into AES-256-GCM vault and purge from saved JSON
+  if (saved.providers?.deepseek?.apiKey) {
+    setSecretInVault('DEEPSEEK_API_KEY', saved.providers.deepseek.apiKey);
+    delete saved.providers.deepseek.apiKey;
+  }
+  if (saved.providers?.opencodeGo?.apiKey) {
+    setSecretInVault('OPENCODE_API_KEY', saved.providers.opencodeGo.apiKey);
+    delete saved.providers.opencodeGo.apiKey;
+  }
+  if (saved.search?.tavilyApiKey) {
+    setSecretInVault('TAVILY_API_KEY', saved.search.tavilyApiKey);
+    delete saved.search.tavilyApiKey;
+  }
+  if (saved.search?.parallelApiKey) {
+    setSecretInVault('PARALLEL_API_KEY', saved.search.parallelApiKey);
+    delete saved.search.parallelApiKey;
+  }
+  if (saved.search?.jinaApiKey) {
+    setSecretInVault('JINA_API_KEY', saved.search.jinaApiKey);
+    delete saved.search.jinaApiKey;
+  }
+
+  const deepseekSec = resolveSecretCredential('DEEPSEEK_API_KEY');
+  const opencodeSec = resolveSecretCredential([
+    'OPENCODE_GO_API_KEY',
+    'OPENCODE_API_KEY',
+    'OPENCODE_ZEN_API_KEY',
+  ]);
+  const tavilySec = resolveSecretCredential('TAVILY_API_KEY');
+  const parallelSec = resolveSecretCredential('PARALLEL_API_KEY');
+  const jinaSec = resolveSecretCredential('JINA_API_KEY');
 
   const wsHash = crypto
     .createHash('sha1')
@@ -694,24 +733,52 @@ export function loadHubConfig(workspaceRoot) {
     defaultDepths[m.id] = m.defaultReasoningDepth || 'balanced';
   }
 
+  const ideRoleModels = ideSettings['antigravity.harness.swarmRoleModels'] || {};
+
   const config = {
-    activeModelId: saved.activeModelId || 'deepseek-v4-pro',
-    activeReasoningDepth: saved.activeReasoningDepth || 'balanced',
-    activeReasoningEffort: saved.activeReasoningEffort || 'high',
+    activeModelId:
+      saved.activeModelId ||
+      ideSettings['antigravity.harness.activeModel'] ||
+      'deepseek-v4-pro',
+    activeReasoningDepth:
+      saved.activeReasoningDepth ||
+      ideSettings['antigravity.harness.reasoningDepth'] ||
+      'balanced',
+    activeReasoningEffort:
+      saved.activeReasoningEffort ||
+      ideSettings['antigravity.harness.reasoningEffort'] ||
+      'high',
+    ideSettingsPath: '.vscode/settings.json',
+    secretVault: getSecretVaultStatusSummary(),
     subagentModelRouting: {
-      proposerModelId: saved.subagentModelRouting?.proposerModelId || 'deepseek-v4-pro',
+      proposerModelId:
+        saved.subagentModelRouting?.proposerModelId ||
+        ideRoleModels.proposerModelId ||
+        'deepseek-v4-pro',
       ragResearcherModelId:
-        saved.subagentModelRouting?.ragResearcherModelId || 'deepseek-flash',
+        saved.subagentModelRouting?.ragResearcherModelId ||
+        ideRoleModels.ragResearcherModelId ||
+        'deepseek-flash',
       proberAModelId:
-        saved.subagentModelRouting?.proberAModelId || 'opencode-go/kimi-k2.7-code',
+        saved.subagentModelRouting?.proberAModelId ||
+        ideRoleModels.proberAModelId ||
+        'opencode-go/kimi-k2.7-code',
       proberBModelId:
-        saved.subagentModelRouting?.proberBModelId || 'opencode-go/glm-5.3',
+        saved.subagentModelRouting?.proberBModelId ||
+        ideRoleModels.proberBModelId ||
+        'opencode-go/glm-5.3',
       proberCModelId:
-        saved.subagentModelRouting?.proberCModelId || 'opencode-go/gpt-6-luna',
+        saved.subagentModelRouting?.proberCModelId ||
+        ideRoleModels.proberCModelId ||
+        'opencode-go/gpt-6-luna',
       verifierModelId:
-        saved.subagentModelRouting?.verifierModelId || 'opencode-go/minimax-m3.1-flash',
+        saved.subagentModelRouting?.verifierModelId ||
+        ideRoleModels.verifierModelId ||
+        'opencode-go/minimax-m3.1-flash',
       composerModelId:
-        saved.subagentModelRouting?.composerModelId || 'opencode-go/grok-4.7',
+        saved.subagentModelRouting?.composerModelId ||
+        ideRoleModels.composerModelId ||
+        'opencode-go/grok-4.7',
     },
     modelReasoningDepths: {
       ...defaultDepths,
@@ -720,16 +787,20 @@ export function loadHubConfig(workspaceRoot) {
     providers: {
       deepseek: {
         enabled: saved.providers?.deepseek?.enabled ?? true,
-        baseUrl: saved.providers?.deepseek?.baseUrl || 'https://api.deepseek.com',
+        baseUrl:
+          saved.providers?.deepseek?.baseUrl ||
+          ideSettings['antigravity.harness.deepseek.baseUrl'] ||
+          'https://api.deepseek.com',
         chatCompletionsUrl: 'https://api.deepseek.com/chat/completions',
         responsesUrl: 'https://api.deepseek.com/responses',
         anthropicBaseUrl:
           saved.providers?.deepseek?.anthropicBaseUrl || 'https://api.deepseek.com/anthropic',
         searchUrl: 'https://api.deepseek.com/v1/tools/search',
         fetchUrl: 'https://api.deepseek.com/v1/tools/fetch',
-        apiKey: deepseekApiKey,
-        hasKey: Boolean(deepseekApiKey),
-        maskedKey: maskKey(deepseekApiKey),
+        hasKey: deepseekSec.hasKey,
+        hasApiKey: deepseekSec.hasKey,
+        keySource: deepseekSec.source,
+        vaultStatus: deepseekSec.hasKey ? '🔒 Stored Secretly' : 'Not Configured',
         preserveReasoningContent: true,
       },
       opencodeGo: {
@@ -737,7 +808,9 @@ export function loadHubConfig(workspaceRoot) {
         providerId: 'opencode-go',
         planType: 'opencode-go-coding-plan',
         baseUrl:
-          saved.providers?.opencodeGo?.baseUrl || 'https://opencode.ai/inference/go/openai/v1',
+          saved.providers?.opencodeGo?.baseUrl ||
+          ideSettings['antigravity.harness.opencodeGo.baseUrl'] ||
+          'https://opencode.ai/inference/go/openai/v1',
         openaiEndpoint:
           saved.providers?.opencodeGo?.openaiEndpoint ||
           'https://opencode.ai/inference/go/openai/v1/chat/completions',
@@ -752,13 +825,17 @@ export function loadHubConfig(workspaceRoot) {
           saved.providers?.opencodeGo?.localServerUrl || 'http://127.0.0.1:4096',
         sessionHeader:
           saved.providers?.opencodeGo?.sessionHeader || `ses_gwh_${wsHash}`,
-        apiKey: opencodeGoApiKey,
-        hasKey: Boolean(opencodeGoApiKey),
-        maskedKey: maskKey(opencodeGoApiKey),
+        hasKey: opencodeSec.hasKey,
+        hasApiKey: opencodeSec.hasKey,
+        keySource: opencodeSec.source,
+        vaultStatus: opencodeSec.hasKey ? '🔒 Stored Secretly' : 'Session Header Active',
       },
     },
     search: {
-      defaultEngine: saved.search?.defaultEngine || 'multi-fusion',
+      defaultEngine:
+        saved.search?.defaultEngine ||
+        ideSettings['antigravity.harness.search.defaultEngine'] ||
+        'multi-fusion',
       enabledEngines: saved.search?.enabledEngines || [
         'deepseek-search',
         'parallel',
@@ -768,15 +845,12 @@ export function loadHubConfig(workspaceRoot) {
         'wikipedia',
         'hn-algolia',
       ],
-      tavilyApiKey,
-      hasTavilyKey: Boolean(tavilyApiKey),
-      maskedTavilyKey: maskKey(tavilyApiKey),
-      parallelApiKey,
-      hasParallelKey: Boolean(parallelApiKey),
-      maskedParallelKey: maskKey(parallelApiKey),
-      jinaApiKey,
-      hasJinaKey: Boolean(jinaApiKey),
-      maskedJinaKey: maskKey(jinaApiKey),
+      hasTavilyKey: tavilySec.hasKey,
+      tavilyKeySource: tavilySec.source,
+      hasParallelKey: parallelSec.hasKey,
+      parallelKeySource: parallelSec.source,
+      hasJinaKey: jinaSec.hasKey,
+      jinaKeySource: jinaSec.source,
     },
     selfImprovement: {
       enabled: saved.selfImprovement?.enabled ?? true,
@@ -789,14 +863,54 @@ export function loadHubConfig(workspaceRoot) {
     updatedAt: saved.updatedAt || new Date().toISOString(),
   };
 
+  config.providers['deepseek-official'] = config.providers.deepseek;
+  config.providers['opencode-go'] = config.providers.opencodeGo;
+
   return config;
 }
 
 /**
- * Saves updated Model Hub / Provider / Search configuration.
+ * Saves updated Model Hub configuration and syncs non-secret settings to `.vscode/settings.json`
+ * (Antigravity IDE Settings). Any API keys passed in `patch` are immediately encrypted into
+ * `~/.gemini/config/.secrets.vault.enc` (AES-256-GCM) and stripped from plaintext JSON files.
  */
 export function saveHubConfig(workspaceRoot, patch = {}) {
   const current = loadHubConfig(workspaceRoot);
+
+  // Route any secret keys directly into the AES-256-GCM encrypted vault (never saved to workspace JSON)
+  const dsKey =
+    patch.providers?.deepseek?.apiKey || patch.providers?.['deepseek-official']?.apiKey;
+  if (dsKey) setSecretInVault('DEEPSEEK_API_KEY', dsKey);
+
+  const ocKey =
+    patch.providers?.opencodeGo?.apiKey || patch.providers?.['opencode-go']?.apiKey;
+  if (ocKey) setSecretInVault('OPENCODE_API_KEY', ocKey);
+
+  const tvKey = patch.search?.tavilyApiKey || patch.searchEngines?.tavily?.apiKey;
+  if (tvKey) setSecretInVault('TAVILY_API_KEY', tvKey);
+
+  const plKey = patch.search?.parallelApiKey || patch.searchEngines?.parallel?.apiKey;
+  if (plKey) setSecretInVault('PARALLEL_API_KEY', plKey);
+
+  const jnKey = patch.search?.jinaApiKey || patch.searchEngines?.jina?.apiKey;
+  if (jnKey) setSecretInVault('JINA_API_KEY', jnKey);
+
+  const cleanDeepseekPatch = {
+    ...(patch.providers?.deepseek || {}),
+    ...(patch.providers?.['deepseek-official'] || {}),
+  };
+  delete cleanDeepseekPatch.apiKey;
+
+  const cleanOpencodePatch = {
+    ...(patch.providers?.opencodeGo || {}),
+    ...(patch.providers?.['opencode-go'] || {}),
+  };
+  delete cleanOpencodePatch.apiKey;
+
+  const cleanSearchPatch = { ...(patch.search || {}) };
+  delete cleanSearchPatch.tavilyApiKey;
+  delete cleanSearchPatch.parallelApiKey;
+  delete cleanSearchPatch.jinaApiKey;
 
   const next = {
     ...current,
@@ -810,20 +924,21 @@ export function saveHubConfig(workspaceRoot, patch = {}) {
     modelReasoningDepths: {
       ...current.modelReasoningDepths,
       ...(patch.modelReasoningDepths || {}),
+      ...(patch.modelReasoningOverrides || {}),
     },
     providers: {
       deepseek: {
         ...current.providers.deepseek,
-        ...(patch.providers?.deepseek || {}),
+        ...cleanDeepseekPatch,
       },
       opencodeGo: {
         ...current.providers.opencodeGo,
-        ...(patch.providers?.opencodeGo || {}),
+        ...cleanOpencodePatch,
       },
     },
     search: {
       ...current.search,
-      ...(patch.search || {}),
+      ...cleanSearchPatch,
     },
     selfImprovement: {
       ...current.selfImprovement,
@@ -831,10 +946,33 @@ export function saveHubConfig(workspaceRoot, patch = {}) {
     },
     updatedAt: new Date().toISOString(),
   };
+  delete next.secretVault;
 
   const file = getHubConfigFile(workspaceRoot);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(next, null, 2), 'utf8');
+
+  // Sync non-secret preferences to Antigravity IDE Settings (.vscode/settings.json)
+  try {
+    const vsFile = getVscodeSettingsFile(workspaceRoot);
+    const existingVs = loadIdeSettings(workspaceRoot);
+    const updatedVs = {
+      $schema: '../schemas/antigravity-settings.schema.json',
+      ...existingVs,
+      'antigravity.harness.activeModel': next.activeModelId,
+      'antigravity.harness.reasoningDepth': next.activeReasoningDepth,
+      'antigravity.harness.reasoningEffort': next.activeReasoningEffort,
+      'antigravity.harness.deepseek.baseUrl': next.providers.deepseek.baseUrl,
+      'antigravity.harness.opencodeGo.baseUrl': next.providers.opencodeGo.baseUrl,
+      'antigravity.harness.search.defaultEngine': next.search.defaultEngine,
+      'antigravity.harness.swarmRoleModels': next.subagentModelRouting,
+    };
+    fs.mkdirSync(path.dirname(vsFile), { recursive: true });
+    fs.writeFileSync(vsFile, JSON.stringify(updatedVs, null, 2), 'utf8');
+  } catch {
+    // ignore if workspace is read-only
+  }
+
   return loadHubConfig(workspaceRoot);
 }
 
@@ -873,12 +1011,12 @@ export function getEnrichedModelCatalog(workspaceRoot, contextAnalytics = null) 
     if (m.provider === 'deepseek-official') {
       providerReady = cfg.providers.deepseek.enabled;
       authStatus = cfg.providers.deepseek.hasKey
-        ? `API Key (${cfg.providers.deepseek.maskedKey})`
-        : 'Co-op Bridge Ready (Set DEEPSEEK_API_KEY for live 1M API)';
+        ? '🔒 Secret Vault Ready'
+        : 'Co-op Bridge Ready (Set DEEPSEEK_API_KEY in Vault / ~/.env)';
     } else if (m.provider === 'opencode-go') {
       providerReady = cfg.providers.opencodeGo.enabled;
       authStatus = cfg.providers.opencodeGo.hasKey
-        ? `Go Plan Key (${cfg.providers.opencodeGo.maskedKey})`
+        ? '🔒 Secret Vault Ready'
         : `OpenCode Go Plan (${cfg.providers.opencodeGo.sessionHeader})`;
     }
 
@@ -1071,8 +1209,9 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
     options.systemPrompt ||
     `You are an autonomous agent node in Gravity Well Harness running on ${modelMeta.name} (${modelMeta.providerLabel}) with reasoningDepth=${reasoningDepth.toUpperCase()} (reasoning_effort=${reasoningEffort}, thinkingBudget=${depthProfile.thinkingBudgetTokens} tokens).`;
 
-  // 1. Live DeepSeek Official API call when DEEPSEEK_API_KEY is configured
-  if (modelMeta.provider === 'deepseek-official' && cfg.providers.deepseek.hasKey) {
+  // 1. Live DeepSeek Official API call when DEEPSEEK_API_KEY is configured in Secret Vault / ~/.env
+  const deepseekSecret = resolveSecretCredential('DEEPSEEK_API_KEY');
+  if (modelMeta.provider === 'deepseek-official' && deepseekSecret.hasKey) {
     try {
       const baseUrl = cfg.providers.deepseek.baseUrl.replace(/\/+$/, '');
       const url = `${baseUrl}/chat/completions`;
@@ -1100,7 +1239,7 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${cfg.providers.deepseek.apiKey}`,
+          Authorization: `Bearer ${deepseekSecret.value}`,
         },
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(15_000),
@@ -1135,8 +1274,13 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
     }
   }
 
-  // 2. Live OpenCode Go Coding Plan API call when OPENCODE_API_KEY is configured
-  if (modelMeta.provider === 'opencode-go' && cfg.providers.opencodeGo.hasKey) {
+  // 2. Live OpenCode Go Coding Plan API call when OPENCODE_API_KEY is configured in Secret Vault / ~/.env
+  const opencodeSecret = resolveSecretCredential([
+    'OPENCODE_GO_API_KEY',
+    'OPENCODE_API_KEY',
+    'OPENCODE_ZEN_API_KEY',
+  ]);
+  if (modelMeta.provider === 'opencode-go' && opencodeSecret.hasKey) {
     try {
       const strippedModelId = modelMeta.id.replace(/^opencode-go\//, '');
       const isAnthropicWire = modelMeta.wireFormat === 'opencode-go-anthropic';
@@ -1150,7 +1294,7 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
       };
       let body;
       if (isAnthropicWire) {
-        headers['x-api-key'] = cfg.providers.opencodeGo.apiKey;
+        headers['x-api-key'] = opencodeSecret.value;
         headers['anthropic-version'] = '2023-06-01';
         body = {
           model: strippedModelId,
@@ -1159,7 +1303,7 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
           messages: [{ role: 'user', content: prompt }],
         };
       } else {
-        headers.Authorization = `Bearer ${cfg.providers.opencodeGo.apiKey}`;
+        headers.Authorization = `Bearer ${opencodeSecret.value}`;
         body = {
           model: strippedModelId,
           messages: [
@@ -1277,13 +1421,14 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
   if (enginesToRun.includes('deepseek-search')) {
     tasks.push(
       (async () => {
-        if (cfg.providers.deepseek.hasKey) {
+        const dsSec = resolveSecretCredential('DEEPSEEK_API_KEY');
+        if (dsSec.hasKey) {
           try {
             const res = await fetch('https://api.deepseek.com/v1/tools/search', {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
-                Authorization: `Bearer ${cfg.providers.deepseek.apiKey}`,
+                Authorization: `Bearer ${dsSec.value}`,
               },
               body: JSON.stringify({
                 query: query.slice(0, 128),
@@ -1314,13 +1459,14 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
   if (enginesToRun.includes('parallel')) {
     tasks.push(
       (async () => {
-        if (cfg.search.hasParallelKey) {
+        const plSec = resolveSecretCredential('PARALLEL_API_KEY');
+        if (plSec.hasKey) {
           try {
             const res = await fetch('https://api.parallel.ai/v1beta/search', {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
-                'x-api-key': cfg.search.parallelApiKey,
+                'x-api-key': plSec.value,
               },
               body: JSON.stringify({
                 objective: query,
@@ -1350,13 +1496,14 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
   if (enginesToRun.includes('tavily')) {
     tasks.push(
       (async () => {
-        if (cfg.search.hasTavilyKey) {
+        const tvSec = resolveSecretCredential('TAVILY_API_KEY');
+        if (tvSec.hasKey) {
           try {
             const res = await fetch('https://api.tavily.com/search', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
-                api_key: cfg.search.tavilyApiKey,
+                api_key: tvSec.value,
                 query,
                 search_depth: 'basic',
                 max_results: limit,

@@ -1771,99 +1771,23 @@
   }
 
   function renderSettingsTab(data) {
-    if (settingsInitializedForWs === data.workspaceRoot) return;
     const s = data.settings || {};
-    document.getElementById('set-rag-backend').value = s.rag?.primaryBackend || 'qmd-hybrid';
-    document.getElementById('set-auto-index').checked = s.rag?.autoIndexOnChange !== false;
-    document.getElementById('set-qmd-cli').checked = s.rag?.enableQmdCliIfAvailable !== false;
-    document.getElementById('set-basic-memory').checked = Boolean(
-      s.rag?.optionalBackends?.basicMemory?.enabled
-    );
-    document.getElementById('set-context7-enabled').checked =
-      s.externalDocs?.context7?.enabled !== false;
-    document.getElementById('set-context7-key').value = s.externalDocs?.context7?.apiKey || '';
-    document.getElementById('set-google-dev-enabled').checked = Boolean(
-      s.externalDocs?.googleDeveloperKnowledge?.enabled
-    );
-    document.getElementById('set-h2-level').value =
-      s.harness2?.executionLevel || 'native-antigravity-swarm';
-    document.getElementById('set-strict-snapshot').checked =
-      s.harness2?.strictSnapshotIsolation !== false;
-    document.getElementById('set-h2-mode').value = s.harness2?.defaultMode || 'parallel';
-    document.getElementById('set-h2-k').value = String(s.harness2?.defaultCandidatesK || 2);
-    const depthEl = document.getElementById('set-h2-reasoning-depth');
-    if (depthEl) depthEl.value = s.harness2?.reasoningDepth || 'balanced';
-    const thinkEl = document.getElementById('set-h2-thinking-budget');
-    if (thinkEl) thinkEl.value = String(s.harness2?.thinkingBudgetTokens || 2048);
-    const proberModelEl = document.getElementById('set-h2-prober-model');
-    if (proberModelEl) proberModelEl.value = s.harness2?.proberModelTier || 'flash';
-    const snipCapEl = document.getElementById('set-h2-snippet-cap');
-    if (snipCapEl) snipCapEl.value = String(s.harness2?.ragSnippetMaxChars || 500);
-    const earlyStopEl = document.getElementById('set-h2-early-stop');
-    if (earlyStopEl) earlyStopEl.checked = s.harness2?.earlyStopOnFirstPass !== false;
     const runDepthEl = document.getElementById('h2-run-depth');
-    if (runDepthEl) runDepthEl.value = s.harness2?.reasoningDepth || 'balanced';
-    document.getElementById('set-hook-preplan').checked =
-      s.uiMonitor?.enablePrePlanningRagHook !== false;
-    document.getElementById('set-hook-telemetry').checked =
-      s.uiMonitor?.enablePostToolTelemetryHook !== false;
-
-    const hub = data.modelHub || {};
-    const hubCfg = hub.config || {};
-    const dsUrlEl = document.getElementById('set-deepseek-url');
-    if (dsUrlEl && hubCfg.providers?.['deepseek-official']?.baseUrl) {
-      dsUrlEl.value = hubCfg.providers['deepseek-official'].baseUrl;
-    }
-    const ocUrlEl = document.getElementById('set-opencode-url');
-    if (ocUrlEl && hubCfg.providers?.['opencode-go']?.baseUrl) {
-      ocUrlEl.value = hubCfg.providers['opencode-go'].baseUrl;
+    if (runDepthEl && settingsInitializedForWs !== data.workspaceRoot) {
+      runDepthEl.value = s.harness2?.reasoningDepth || 'balanced';
+      settingsInitializedForWs = data.workspaceRoot || 'init';
     }
 
-    const tableWrap = document.getElementById('model-catalog-table-wrap');
-    const catalog = hub.catalog || [];
-    if (tableWrap && catalog.length > 0) {
-      tableWrap.innerHTML = `
-        <table class="model-catalog-table">
-          <thead>
-            <tr>
-              <th>Model Name &amp; ID</th>
-              <th>Provider &amp; Endpoint</th>
-              <th>Reasoning Depth · Effort</th>
-              <th>Context Usage (Used / Max)</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${catalog
-              .map((m) => {
-                const depthUpper = String(m.reasoningDepth || 'balanced').toUpperCase();
-                return `
-                  <tr>
-                    <td>
-                      <strong>${escapeHtml(m.name)}</strong><br/>
-                      <code>${escapeHtml(m.id)}</code> · <span class="muted-text">${escapeHtml(m.underlyingModel || '')}</span>
-                    </td>
-                    <td>
-                      <span class="pill-badge">${escapeHtml(m.providerLabel || m.provider)}</span><br/>
-                      <span class="muted-text" style="font-size:10px;">${escapeHtml(m.endpoint || '')}</span>
-                    </td>
-                    <td>
-                      <span class="pill-badge pill-ok">${escapeHtml(depthUpper)} · effort=${escapeHtml(m.reasoningEffort || 'high')}</span><br/>
-                      <span class="muted-text" style="font-size:10px;">Thinking cap: ${Number(m.thinkingBudgetTokens || 2048).toLocaleString()} tok</span>
-                    </td>
-                    <td>
-                      <strong>${formatCompactContext(m.usedContextTokens || 55100)} / ${formatCompactContext(m.contextWindowTokens || 256000)}</strong>
-                      <span class="pill-badge" style="margin-left:4px;">${Number(m.contextUsedPct || 0)}%</span>
-                    </td>
-                  </tr>
-                `;
-              })
-              .join('')}
-          </tbody>
-        </table>
-      `;
+    const vaultBadge = document.getElementById('inline-vault-badge');
+    if (vaultBadge) {
+      const vault = data.modelHub?.config?.secretVault || s.secretVault || {};
+      const keyStatus = vault.keys || {};
+      const configuredCount = Object.values(keyStatus).filter((k) => k && k.configured).length;
+      vaultBadge.textContent = `🔒 IDE Settings · Vault (${configuredCount} keys)`;
+      vaultBadge.title =
+        `Configuration in Antigravity IDE Settings (.vscode/settings.json · Ctrl+,) · ` +
+        `API Keys encrypted in ~/.gemini/config/.secrets.vault.enc (AES-256-GCM) & ~/.env (${configuredCount} configured)`;
     }
-
-    settingsInitializedForWs = data.workspaceRoot || 'init';
   }
 
   async function runRagSearch(customQuery) {
@@ -2400,54 +2324,6 @@
     }
   });
 
-  document.getElementById('btn-save-settings').addEventListener('click', async () => {
-    const settingsPayload = {
-      rag: {
-        primaryBackend: document.getElementById('set-rag-backend').value,
-        autoIndexOnChange: document.getElementById('set-auto-index').checked,
-        enableQmdCliIfAvailable: document.getElementById('set-qmd-cli').checked,
-        optionalBackends: {
-          basicMemory: {
-            enabled: document.getElementById('set-basic-memory').checked,
-          },
-        },
-      },
-      externalDocs: {
-        context7: {
-          enabled: document.getElementById('set-context7-enabled').checked,
-          apiKey: document.getElementById('set-context7-key').value.trim(),
-        },
-        googleDeveloperKnowledge: {
-          enabled: document.getElementById('set-google-dev-enabled').checked,
-        },
-      },
-      harness2: {
-        executionLevel: document.getElementById('set-h2-level').value,
-        strictSnapshotIsolation: document.getElementById('set-strict-snapshot').checked,
-        defaultMode: document.getElementById('set-h2-mode').value,
-        defaultCandidatesK: Number(document.getElementById('set-h2-k').value || 2),
-        reasoningDepth: document.getElementById('set-h2-reasoning-depth')?.value || 'balanced',
-        thinkingBudgetTokens: Number(
-          document.getElementById('set-h2-thinking-budget')?.value || 2048
-        ),
-        proberModelTier: document.getElementById('set-h2-prober-model')?.value || 'flash',
-        ragSnippetMaxChars: Number(document.getElementById('set-h2-snippet-cap')?.value || 500),
-        earlyStopOnFirstPass:
-          document.getElementById('set-h2-early-stop')?.checked !== false,
-      },
-      uiMonitor: {
-        enablePrePlanningRagHook: document.getElementById('set-hook-preplan').checked,
-        enablePostToolTelemetryHook: document.getElementById('set-hook-telemetry').checked,
-      },
-    };
-
-    const res = await apiFetch('/api/settings/save', { settings: settingsPayload });
-    if (res.ok) {
-      showToast('Settings saved to .harness/config.json, global config, and plugin MCP config!');
-      await refreshDashboard();
-    }
-  });
-
   // =========================================================================
   // MULTI-MODEL HUB, MESSAGE INJECTION, WEB SEARCH & SELF-IMPROVEMENT WIRING
   // =========================================================================
@@ -2629,50 +2505,6 @@
     ?.addEventListener('click', handleMultiEngineSearch);
   document.getElementById('multi-search-input')?.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') handleMultiEngineSearch();
-  });
-
-  document.getElementById('btn-save-hub-config')?.addEventListener('click', async () => {
-    const deepseekUrl =
-      document.getElementById('set-deepseek-url')?.value?.trim() || 'https://api.deepseek.com';
-    const deepseekKey = document.getElementById('set-deepseek-key')?.value?.trim() || '';
-    const opencodeUrl =
-      document.getElementById('set-opencode-url')?.value?.trim() ||
-      'https://opencode.ai/inference/go/openai/v1';
-    const opencodeKey = document.getElementById('set-opencode-key')?.value?.trim() || '';
-    const parallelKey = document.getElementById('set-parallel-key')?.value?.trim() || '';
-    const tavilyKey = document.getElementById('set-tavily-key')?.value?.trim() || '';
-    const jinaKey = document.getElementById('set-jina-key')?.value?.trim() || '';
-
-    const configUpdate = {
-      providers: {
-        'deepseek-official': {
-          baseUrl: deepseekUrl,
-          ...(deepseekKey ? { apiKey: deepseekKey } : {}),
-        },
-        'opencode-go': {
-          baseUrl: opencodeUrl,
-          ...(opencodeKey ? { apiKey: opencodeKey } : {}),
-        },
-      },
-      searchEngines: {
-        ...(parallelKey ? { parallel: { apiKey: parallelKey } } : {}),
-        ...(tavilyKey ? { tavily: { apiKey: tavilyKey } } : {}),
-        ...(jinaKey ? { jina: { apiKey: jinaKey } } : {}),
-      },
-    };
-
-    const res = await apiFetch('/api/models/config', {
-      action: 'save',
-      config: configUpdate,
-    });
-    if (res && res.ok) {
-      lastModelCatalogSig = '';
-      settingsInitializedForWs = '';
-      showToast(
-        '💾 Saved DeepSeek Official, OpenCode Go Coding Plan & Search Hub configuration!'
-      );
-      await refreshDashboard(false);
-    }
   });
 
   // Initial load + initial search + 1-second real-time live pulse stream

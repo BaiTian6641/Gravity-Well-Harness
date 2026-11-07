@@ -15,6 +15,7 @@
   "scripts": {
     "setup": "node setup.mjs",
     "uninstall": "node setup.mjs --uninstall",
+    "secrets": "node scripts/manage-secrets.mjs status",
     "start:sidecar": "node sidecars/harness-ide-monitor/server.mjs",
     "start:mcp": "node mcp/harness-rag-server.mjs",
     "test": "node --test test/harness-ide.test.mjs"

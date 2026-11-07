@@ -55,6 +55,9 @@
         <button class="btn btn-secondary btn-xs" id="btn-self-improve-top" title="Run Multi-Model Self-Improvement &amp; Cooperation Cycle (Harness² + Peer Critique)">
           🧠 Self-Improve Swarm
         </button>
+        <span class="pill-badge pill-ok" id="inline-vault-badge" title="Configured via Antigravity IDE Settings (.vscode/settings.json · Ctrl+,) · API Keys encrypted in ~/.gemini/config/.secrets.vault.enc (AES-256-GCM)">
+          🔒 IDE Settings &amp; Vault
+        </span>
       </div>
 
       <div class="imc-right" id="inline-context-usage-bar" title="Real-Time Context Window Usage &amp; 8-Segment Context DNA (Inline in Antigravity UI)">
@@ -79,7 +82,7 @@
     <!-- Toast Banner -->
     <div id="toast-banner" class="toast-banner hidden"></div>
 
-    <!-- 5-Tab Navigation Bar -->
+    <!-- 4-Tab Pure Monitor Navigation Bar (Configuration lives in Antigravity IDE Settings) -->
     <nav class="tab-nav" role="tablist">
       <button class="tab-btn active" data-tab="swarm" role="tab">
         <span>1. Swarm Formation (编队)</span>
@@ -88,13 +91,10 @@
         <span>2. Context &amp; Token DNA (上下文)</span>
       </button>
       <button class="tab-btn" data-tab="harness2" role="tab">
-        <span>3. Harness² Studio</span>
+        <span>3. Harness² Monitor</span>
       </button>
       <button class="tab-btn" data-tab="rag" role="tab">
         <span>4. Local RAG (QMD)</span>
-      </button>
-      <button class="tab-btn" data-tab="settings" role="tab">
-        <span>5. Settings</span>
       </button>
     </nav>
 
@@ -711,268 +711,6 @@
             <button class="btn btn-primary" id="btn-save-note">➕ Save Markdown Note &amp; Refresh Index</button>
           </div>
         </div>
-      </div>
-    </section>
-
-    <!-- =================================================================== -->
-    <!-- TAB 5: EASY-TO-UNDERSTAND VISUAL SETTINGS MANAGER                   -->
-    <!-- =================================================================== -->
-    <section id="tab-settings" class="tab-panel">
-      <div class="card card-highlight">
-        <div class="card-header">
-          <div>
-            <span class="eyebrow">LOCAL-FIRST CONFIGURATION (.harness/config.json)</span>
-            <h2 class="card-title">Gravity Well Harness &amp; Local RAG Settings</h2>
-          </div>
-          <button class="btn btn-primary" id="btn-save-settings">💾 Save All Settings</button>
-        </div>
-        <p class="help-text">
-          All settings are stored locally on your machine (<code>.harness/config.json</code> &amp; <code>~/.gemini/config/harness-ide-settings.json</code>) and automatically update your plugin's MCP wiring.
-        </p>
-      </div>
-
-      <div class="card">
-        <div class="card-header">
-          <div>
-            <span class="eyebrow">1. LOCAL KNOWLEDGE &amp; RAG LAYER</span>
-            <h3 class="card-title">Primary Retrieval Engine &amp; Indexing</h3>
-          </div>
-        </div>
-        <div class="settings-list">
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-title">Primary Local Knowledge Backend</div>
-              <div class="setting-desc">
-                <strong>QMD + Built-in Hybrid</strong> indexes versioned Markdown &amp; Harness² <code>EXPERIENCE.md</code> files locally. Switch to <strong>Basic Memory</strong> for an actively linked notebook, or <strong>RAGFlow</strong> when ingesting heavy PDFs/hardware manuals.
-              </div>
-            </div>
-            <select id="set-rag-backend" class="input-field select-medium">
-              <option value="qmd-hybrid">QMD + Built-in Local Hybrid (Recommended)</option>
-              <option value="builtin-local">Built-in Zero-Dep Hybrid Only (SQLite/BM25+Vec)</option>
-              <option value="basic-memory">Basic Memory (Editable Notebook MCP)</option>
-              <option value="ragflow">RAGFlow (PDFs &amp; Hardware Manuals Backend)</option>
-            </select>
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-title">Auto-Refresh RAG Index on File Save</div>
-              <div class="setting-desc">Automatically rebuilds the local search index whenever Markdown notes or <code>EXPERIENCE.md</code> files change.</div>
-            </div>
-            <input type="checkbox" id="set-auto-index" class="toggle-checkbox" checked />
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-title">Sync with QMD CLI When Installed (<code>tobi/qmd</code>)</div>
-              <div class="setting-desc">Runs <code>qmd update</code> alongside the built-in hybrid indexer when <code>qmd</code> is found on PATH.</div>
-            </div>
-            <input type="checkbox" id="set-qmd-cli" class="toggle-checkbox" checked />
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-title">Enable Basic Memory Companion MCP</div>
-              <div class="setting-desc">Adds <code>basic-memory mcp</code> to the plugin's MCP servers for bidirectional note linking.</div>
-            </div>
-            <input type="checkbox" id="set-basic-memory" class="toggle-checkbox" />
-          </div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-header">
-          <div>
-            <span class="eyebrow">2. CURRENT EXTERNAL DOCUMENTATION</span>
-            <h3 class="card-title">Context7 &amp; Google Developer Knowledge</h3>
-          </div>
-        </div>
-        <div class="settings-list">
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-title">Enable Context7 MCP (<code>mcp.context7.com</code>)</div>
-              <div class="setting-desc">Fetches up-to-date, version-specific documentation and code examples for external libraries and frameworks.</div>
-            </div>
-            <input type="checkbox" id="set-context7-enabled" class="toggle-checkbox" checked />
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-title">Context7 API Key (Optional)</div>
-              <div class="setting-desc">Optional Bearer token from context7.com/dashboard for higher rate limits (stored locally only).</div>
-            </div>
-            <input type="password" id="set-context7-key" class="input-field select-medium" placeholder="Optional API key…" />
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-title">Enable Google Developer Knowledge MCP</div>
-              <div class="setting-desc">Connects <code>https://developers.google.com/knowledge/mcp</code> for official Android, Firebase, and Google Cloud documentation.</div>
-            </div>
-            <input type="checkbox" id="set-google-dev-enabled" class="toggle-checkbox" />
-          </div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-header">
-          <div>
-            <span class="eyebrow">3. GOOGLE RESEARCH HARNESS² CONFIGURATION</span>
-            <h3 class="card-title">Propose–Probe–Compose &amp; Snapshot Isolation</h3>
-          </div>
-        </div>
-        <div class="settings-list">
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-title">Harness² Execution Integration Level</div>
-              <div class="setting-desc">Choose whether Antigravity executes candidate probes directly via branched subagent swarms or delegates to the Python <code>AntigravityExecutor</code> / upstream <code>harness2</code> CLI.</div>
-            </div>
-            <select id="set-h2-level" class="input-field select-medium">
-              <option value="native-antigravity-swarm">Native Antigravity Branched Subagent Swarm</option>
-              <option value="harness2-python-sdk-adapter">Python AntigravityExecutor Adapter</option>
-              <option value="harness2-cli-opencode">Upstream Harness² CLI (OpenCode/Codex)</option>
-            </select>
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-title">Strict Snapshot Isolation During Candidate Probes</div>
-              <div class="setting-desc">Guarantees that during a comparison of <em>K</em> candidate harnesses, later candidates cannot read notes written during earlier candidates' execution.</div>
-            </div>
-            <input type="checkbox" id="set-strict-snapshot" class="toggle-checkbox" checked />
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-title">Default Recursion Mode &amp; Candidate Count (<em>K</em>)</div>
-              <div class="setting-desc">Parallel explores <em>K</em> candidates concurrently in branched workspaces; Sequential refines through <em>K</em> steps.</div>
-            </div>
-            <div class="inline-pair">
-              <select id="set-h2-mode" class="input-field select-compact">
-                <option value="parallel">Parallel</option>
-                <option value="sequential">Sequential</option>
-              </select>
-              <input type="number" id="set-h2-k" class="input-field input-tiny" value="2" min="1" max="6" />
-            </div>
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-title">Reasoning Depth &amp; Token Efficiency Profile</div>
-              <div class="setting-desc">Controls thinking token depth, Cue-First RAG snippet pruning, and subagent model routing so Harness² loops stay fast and token-efficient.</div>
-            </div>
-            <select id="set-h2-reasoning-depth" class="input-field select-medium">
-              <option value="balanced">Balanced / Adaptive (~53% fewer tokens — Recommended)</option>
-              <option value="eco">Eco / Token-Saver (~71% fewer tokens · Flash-Lite)</option>
-              <option value="deep">Deep Reasoning (Complex Architecture &amp; Multi-Stage)</option>
-            </select>
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-title">Max Thinking Token Budget &amp; Candidate Prober Model Tier</div>
-              <div class="setting-desc">Caps thinking tokens per probe turn (e.g. <code>2048</code>) and routes candidate probers to lighter models (<code>flash</code> / <code>flash_lite</code>) while keeping your main agent on its primary model.</div>
-            </div>
-            <div class="inline-pair">
-              <input type="number" id="set-h2-thinking-budget" class="input-field select-compact" value="2048" min="512" max="16384" step="256" title="Max Thinking Tokens per Turn" />
-              <select id="set-h2-prober-model" class="input-field select-compact" title="Prober Subagent Model Tier">
-                <option value="flash">flash (Fast &amp; Token-Efficient)</option>
-                <option value="flash_lite">flash_lite (Ultra-Low Token Cost)</option>
-                <option value="inherit">inherit (Same as Main Agent)</option>
-                <option value="pro">pro (Heavy Reasoning)</option>
-              </select>
-            </div>
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-title">Cue-First RAG Snippet Cap &amp; Early-Stop Token Guardrail</div>
-              <div class="setting-desc">Truncates retrieved RAG snippets to compact cues (default <code>500</code> chars) and stops sequential probing early once a candidate passes 100% of verification checks.</div>
-            </div>
-            <div class="inline-pair">
-              <input type="number" id="set-h2-snippet-cap" class="input-field input-tiny" value="500" min="160" max="2000" step="50" title="Max RAG Snippet Chars" />
-              <input type="checkbox" id="set-h2-early-stop" class="toggle-checkbox" checked title="Early-Stop on First Verified Pass" />
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-header">
-          <div>
-            <span class="eyebrow">4. LIFECYCLE HOOKS &amp; SWARM TELEMETRY</span>
-            <h3 class="card-title">Automated Context Injection &amp; UI Polling</h3>
-          </div>
-        </div>
-        <div class="settings-list">
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-title">Pre-Planning RAG Context Hook (<code>SessionStart</code>)</div>
-              <div class="setting-desc">Injects active local knowledge counts and Snapshot Isolation lock status at session start.</div>
-            </div>
-            <input type="checkbox" id="set-hook-preplan" class="toggle-checkbox" checked />
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-title">Live Swarm Telemetry Hook (<code>PostToolUse</code>)</div>
-              <div class="setting-desc">Streams subagent invocations and tool execution events to the Swarm Monitor in real time.</div>
-            </div>
-            <input type="checkbox" id="set-hook-telemetry" class="toggle-checkbox" checked />
-          </div>
-        </div>
-      </div>
-      <div class="card">
-        <div class="card-header">
-          <div>
-            <span class="eyebrow">5. MULTI-MODEL ENDPOINTS (DEEPSEEK OFFICIAL + OPENCODE GO) &amp; SEARCH HUB</span>
-            <h3 class="card-title">DeepSeek V4-Pro/Flash (1M), OpenCode Go Coding Plan &amp; Parallel / Tavily / Free Search</h3>
-          </div>
-          <button class="btn btn-primary btn-xs" id="btn-save-hub-config">💾 Save Model &amp; Search Hub</button>
-        </div>
-        <div class="settings-list">
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-title">DeepSeek Official Endpoint &amp; API Key (<code>https://api.deepseek.com</code>)</div>
-              <div class="setting-desc">Supports <code>deepseek-v4-pro</code> (<code>DeepSeek-V4-Pro-0813</code> · 1M ctx) &amp; <code>deepseek-flash</code> (<code>DeepSeek-V4.1-Flash-1017</code> · 1M Vision), <code>/responses</code>, <code>/anthropic</code>, and <code>/v1/tools/search</code>.</div>
-            </div>
-            <div class="inline-pair">
-              <input type="text" id="set-deepseek-url" class="input-field select-compact" value="https://api.deepseek.com" placeholder="https://api.deepseek.com" />
-              <input type="password" id="set-deepseek-key" class="input-field select-compact" placeholder="DEEPSEEK_API_KEY (sk-…)" />
-            </div>
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-title">OpenCode Go Coding Plan Endpoint &amp; API Key (<code>opencode-go/*</code>)</div>
-              <div class="setting-desc">Routes <code>opencode-go/grok-4.7</code>, <code>gpt-6-luna</code>, <code>claude-haiku-5-5</code>, <code>gemini-4-argon</code>, <code>kimi-k3.1-pro</code>, <code>kimi-k2.7-code</code>, <code>glm-5.3</code>, <code>mimo-v2.6-pro</code>, <code>minimax-m3.1-flash</code>, <code>qwen3.7-max</code>, <code>longcat-2.0</code>, <code>step-5-preview</code> via <code>https://opencode.ai/inference/go</code>.</div>
-            </div>
-            <div class="inline-pair">
-              <input type="text" id="set-opencode-url" class="input-field select-compact" value="https://opencode.ai/inference/go/openai/v1" placeholder="https://opencode.ai/inference/go/openai/v1" />
-              <input type="password" id="set-opencode-key" class="input-field select-compact" placeholder="OPENCODE_API_KEY (oc_sk_…)" />
-            </div>
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-title">Multi-Engine Search Keys (Parallel AI · Tavily · Jina)</div>
-              <div class="setting-desc">Parallel AI MCP (<code>https://search.parallel.ai/mcp</code>), DuckDuckGo, Wikipedia, and HN Algolia work zero-key out of the box; add optional API keys for higher rate limits.</div>
-            </div>
-            <div class="inline-pair" style="flex-wrap:wrap;">
-              <input type="password" id="set-parallel-key" class="input-field select-compact" placeholder="PARALLEL_API_KEY (optional)" />
-              <input type="password" id="set-tavily-key" class="input-field select-compact" placeholder="TAVILY_API_KEY (tvly-…)" />
-              <input type="password" id="set-jina-key" class="input-field select-compact" placeholder="JINA_API_KEY (optional)" />
-            </div>
-          </div>
-        </div>
-
-        <div class="card-header" style="margin-top:10px; border-top:1px solid rgba(148,163,184,0.14); padding-top:10px;">
-          <div>
-            <span class="eyebrow">FULL MODEL CATALOG · NAME, REASONING DEPTH / EFFORT &amp; LIVE CONTEXT USAGE</span>
-            <h3 class="card-title">Registered Models Across DeepSeek Official, OpenCode Go &amp; Antigravity Native</h3>
-          </div>
-        </div>
-        <div id="model-catalog-table-wrap" class="stack-list"></div>
       </div>
     </section>
   </div>

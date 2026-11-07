@@ -5,6 +5,12 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { HarnessKnowledgeEngine } from '../src/rag-engine.mjs';
+import {
+  setSecretInVault,
+  resolveSecretCredential,
+  getSecretVaultStatusSummary,
+  redactSecrets,
+} from '../src/secret-vault.mjs';
 import { handleToolCall } from '../mcp/harness-rag-server.mjs';
 import { createHarnessMonitorApp } from '../sidecars/harness-ide-monitor/server.mjs';
 
@@ -557,6 +563,91 @@ test('8. Multi-Model Hub (DeepSeek Official + OpenCode Go), Bidirectional Subage
     assert.equal(rsiData.cooperationRoster.composerModel, 'opencode-go/gpt-6-luna');
     assert.ok(rsiData.peerCritiques.length >= 2);
     assert.ok(rsiData.winner.score >= 0.85);
+
+    // 5. Verify Antigravity IDE Settings (.vscode/settings.json), Pure Monitor Sidecar UI, and AES-256-GCM Secret Vault (Zero Leakage)
+    const indexHtml = fs.readFileSync(
+      path.join(REPO_ROOT, 'sidecars', 'harness-ide-monitor', 'ui', 'index.html'),
+      'utf8'
+    );
+    assert.ok(
+      !indexHtml.includes('id="tab-settings"'),
+      'Sidecar Monitor UI must be strictly a Monitor page without a Settings tab'
+    );
+    assert.ok(
+      !indexHtml.includes('type="password"'),
+      'Sidecar Monitor UI must not contain password/API key input fields'
+    );
+
+    const ideSettingsPath = path.join(REPO_ROOT, '.vscode', 'settings.json');
+    assert.ok(fs.existsSync(ideSettingsPath), 'Expected .vscode/settings.json for Antigravity IDE Settings');
+    const ideSettings = JSON.parse(fs.readFileSync(ideSettingsPath, 'utf8'));
+    assert.ok(ideSettings['antigravity.harness.activeModel'], 'Expected antigravity.harness.activeModel in IDE settings');
+    assert.ok(ideSettings['antigravity.harness.reasoningDepth'], 'Expected antigravity.harness.reasoningDepth in IDE settings');
+
+    // Test storing a synthetic API key via /api/models/config and verifying zero leakage in disk JSON or HTTP responses
+    const testSecretVal = 'sk-test-vault-never-leak-9988776655443322';
+    const prevDeepSeekCred = resolveSecretCredential('DEEPSEEK_API_KEY');
+    try {
+      const cfgSaveRes = await fetch(`${base}/api/models/config`, {
+        method: 'POST',
+        body: JSON.stringify({
+          workspaceRoot: REPO_ROOT,
+          providers: {
+            'deepseek-official': {
+              baseUrl: 'https://api.deepseek.com',
+              apiKey: testSecretVal,
+            },
+          },
+        }),
+      });
+      assert.equal(cfgSaveRes.status, 200);
+      const cfgSaveData = await cfgSaveRes.json();
+      assert.ok(
+        !JSON.stringify(cfgSaveData).includes(testSecretVal),
+        'API response from /api/models/config must never echo or leak the API key'
+      );
+
+      // Verify encrypted vault resolves the secret in memory
+      const resolved = resolveSecretCredential('DEEPSEEK_API_KEY');
+      assert.equal(resolved.hasKey, true);
+      assert.equal(resolved.value, testSecretVal);
+      assert.ok(resolved.source.includes('aes-256-gcm-vault'));
+
+      // Verify .harness/runtime/model-search-hub.json, .vscode/settings.json, and /api/dashboard NEVER contain the secret
+      const hubDiskRaw = fs.readFileSync(
+        path.join(REPO_ROOT, '.harness', 'runtime', 'model-search-hub.json'),
+        'utf8'
+      );
+      assert.ok(!hubDiskRaw.includes(testSecretVal), 'model-search-hub.json must never contain plaintext API keys');
+      const ideDiskRaw = fs.readFileSync(ideSettingsPath, 'utf8');
+      assert.ok(!ideDiskRaw.includes(testSecretVal), '.vscode/settings.json must never contain plaintext API keys');
+
+      const dashVerifyRes = await fetch(`${base}/api/dashboard`, {
+        method: 'POST',
+        body: JSON.stringify({ workspaceRoot: REPO_ROOT }),
+      });
+      const dashVerifyJson = await dashVerifyRes.json();
+      assert.ok(
+        !JSON.stringify(dashVerifyJson).includes(testSecretVal),
+        '/api/dashboard HTTP response must never leak plaintext API keys'
+      );
+      assert.equal(
+        dashVerifyJson.modelHub.config.providers['deepseek-official'].hasApiKey,
+        true
+      );
+      assert.equal(
+        redactSecrets(`Bearer ${testSecretVal}`),
+        'Bearer [REDACTED_API_KEY]'
+      );
+      assert.ok(getSecretVaultStatusSummary().cipher.includes('AES-256-GCM'));
+    } finally {
+      // Restore previous DEEPSEEK_API_KEY vault state
+      if (prevDeepSeekCred.hasKey && prevDeepSeekCred.source.includes('aes-256-gcm-vault')) {
+        setSecretInVault('DEEPSEEK_API_KEY', prevDeepSeekCred.value);
+      } else {
+        setSecretInVault('DEEPSEEK_API_KEY', '');
+      }
+    }
 
     // Clean up recall state and consume any remaining test message-bus messages
     await fetch(`${base}/api/swarm/recall`, {

@@ -36,16 +36,14 @@
       },
       "ragflow": {
         "enabled": false,
-        "baseUrl": "http://127.0.0.1:9380",
-        "apiKey": ""
+        "baseUrl": "http://127.0.0.1:9380"
       }
     }
   },
   "externalDocs": {
     "context7": {
       "enabled": true,
-      "serverUrl": "https://mcp.context7.com/mcp",
-      "apiKey": ""
+      "serverUrl": "https://mcp.context7.com/mcp"
     },
     "googleDeveloperKnowledge": {
       "enabled": false,
@@ -59,7 +57,7 @@
     "strictSnapshotIsolation": true,
     "autoRecordExperiencePrompt": true,
     "reasoningDepth": "balanced",
-    "thinkingBudgetTokens": 16384,
+    "thinkingBudgetTokens": 2048,
     "maxCandidateTokens": 24000,
     "maxProbeSteps": 6,
     "ragTopK": 6,

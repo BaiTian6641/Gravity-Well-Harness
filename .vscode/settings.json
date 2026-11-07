@@ -1,0 +1,28 @@
+{
+  "$schema": "../schemas/antigravity-settings.schema.json",
+  "antigravity.harness.activeModel": "deepseek-v4-pro",
+  "antigravity.harness.reasoningDepth": "balanced",
+  "antigravity.harness.reasoningEffort": "high",
+  "antigravity.harness.deepseek.baseUrl": "https://api.deepseek.com",
+  "antigravity.harness.opencodeGo.baseUrl": "https://opencode.ai/inference/go/openai/v1",
+  "antigravity.harness.search.defaultEngine": "multi-fusion",
+  "antigravity.harness.rag.primaryBackend": "qmd-hybrid",
+  "antigravity.harness.harness2.strictSnapshotIsolation": true,
+  "antigravity.harness.harness2.thinkingBudgetTokens": 2048,
+  "antigravity.harness.swarmRoleModels": {
+    "proposerModelId": "deepseek-v4-pro",
+    "ragResearcherModelId": "deepseek-flash",
+    "proberAModelId": "opencode-go/kimi-k2.7-code",
+    "proberBModelId": "opencode-go/glm-5.3",
+    "proberCModelId": "opencode-go/gpt-6-luna",
+    "verifierModelId": "opencode-go/minimax-m3.1-flash",
+    "composerModelId": "opencode-go/grok-4.7"
+  },
+  "antigravity.harness.rag.autoIndexOnChange": true,
+  "antigravity.harness.rag.enableQmdCli": true,
+  "antigravity.harness.harness2.defaultMode": "parallel",
+  "antigravity.harness.harness2.defaultCandidatesK": 2,
+  "antigravity.harness.harness2.proberModelTier": "inherit",
+  "antigravity.harness.harness2.ragSnippetMaxChars": 500,
+  "antigravity.harness.harness2.earlyStopOnFirstPass": true
+}

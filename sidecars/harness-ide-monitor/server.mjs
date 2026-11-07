@@ -3054,7 +3054,7 @@ export function createHarnessMonitorApp() {
   const handleModelsConfig = async (reqData = {}) => {
     const payload = reqData?.body || reqData || {};
     const wsCtx = await resolveWorkspaceContext(payload);
-    const updated = saveHubConfig(wsCtx.workspaceRoot, payload);
+    const updated = saveHubConfig(wsCtx.workspaceRoot, payload.config || payload);
     return {
       ok: true,
       workspaceRoot: wsCtx.workspaceRoot,

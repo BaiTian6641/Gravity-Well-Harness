@@ -114,7 +114,11 @@ async function main() {
   console.log('  Harness² + Local RAG Antigravity IDE Installer (harness-ide)');
   console.log('================================================================');
 
-  // 1. Sync latest rag-engine.mjs and model-hub.mjs into plugin and sidecar
+  // 1. Sync latest secret-vault.mjs, rag-engine.mjs and model-hub.mjs into plugin and sidecar
+  const masterVaultPath = path.join(REPO_ROOT, 'src', 'secret-vault.mjs');
+  fs.copyFileSync(masterVaultPath, path.join(SOURCE_PLUGIN_DIR, 'scripts', 'secret-vault.mjs'));
+  fs.copyFileSync(masterVaultPath, path.join(SOURCE_SIDECAR_DIR, 'secret-vault.mjs'));
+
   const masterEnginePath = path.join(REPO_ROOT, 'src', 'rag-engine.mjs');
   fs.copyFileSync(masterEnginePath, path.join(SOURCE_PLUGIN_DIR, 'scripts', 'rag-engine.mjs'));
   fs.copyFileSync(masterEnginePath, path.join(SOURCE_SIDECAR_DIR, 'rag-engine.mjs'));

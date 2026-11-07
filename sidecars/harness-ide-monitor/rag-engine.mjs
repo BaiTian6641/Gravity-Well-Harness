@@ -3,6 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { setSecretInVault, getSecretVaultStatusSummary } from './secret-vault.mjs';
 
 const GLOBAL_SETTINGS_PATH = path.join(os.homedir(), '.gemini', 'config', 'harness-ide-settings.json');
 
@@ -285,11 +286,11 @@ export class HarnessKnowledgeEngine {
         },
         optionalBackends: {
           basicMemory: { enabled: false, command: 'uvx', args: ['basic-memory', 'mcp'] },
-          ragflow: { enabled: false, baseUrl: 'http://127.0.0.1:9380', apiKey: '' }
+          ragflow: { enabled: false, baseUrl: 'http://127.0.0.1:9380' }
         }
       },
       externalDocs: {
-        context7: { enabled: true, serverUrl: 'https://mcp.context7.com/mcp', apiKey: '' },
+        context7: { enabled: true, serverUrl: 'https://mcp.context7.com/mcp' },
         googleDeveloperKnowledge: { enabled: false, serverUrl: 'https://developers.google.com/knowledge/mcp' }
       },
       harness2: {
@@ -336,12 +337,81 @@ export class HarnessKnowledgeEngine {
       // Ignore malformed local config
     }
 
+    // Read Antigravity IDE Settings (.vscode/settings.json)
+    try {
+      const ideSettingsPath = path.join(this.workspaceRoot, '.vscode', 'settings.json');
+      if (fs.existsSync(ideSettingsPath)) {
+        const ide = JSON.parse(fs.readFileSync(ideSettingsPath, 'utf8'));
+        if (ide['antigravity.harness.rag.primaryBackend']) {
+          baseConfig.rag.primaryBackend = ide['antigravity.harness.rag.primaryBackend'];
+        }
+        if (typeof ide['antigravity.harness.rag.autoIndexOnChange'] === 'boolean') {
+          baseConfig.rag.autoIndexOnChange = ide['antigravity.harness.rag.autoIndexOnChange'];
+        }
+        if (typeof ide['antigravity.harness.rag.enableQmdCli'] === 'boolean') {
+          baseConfig.rag.enableQmdCliIfAvailable = ide['antigravity.harness.rag.enableQmdCli'];
+        }
+        if (ide['antigravity.harness.reasoningDepth']) {
+          baseConfig.harness2.reasoningDepth = ide['antigravity.harness.reasoningDepth'];
+        }
+        if (typeof ide['antigravity.harness.harness2.strictSnapshotIsolation'] === 'boolean') {
+          baseConfig.harness2.strictSnapshotIsolation = ide['antigravity.harness.harness2.strictSnapshotIsolation'];
+        }
+        if (ide['antigravity.harness.harness2.defaultMode']) {
+          baseConfig.harness2.defaultMode = ide['antigravity.harness.harness2.defaultMode'];
+        }
+        if (typeof ide['antigravity.harness.harness2.defaultCandidatesK'] === 'number') {
+          baseConfig.harness2.defaultCandidatesK = ide['antigravity.harness.harness2.defaultCandidatesK'];
+        }
+        if (typeof ide['antigravity.harness.harness2.thinkingBudgetTokens'] === 'number') {
+          baseConfig.harness2.thinkingBudgetTokens = ide['antigravity.harness.harness2.thinkingBudgetTokens'];
+        }
+        if (ide['antigravity.harness.harness2.proberModelTier']) {
+          baseConfig.harness2.proberModelTier = ide['antigravity.harness.harness2.proberModelTier'];
+        }
+        if (typeof ide['antigravity.harness.harness2.ragSnippetMaxChars'] === 'number') {
+          baseConfig.harness2.ragSnippetMaxChars = ide['antigravity.harness.harness2.ragSnippetMaxChars'];
+        }
+        if (typeof ide['antigravity.harness.harness2.earlyStopOnFirstPass'] === 'boolean') {
+          baseConfig.harness2.earlyStopOnFirstPass = ide['antigravity.harness.harness2.earlyStopOnFirstPass'];
+        }
+      }
+    } catch {
+      // Ignore malformed IDE settings
+    }
+
+    // Never expose plaintext apiKey fields; attach Secret Vault status summary instead
+    if (baseConfig.externalDocs?.context7 && 'apiKey' in baseConfig.externalDocs.context7) {
+      delete baseConfig.externalDocs.context7.apiKey;
+    }
+    if (baseConfig.rag?.optionalBackends?.ragflow && 'apiKey' in baseConfig.rag.optionalBackends.ragflow) {
+      delete baseConfig.rag.optionalBackends.ragflow.apiKey;
+    }
+    baseConfig.secretVault = getSecretVaultStatusSummary();
+
     return baseConfig;
   }
 
   saveConfig(partialConfig, saveGlobal = true) {
     this.ensureDirectories();
-    const merged = this._deepMerge(this.loadConfig(), partialConfig);
+    const sanitized = JSON.parse(JSON.stringify(partialConfig || {}));
+    if (sanitized.externalDocs?.context7?.apiKey) {
+      setSecretInVault('CONTEXT7_API_KEY', sanitized.externalDocs.context7.apiKey);
+      delete sanitized.externalDocs.context7.apiKey;
+    }
+    if (sanitized.rag?.optionalBackends?.ragflow?.apiKey) {
+      setSecretInVault('RAGFLOW_API_KEY', sanitized.rag.optionalBackends.ragflow.apiKey);
+      delete sanitized.rag.optionalBackends.ragflow.apiKey;
+    }
+    const merged = this._deepMerge(this.loadConfig(), sanitized);
+    if (merged.externalDocs?.context7 && 'apiKey' in merged.externalDocs.context7) {
+      delete merged.externalDocs.context7.apiKey;
+    }
+    if (merged.rag?.optionalBackends?.ragflow && 'apiKey' in merged.rag.optionalBackends.ragflow) {
+      delete merged.rag.optionalBackends.ragflow.apiKey;
+    }
+    delete merged.secretVault;
+
     fs.writeFileSync(this.configPath, JSON.stringify(merged, null, 2) + '\n', 'utf8');
     if (saveGlobal) {
       try {
@@ -351,6 +421,53 @@ export class HarnessKnowledgeEngine {
         // Ignore if global config dir is read-only
       }
     }
+    // Sync non-secret preferences to Antigravity IDE Settings (.vscode/settings.json)
+    try {
+      const ideDir = path.join(this.workspaceRoot, '.vscode');
+      const ideSettingsPath = path.join(ideDir, 'settings.json');
+      let existing = {};
+      if (fs.existsSync(ideSettingsPath)) {
+        existing = JSON.parse(fs.readFileSync(ideSettingsPath, 'utf8'));
+      }
+      if (merged.rag?.primaryBackend) {
+        existing['antigravity.harness.rag.primaryBackend'] = merged.rag.primaryBackend;
+      }
+      if (typeof merged.rag?.autoIndexOnChange === 'boolean') {
+        existing['antigravity.harness.rag.autoIndexOnChange'] = merged.rag.autoIndexOnChange;
+      }
+      if (typeof merged.rag?.enableQmdCliIfAvailable === 'boolean') {
+        existing['antigravity.harness.rag.enableQmdCli'] = merged.rag.enableQmdCliIfAvailable;
+      }
+      if (merged.harness2?.reasoningDepth) {
+        existing['antigravity.harness.reasoningDepth'] = merged.harness2.reasoningDepth;
+      }
+      if (typeof merged.harness2?.strictSnapshotIsolation === 'boolean') {
+        existing['antigravity.harness.harness2.strictSnapshotIsolation'] = merged.harness2.strictSnapshotIsolation;
+      }
+      if (merged.harness2?.defaultMode) {
+        existing['antigravity.harness.harness2.defaultMode'] = merged.harness2.defaultMode;
+      }
+      if (typeof merged.harness2?.defaultCandidatesK === 'number') {
+        existing['antigravity.harness.harness2.defaultCandidatesK'] = merged.harness2.defaultCandidatesK;
+      }
+      if (typeof merged.harness2?.thinkingBudgetTokens === 'number') {
+        existing['antigravity.harness.harness2.thinkingBudgetTokens'] = merged.harness2.thinkingBudgetTokens;
+      }
+      if (merged.harness2?.proberModelTier) {
+        existing['antigravity.harness.harness2.proberModelTier'] = merged.harness2.proberModelTier;
+      }
+      if (typeof merged.harness2?.ragSnippetMaxChars === 'number') {
+        existing['antigravity.harness.harness2.ragSnippetMaxChars'] = merged.harness2.ragSnippetMaxChars;
+      }
+      if (typeof merged.harness2?.earlyStopOnFirstPass === 'boolean') {
+        existing['antigravity.harness.harness2.earlyStopOnFirstPass'] = merged.harness2.earlyStopOnFirstPass;
+      }
+      fs.mkdirSync(ideDir, { recursive: true });
+      fs.writeFileSync(ideSettingsPath, JSON.stringify(existing, null, 2) + '\n', 'utf8');
+    } catch {
+      // Ignore if .vscode is read-only
+    }
+    merged.secretVault = getSecretVaultStatusSummary();
     return merged;
   }
 
