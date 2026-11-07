@@ -42,6 +42,32 @@
       </div>
     </header>
 
+    <!-- ALWAYS-VISIBLE INLINE MODEL SELECTOR (NAME + REASONING DEPTH) & LIVE CONTEXT USAGE BAR -->
+    <div class="inline-model-context-strip" id="inline-model-context-strip">
+      <div class="imc-left">
+        <span class="imc-badge">🤖 Model &amp; Depth</span>
+        <select id="header-model-selector" class="input-field select-compact imc-model-select" title="Select Active Model (DeepSeek Official 1M · OpenCode Go Plan · Antigravity Native)"></select>
+        <select id="header-depth-selector" class="input-field select-compact imc-depth-select" title="Set Active Reasoning Depth &amp; DeepSeek/OpenCode reasoning_effort">
+          <option value="eco">ECO · effort=low (1024 tok)</option>
+          <option value="balanced" selected>BALANCED · effort=high (2048 tok)</option>
+          <option value="deep">DEEP · effort=max (8192 tok)</option>
+        </select>
+        <button class="btn btn-secondary btn-xs" id="btn-self-improve-top" title="Run Multi-Model Self-Improvement &amp; Cooperation Cycle (Harness² + Peer Critique)">
+          🧠 Self-Improve Swarm
+        </button>
+      </div>
+
+      <div class="imc-right" id="inline-context-usage-bar" title="Real-Time Context Window Usage &amp; 8-Segment Context DNA (Inline in Antigravity UI)">
+        <div class="imc-ctx-meta">
+          <span class="imc-ctx-label">Context Usage:</span>
+          <strong id="inline-ctx-tokens">55.1k / 1.0M</strong>
+          <span class="pill-badge pill-accent" id="inline-ctx-pct">5.5%</span>
+          <span class="muted-text" id="inline-ctx-cache">Cache 93.7% · 226 tok/s</span>
+        </div>
+        <div class="imc-dna-bar" id="inline-ctx-dna-bar"></div>
+      </div>
+    </div>
+
     <!-- Uninitialized Workspace Banner (shown smoothly if user switches to a workspace without .harness/) -->
     <div id="uninitialized-workspace-banner" class="ws-init-banner hidden">
       <div>
@@ -88,11 +114,9 @@
 
         <div class="swarm-summary-right">
           <div class="formation-selector-wrap">
-            <label for="formation-select" class="muted-text">Formation:</label>
+            <label for="formation-select" class="muted-text">Workspace Swarm:</label>
             <select id="formation-select" class="input-field select-compact">
-              <option value="live-harness2">Gravity Well Harness² Swarm (Live Workspace)</option>
-              <option value="compact-verification">4-Agent Verification Diamond (Core Audit)</option>
-              <option value="multi-stage-team">13-Agent Multi-Stage Pipeline Swarm (Stages A–D)</option>
+              <option value="live-harness2">Current Workspace Agent Swarm</option>
             </select>
           </div>
           <div class="subagent-progress-wrap">
@@ -103,6 +127,48 @@
             <span class="subagent-progress-text" id="swarm-progress-label">3/5</span>
           </div>
         </div>
+      </div>
+
+      <!-- MULTI-MODEL MESSAGE INJECTION, CONVEY & UNIFIED WEB SEARCH BAR -->
+      <div class="coop-injection-bar" id="multi-model-coop-bar">
+        <div class="coop-row">
+          <span class="coop-label">⚡ Message Injection &amp; Convey:</span>
+          <select id="inject-to-agent" class="input-field select-compact" title="Target Subagent or All Swarm">
+            <option value="harness-proposer">→ Harness² Proposer</option>
+            <option value="harness-prober-1">→ Prober #1 (Candidate A)</option>
+            <option value="harness-prober-2">→ Prober #2 (Candidate B)</option>
+            <option value="harness-prober-3">→ Prober #3 (Candidate C)</option>
+            <option value="harness-sandbox-verifier">→ Regression Verifier</option>
+            <option value="harness-composer">→ Contrastive Composer</option>
+            <option value="all">→ Broadcast to All Swarm</option>
+          </select>
+          <select id="inject-to-model" class="input-field select-compact" title="Target Model (DeepSeek Official / OpenCode Go Plan / Native)"></select>
+          <select id="inject-msg-type" class="input-field select-compact" title="Injection / Cooperation Directive Type">
+            <option value="INJECT_DIRECTIVE">INJECT_DIRECTIVE</option>
+            <option value="CONVEY_CONTEXT">CONVEY_CONTEXT</option>
+            <option value="PEER_CRITIQUE">PEER_CRITIQUE</option>
+            <option value="SELF_IMPROVE_CUE">SELF_IMPROVE_CUE</option>
+          </select>
+          <input type="text" id="inject-msg-input" class="input-field coop-input" placeholder="Inject directive, cross-model handoff, or peer critique (auto-recalls subagent into active 2D grid)…" />
+          <button class="btn btn-primary btn-xs" id="btn-send-injection">⚡ Inject &amp; Convey</button>
+        </div>
+
+        <div class="coop-row coop-search-row">
+          <span class="coop-label">🌐 Multi-Engine Search:</span>
+          <select id="multi-search-engine" class="input-field select-compact" title="Select Search Engine (DeepSeek Search / Parallel AI / Tavily / Free Engines)">
+            <option value="multi-fusion">Multi-Engine RRF Fusion (All)</option>
+            <option value="deepseek-search">DeepSeek Official Search (/v1/tools/search)</option>
+            <option value="parallel">Parallel AI Search (search.parallel.ai/mcp)</option>
+            <option value="tavily">Tavily AI Search (api.tavily.com)</option>
+            <option value="duckduckgo">DuckDuckGo Instant (Free Zero-Key)</option>
+            <option value="jina">Jina AI Search &amp; Reader (s.jina.ai)</option>
+            <option value="wikipedia">Wikipedia Action API (Free Zero-Key)</option>
+            <option value="hn-algolia">HackerNews Algolia (Free Zero-Key)</option>
+          </select>
+          <input type="text" id="multi-search-input" class="input-field coop-input" placeholder="Search across DeepSeek Search, Parallel AI, Tavily, DuckDuckGo, Jina &amp; Wikipedia…" />
+          <button class="btn btn-secondary btn-xs" id="btn-run-multi-search">🔍 Search Web</button>
+        </div>
+        <div id="multi-search-results-drawer" class="multi-search-results hidden"></div>
       </div>
 
       <!-- Main Split View: Left Hierarchy Map + Right Team Members & Tasks -->
@@ -855,6 +921,58 @@
             <input type="checkbox" id="set-hook-telemetry" class="toggle-checkbox" checked />
           </div>
         </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <span class="eyebrow">5. MULTI-MODEL ENDPOINTS (DEEPSEEK OFFICIAL + OPENCODE GO) &amp; SEARCH HUB</span>
+            <h3 class="card-title">DeepSeek V4-Pro/Flash (1M), OpenCode Go Coding Plan &amp; Parallel / Tavily / Free Search</h3>
+          </div>
+          <button class="btn btn-primary btn-xs" id="btn-save-hub-config">💾 Save Model &amp; Search Hub</button>
+        </div>
+        <div class="settings-list">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">DeepSeek Official Endpoint &amp; API Key (<code>https://api.deepseek.com</code>)</div>
+              <div class="setting-desc">Supports <code>deepseek-v4-pro</code> (<code>DeepSeek-V4-Pro-0813</code> · 1M ctx) &amp; <code>deepseek-flash</code> (<code>DeepSeek-V4.1-Flash-1017</code> · 1M Vision), <code>/responses</code>, <code>/anthropic</code>, and <code>/v1/tools/search</code>.</div>
+            </div>
+            <div class="inline-pair">
+              <input type="text" id="set-deepseek-url" class="input-field select-compact" value="https://api.deepseek.com" placeholder="https://api.deepseek.com" />
+              <input type="password" id="set-deepseek-key" class="input-field select-compact" placeholder="DEEPSEEK_API_KEY (sk-…)" />
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">OpenCode Go Coding Plan Endpoint &amp; API Key (<code>opencode-go/*</code>)</div>
+              <div class="setting-desc">Routes <code>opencode-go/grok-4.7</code>, <code>gpt-6-luna</code>, <code>claude-haiku-5-5</code>, <code>gemini-4-argon</code>, <code>kimi-k3.1-pro</code>, <code>kimi-k2.7-code</code>, <code>glm-5.3</code>, <code>mimo-v2.6-pro</code>, <code>minimax-m3.1-flash</code>, <code>qwen3.7-max</code>, <code>longcat-2.0</code>, <code>step-5-preview</code> via <code>https://opencode.ai/inference/go</code>.</div>
+            </div>
+            <div class="inline-pair">
+              <input type="text" id="set-opencode-url" class="input-field select-compact" value="https://opencode.ai/inference/go/openai/v1" placeholder="https://opencode.ai/inference/go/openai/v1" />
+              <input type="password" id="set-opencode-key" class="input-field select-compact" placeholder="OPENCODE_API_KEY (oc_sk_…)" />
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">Multi-Engine Search Keys (Parallel AI · Tavily · Jina)</div>
+              <div class="setting-desc">Parallel AI MCP (<code>https://search.parallel.ai/mcp</code>), DuckDuckGo, Wikipedia, and HN Algolia work zero-key out of the box; add optional API keys for higher rate limits.</div>
+            </div>
+            <div class="inline-pair" style="flex-wrap:wrap;">
+              <input type="password" id="set-parallel-key" class="input-field select-compact" placeholder="PARALLEL_API_KEY (optional)" />
+              <input type="password" id="set-tavily-key" class="input-field select-compact" placeholder="TAVILY_API_KEY (tvly-…)" />
+              <input type="password" id="set-jina-key" class="input-field select-compact" placeholder="JINA_API_KEY (optional)" />
+            </div>
+          </div>
+        </div>
+
+        <div class="card-header" style="margin-top:10px; border-top:1px solid rgba(148,163,184,0.14); padding-top:10px;">
+          <div>
+            <span class="eyebrow">FULL MODEL CATALOG · NAME, REASONING DEPTH / EFFORT &amp; LIVE CONTEXT USAGE</span>
+            <h3 class="card-title">Registered Models Across DeepSeek Official, OpenCode Go &amp; Antigravity Native</h3>
+          </div>
+        </div>
+        <div id="model-catalog-table-wrap" class="stack-list"></div>
       </div>
     </section>
   </div>

@@ -21,6 +21,18 @@ import {
   resolveActiveWorkspace,
 } from 'antigravity-sidecar-kit/workspace';
 import { HarnessKnowledgeEngine } from './rag-engine.mjs';
+import {
+  loadHubConfig,
+  saveHubConfig,
+  getEnrichedModelCatalog,
+  resolveModelMeta,
+  loadMessageBus,
+  injectOrConveySwarmMessage,
+  invokeUnifiedModel,
+  searchWebMultiEngine,
+  runSelfImprovementCoopCycle,
+  SEARCH_ENGINE_CATALOG,
+} from './model-hub.mjs';
 
 const __dirname = realpathSync(dirname(fileURLToPath(import.meta.url)));
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
@@ -1681,6 +1693,47 @@ function buildSwarmFormations(
     },
   ];
 
+  const hubCfg = loadHubConfig(workspaceContext.workspaceRoot);
+  const catalog = getEnrichedModelCatalog(workspaceContext.workspaceRoot, contextAnalytics);
+  const messageBus = loadMessageBus(workspaceContext.workspaceRoot);
+  const findCatalogModel = (id) =>
+    catalog.find((m) => m.id === id) ||
+    catalog.find((m) => m.id === resolveModelMeta(id)?.id) ||
+    catalog[0];
+
+  const nodeModelAssignments = {
+    'main-orchestrator': hubCfg.activeModelId || 'deepseek-v4-pro',
+    'harness-proposer': hubCfg.subagentModelRouting?.proposerModelId || 'deepseek-v4-pro',
+    'rag-context-researcher':
+      hubCfg.subagentModelRouting?.ragResearcherModelId || 'deepseek-flash',
+    'harness-prober-1':
+      hubCfg.subagentModelRouting?.proberAModelId || 'opencode-go/kimi-k2.7-code',
+    'harness-prober-2':
+      hubCfg.subagentModelRouting?.proberBModelId || 'opencode-go/glm-5.3',
+    'harness-prober-3':
+      hubCfg.subagentModelRouting?.proberCModelId || 'opencode-go/gpt-6-luna',
+    'harness-sandbox-verifier':
+      hubCfg.subagentModelRouting?.verifierModelId || 'opencode-go/minimax-m3.1-flash',
+    'harness-composer':
+      hubCfg.subagentModelRouting?.composerModelId || 'opencode-go/grok-4.7',
+  };
+
+  for (const node of liveNodes) {
+    const assignedId = nodeModelAssignments[node.id] || node.model || hubCfg.activeModelId;
+    const catModel = findCatalogModel(assignedId);
+    if (catModel) {
+      node.model = catModel.id;
+      node.modelName = catModel.name;
+      node.provider = catModel.provider;
+      node.providerLabel = catModel.providerLabel;
+      node.reasoningDepth = catModel.reasoningDepth;
+      node.reasoningEffort = catModel.reasoningEffort;
+      node.reasoningDepthLabel = catModel.reasoningDepthLabel;
+      node.thinkingBudgetTokens = catModel.thinkingBudgetTokens;
+      node.contextWindowTokens = catModel.contextWindowTokens;
+    }
+  }
+
   const parseDurationStrToSec = (str) => {
     const raw = String(str || '').split('·')[0].trim();
     let sec = 0;
@@ -1807,12 +1860,26 @@ function buildSwarmFormations(
     }
 
     const messages = [];
+    for (const injected of (messageBus.messages || []).slice(0, 18)) {
+      messages.push({
+        id: injected.id,
+        from: `${injected.fromAgent} (${injected.fromModel})`,
+        to: `${injected.toAgent} (${injected.toModel})`,
+        direction: injected.direction || 'INJECT_DIRECTIVE',
+        status: injected.status || 'DELIVERED',
+        steps: 1,
+        tokensFormatted: `${injected.reasoningDepth?.toUpperCase() || 'BALANCED'}`,
+        summary: injected.replySummary
+          ? `${injected.content}  ➔  Reply: ${injected.replySummary}`
+          : injected.content,
+      });
+    }
     for (const node of subNodes) {
       const parentNode = nodes.find((n) => n.id === node.parentIds?.[0]) || nodes[0];
       messages.push({
         id: `bus-del-${node.id}`,
-        from: parentNode.role,
-        to: node.role,
+        from: `${parentNode.role} (${parentNode.model})`,
+        to: `${node.role} (${node.model})`,
         direction: 'DELEGATE',
         status: node.status,
         steps: node.steps,
@@ -1821,8 +1888,8 @@ function buildSwarmFormations(
       });
       messages.push({
         id: `bus-rep-${node.id}`,
-        from: node.role,
-        to: parentNode.role,
+        from: `${node.role} (${node.model})`,
+        to: `${parentNode.role} (${parentNode.model})`,
         direction: 'REPORT',
         status: node.status,
         steps: node.steps,
@@ -1861,6 +1928,10 @@ function buildSwarmFormations(
         agentId: n.id,
         role: n.role,
         model: n.model,
+        modelName: n.modelName || n.model,
+        providerLabel: n.providerLabel || '',
+        reasoningDepth: n.reasoningDepth || 'balanced',
+        reasoningEffort: n.reasoningEffort || 'high',
         workspace: n.workspace,
         status: n.status,
         recalled: Boolean(n.recalled),
@@ -1878,21 +1949,9 @@ function buildSwarmFormations(
   return {
     'live-harness2': packFormation(
       'live-harness2',
-      `Gravity Well Harness² Formation (${wsName})`,
+      `Current Workspace Agent Swarm (${wsName})`,
       'Tier 0 Main Orchestrator → Tier 1 Proposer & RAG Researcher → Tier 2 Branched Probers (Workspace: branch) → Tier 3 Contrastive Composer',
       liveNodes
-    ),
-    'compact-verification': packFormation(
-      'compact-verification',
-      '4-Agent Core Adaptation & Verification Diamond',
-      'Root Orchestrator → Read-Only Audit + Branched Implementation Worker → Independent Upstream Verifier',
-      diamondNodes
-    ),
-    'multi-stage-team': packFormation(
-      'multi-stage-team',
-      '13-Agent Multi-Stage Engineering Swarm (Stages A–D)',
-      '4-Tier Pipeline Hierarchy organized into Stage A Tooling, Stage B Parallel Workers (W1–W4), Stage C Reviewers (C1–C2), and Stage D Packaging',
-      pipelineNodes
     ),
   };
 }
@@ -2541,6 +2600,8 @@ export function createHarnessMonitorApp() {
     const engine = new HarnessKnowledgeEngine(wsCtx.workspaceRoot);
     const status = engine.getStatus();
     const lifecycleState = loadSubagentLifecycle(wsCtx.workspaceRoot);
+    const hubCfg = loadHubConfig(wsCtx.workspaceRoot);
+    const messageBus = loadMessageBus(wsCtx.workspaceRoot);
     const brainConversations = scanRecentBrainTranscripts();
     const activeBrain =
       brainConversations.find((c) => c.conversationId === wsCtx.activeConversationId) ||
@@ -2557,6 +2618,8 @@ export function createHarnessMonitorApp() {
       status.indexedAt || '',
       status.snapshotIsolationLock?.snapshotId || 'unlocked',
       lifecycleState?.revision || 1,
+      messageBus?.revision || 1,
+      hubCfg?.updatedAt || '',
       liveSec,
     ].join('|');
 
@@ -2604,6 +2667,9 @@ export function createHarnessMonitorApp() {
     const experiences = index.documents.filter(
       (d) => d.collection === 'experiment-knowledge'
     );
+    const hubCfg = loadHubConfig(workspaceRoot);
+    const modelCatalog = getEnrichedModelCatalog(workspaceRoot, contextAnalytics);
+    const messageBus = loadMessageBus(workspaceRoot);
 
     const liveSec = getLiveWallSec();
     const liveRevision = [
@@ -2615,6 +2681,8 @@ export function createHarnessMonitorApp() {
       status.indexedAt || '',
       status.snapshotIsolationLock?.snapshotId || 'unlocked',
       lifecycleState?.revision || 1,
+      messageBus?.revision || 1,
+      hubCfg?.updatedAt || '',
       liveSec,
     ].join('|');
 
@@ -2631,6 +2699,12 @@ export function createHarnessMonitorApp() {
       theme: resolveHostTheme(),
       swarm,
       contextAnalytics,
+      modelHub: {
+        config: hubCfg,
+        catalog: modelCatalog,
+        searchEngines: SEARCH_ENGINE_CATALOG,
+      },
+      messageBus,
       rag: {
         status,
         documents: index.documents.map((d) => ({
@@ -2976,6 +3050,114 @@ export function createHarnessMonitorApp() {
   };
   app.api('/api/harness2/run', handleHarness2Run, 'POST');
   app.api('/api/harness2/run', handleHarness2Run, 'GET');
+
+  const handleModelsConfig = async (reqData = {}) => {
+    const payload = reqData?.body || reqData || {};
+    const wsCtx = await resolveWorkspaceContext(payload);
+    const updated = saveHubConfig(wsCtx.workspaceRoot, payload);
+    return {
+      ok: true,
+      workspaceRoot: wsCtx.workspaceRoot,
+      config: updated,
+      catalog: getEnrichedModelCatalog(wsCtx.workspaceRoot),
+      searchEngines: SEARCH_ENGINE_CATALOG,
+    };
+  };
+  app.api('/api/models/config', handleModelsConfig, 'POST');
+  app.api('/api/models/config', handleModelsConfig, 'GET');
+
+  const handleModelsInvoke = async (reqData = {}) => {
+    const payload = reqData?.body || reqData || {};
+    const wsCtx = await resolveWorkspaceContext(payload);
+    const result = await invokeUnifiedModel(wsCtx.workspaceRoot, {
+      modelId: payload.modelId || payload.model_id,
+      reasoningDepth: payload.reasoningDepth || payload.reasoning_depth,
+      reasoningEffort: payload.reasoningEffort || payload.reasoning_effort,
+      prompt: payload.prompt || 'Verify multi-model harness readiness.',
+      systemPrompt: payload.systemPrompt,
+      delegateToPeerModel: payload.delegateToPeerModel || payload.delegate_to_peer_model,
+    });
+    return {
+      ok: true,
+      workspaceRoot: wsCtx.workspaceRoot,
+      ...result,
+    };
+  };
+  app.api('/api/models/invoke', handleModelsInvoke, 'POST');
+  app.api('/api/models/invoke', handleModelsInvoke, 'GET');
+
+  const handleSearchMulti = async (reqData = {}) => {
+    const payload = reqData?.body || reqData || {};
+    const wsCtx = await resolveWorkspaceContext(payload);
+    const result = await searchWebMultiEngine(wsCtx.workspaceRoot, {
+      query: payload.query || 'Google Research Harness2 self-improving agent',
+      engine: payload.engine || 'multi-fusion',
+      limit: Number(payload.limit || 6),
+    });
+    return {
+      ok: true,
+      workspaceRoot: wsCtx.workspaceRoot,
+      ...result,
+    };
+  };
+  app.api('/api/search/multi', handleSearchMulti, 'POST');
+  app.api('/api/search/multi', handleSearchMulti, 'GET');
+
+  const handleSwarmMessageInject = async (reqData = {}) => {
+    const payload = reqData?.body || reqData || {};
+    const wsCtx = await resolveWorkspaceContext(payload);
+    const toAgent = payload.toAgent || payload.to_agent || 'harness-proposer';
+    const res = await injectOrConveySwarmMessage(wsCtx.workspaceRoot, {
+      fromAgent: payload.fromAgent || payload.from_agent || 'main-orchestrator',
+      toAgent,
+      fromModel: payload.fromModel || payload.from_model,
+      toModel: payload.toModel || payload.to_model,
+      type: payload.type || 'INJECT_DIRECTIVE',
+      priority: payload.priority || 'high',
+      reasoningDepth: payload.reasoningDepth || payload.reasoning_depth,
+      content: payload.content || '',
+      executeTargetModel: payload.executeTargetModel !== false,
+    });
+    if (toAgent && toAgent !== 'main-orchestrator' && toAgent !== 'all') {
+      mutateSubagentLifecycle(wsCtx.workspaceRoot, {
+        formationId: 'live-harness2',
+        nodeId: toAgent,
+        action: 'recall',
+        durationSec: 180,
+      });
+    }
+    return {
+      ok: true,
+      workspaceRoot: wsCtx.workspaceRoot,
+      ...res,
+    };
+  };
+  app.api('/api/swarm/message-inject', handleSwarmMessageInject, 'POST');
+  app.api('/api/swarm/message-inject', handleSwarmMessageInject, 'GET');
+
+  const handleSelfImprove = async (reqData = {}) => {
+    const payload = reqData?.body || reqData || {};
+    const wsCtx = await resolveWorkspaceContext(payload);
+    const engine = new HarnessKnowledgeEngine(wsCtx.workspaceRoot);
+    const res = await runSelfImprovementCoopCycle(wsCtx.workspaceRoot, engine, {
+      task: payload.task,
+      domain: payload.domain || 'software-engineering',
+      reasoningDepth: payload.reasoningDepth || payload.reasoning_depth,
+    });
+    mutateSubagentLifecycle(wsCtx.workspaceRoot, {
+      formationId: 'live-harness2',
+      nodeIds: ['harness-proposer', 'harness-prober-1', 'harness-prober-2', 'harness-composer'],
+      action: 'recall_all',
+      durationSec: 180,
+    });
+    return {
+      ok: true,
+      workspaceRoot: wsCtx.workspaceRoot,
+      ...res,
+    };
+  };
+  app.api('/api/harness2/self-improve', handleSelfImprove, 'POST');
+  app.api('/api/harness2/self-improve', handleSelfImprove, 'GET');
 
   app.api(
     '/api/settings/save',

@@ -191,13 +191,43 @@ test('5. Auxiliary Pane UI Sidecar Server responds on /, /api/status, /api/dashb
     assert.ok(typeof dashData.liveRevision === 'string' && dashData.liveRevision.length > 0);
     assert.equal(dashData.swarm.configuredSwarmRoles.length, 4);
 
-    // Verify Multi-Tier Swarm Hierarchy Formations & Teams
-    assert.ok(dashData.swarm.formations['live-harness2']);
-    assert.ok(dashData.swarm.formations['compact-verification']);
-    assert.ok(dashData.swarm.formations['multi-stage-team']);
-    assert.equal(dashData.swarm.formations['multi-stage-team'].nodes.length, 13);
+    // Verify ONLY the Current Workspace Agent Swarm ('live-harness2') is present (demo formations removed)
+    assert.deepEqual(Object.keys(dashData.swarm.formations), ['live-harness2']);
+    assert.equal(dashData.swarm.formations['compact-verification'], undefined);
+    assert.equal(dashData.swarm.formations['multi-stage-team'], undefined);
     assert.ok(dashData.swarm.formations['live-harness2'].edges.length >= 5);
     assert.ok(dashData.swarm.formations['live-harness2'].teams.length >= 3);
+
+    // Verify Multi-Model Hub Catalog (DeepSeek Official 1M + OpenCode Go Coding Plan + Antigravity Native)
+    assert.ok(dashData.modelHub);
+    assert.ok(dashData.modelHub.catalog.length >= 22);
+    const modelIds = dashData.modelHub.catalog.map((m) => m.id);
+    for (const expectedId of [
+      'deepseek-v4-pro',
+      'deepseek-flash',
+      'deepseek-reasoner',
+      'deepseek-chat',
+      'opencode-go/grok-4.7',
+      'opencode-go/gpt-6-luna',
+      'opencode-go/claude-haiku-5-5',
+      'opencode-go/gemini-4-argon',
+      'opencode-go/kimi-k3.1-pro',
+      'opencode-go/kimi-k2.7-code',
+      'opencode-go/glm-5.3',
+      'opencode-go/mimo-v2.6-pro',
+      'opencode-go/minimax-m3.1-flash',
+      'opencode-go/qwen3.7-max',
+      'opencode-go/longcat-2.0',
+      'opencode-go/step-5-preview',
+    ]) {
+      assert.ok(modelIds.includes(expectedId), `Expected model catalog to include ${expectedId}`);
+    }
+    const dsPro = dashData.modelHub.catalog.find((m) => m.id === 'deepseek-v4-pro');
+    assert.equal(dsPro.underlyingModel, 'DeepSeek-V4-Pro-0813');
+    assert.equal(dsPro.contextWindowTokens, 1000000);
+    assert.ok(dsPro.reasoningDepth);
+    assert.ok(dsPro.reasoningEffort);
+    assert.ok(typeof dsPro.contextUsedPct === 'number');
 
     // Verify finished subagents are accurately marked COMPLETED when no probe lock is active
     const liveFormation = dashData.swarm.formations['live-harness2'];
@@ -420,4 +450,124 @@ test('7. Google Harness2 end-to-end Propose-Probe-Compose loop & Adaptive Reason
   assert.equal(mcpLoop.ok, true);
   assert.equal(mcpLoop.reasoningProfile.reasoningDepth, 'balanced');
   assert.ok(mcpLoop.winner.score >= 0.85);
+});
+
+test('8. Multi-Model Hub (DeepSeek Official + OpenCode Go), Bidirectional Subagent Calling, Multi-Engine Search, Message Injection & Self-Improvement', async () => {
+  const app = createHarnessMonitorApp();
+  await app.run(0);
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+
+    // 1. Bidirectional Model Invocation: DeepSeek V4 Pro calling OpenCode Go Kimi K2.7 Code as subagent
+    const invokeRes = await fetch(`${base}/api/models/invoke`, {
+      method: 'POST',
+      body: JSON.stringify({
+        workspaceRoot: REPO_ROOT,
+        modelId: 'deepseek-v4-pro',
+        reasoningDepth: 'deep',
+        callerModel: 'gemini-4-argon',
+        callerAgent: 'main-orchestrator',
+        delegateToPeerModel: 'opencode-go/kimi-k2.7-code',
+        prompt: 'Verify snapshot isolation and multi-model subagent handoff under frozen RAG cutoff',
+      }),
+    });
+    assert.equal(invokeRes.status, 200);
+    const invokeData = await invokeRes.json();
+    assert.equal(invokeData.ok, true);
+    assert.equal(invokeData.modelId, 'deepseek-v4-pro');
+    assert.equal(invokeData.reasoningDepth, 'deep');
+    assert.equal(invokeData.reasoningEffort, 'max');
+    assert.ok(invokeData.reasoning_content.includes('DeepSeek-V4-Pro-0813'));
+    assert.ok(invokeData.peerDelegation);
+    assert.equal(invokeData.peerDelegation.modelId, 'opencode-go/kimi-k2.7-code');
+
+    // 2. Multi-Engine Web Search Hub (Reciprocal Rank Fusion across DeepSeek/Parallel/Tavily/Free engines)
+    const searchRes = await fetch(`${base}/api/search/multi`, {
+      method: 'POST',
+      body: JSON.stringify({
+        workspaceRoot: REPO_ROOT,
+        query: 'DeepSeek V4 Pro OpenCode Go Harness2 recursive self-improvement',
+        engine: 'multi-fusion',
+        maxResults: 5,
+      }),
+    });
+    assert.equal(searchRes.status, 200);
+    const searchData = await searchRes.json();
+    assert.equal(searchData.ok, true);
+    assert.ok(Array.isArray(searchData.results) && searchData.results.length >= 1);
+
+    // 3. Inter-Model Message Injection & Convey (and auto-recall onto 2D swarm graph)
+    const injectRes = await fetch(`${base}/api/swarm/message-inject`, {
+      method: 'POST',
+      body: JSON.stringify({
+        workspaceRoot: REPO_ROOT,
+        action: 'inject',
+        fromAgent: 'main-orchestrator',
+        fromModel: 'deepseek-v4-pro',
+        toAgent: 'harness-prober-2',
+        toModel: 'opencode-go/glm-5.3',
+        messageType: 'PEER_CRITIQUE',
+        reasoningDepth: 'balanced',
+        content: 'Apply Cue-First RAG retrieval before patching src/model-hub.mjs',
+        autoRecallTarget: true,
+      }),
+    });
+    assert.equal(injectRes.status, 200);
+    const injectData = await injectRes.json();
+    assert.equal(injectData.ok, true);
+    assert.equal(injectData.message.toAgent, 'harness-prober-2');
+    assert.equal(injectData.message.toModel, 'opencode-go/glm-5.3');
+
+    // Verify pre-invocation hook consumes the pending injected message into injectSteps
+    const hooksDir = path.join(REPO_ROOT, 'plugin', 'harness-ide', 'scripts', 'hooks');
+    const preRes = spawnSync('node', [path.join(hooksDir, 'pre-invocation.mjs')], {
+      input: JSON.stringify({
+        conversationId: 'test-conv-inject',
+        workspacePaths: [REPO_ROOT],
+        prompt: 'Continue implementing the multi-model swarm',
+      }),
+      encoding: 'utf8',
+    });
+    assert.equal(preRes.status, 0);
+    const preJson = JSON.parse(preRes.stdout.trim());
+    assert.ok(
+      Array.isArray(preJson.injectSteps) &&
+        preJson.injectSteps.some((s) =>
+          String(typeof s === 'string' ? s : s.ephemeralMessage || s.content || '').includes(
+            'Swarm Message Injection'
+          )
+        ),
+      'Expected pre-invocation hook to inject pending Swarm Message Bus directives'
+    );
+
+    // 4. Multi-Model Self-Improvement & Cooperation Cycle (without polluting permanent library during test)
+    const rsiData = await handleToolCall('harness_self_improve', {
+      workspace_root: REPO_ROOT,
+      task_id: 'test-rsi-coop',
+      domain: 'software-engineering',
+      problem: 'Coordinate DeepSeek V4 Pro and OpenCode Go models for self-improving verification',
+      proposer_model: 'deepseek-v4-pro',
+      prober_models: ['opencode-go/kimi-k2.7-code', 'opencode-go/glm-5.3', 'deepseek-flash'],
+      composer_model: 'opencode-go/gpt-6-luna',
+      reasoning_depth: 'balanced',
+      record_to_library: false,
+    });
+    assert.equal(rsiData.ok, true);
+    assert.equal(rsiData.cooperationRoster.proposerModel, 'deepseek-v4-pro');
+    assert.equal(rsiData.cooperationRoster.composerModel, 'opencode-go/gpt-6-luna');
+    assert.ok(rsiData.peerCritiques.length >= 2);
+    assert.ok(rsiData.winner.score >= 0.85);
+
+    // Clean up recall state and consume any remaining test message-bus messages
+    await fetch(`${base}/api/swarm/recall`, {
+      method: 'POST',
+      body: JSON.stringify({ workspaceRoot: REPO_ROOT, action: 'reset' }),
+    });
+    const msgBusFile = path.join(REPO_ROOT, '.harness', 'runtime', 'message-bus.json');
+    if (fs.existsSync(msgBusFile)) {
+      fs.unlinkSync(msgBusFile);
+    }
+  } finally {
+    await app.close();
+  }
 });

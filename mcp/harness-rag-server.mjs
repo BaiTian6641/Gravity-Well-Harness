@@ -4,6 +4,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HarnessKnowledgeEngine } from '../src/rag-engine.mjs';
+import {
+  invokeUnifiedModel,
+  searchWebMultiEngine,
+  injectOrConveySwarmMessage,
+  runSelfImprovementCoopCycle,
+  getEnrichedModelCatalog,
+  SEARCH_ENGINE_CATALOG,
+} from '../src/model-hub.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -391,6 +399,111 @@ const TOOL_DEFINITIONS = [
       },
       required: ['task_id', 'problem']
     }
+  },
+  {
+    name: 'harness_model_invoke',
+    description:
+      'Invoke any model across DeepSeek Official (deepseek-reasoner, deepseek-chat, deepseek-v4-pro), OpenCode Go Coding Plan (kimi-k3.1-pro, kimi-k2.7-code, glm-5.3, glm-5.3-flash, minimax-m3.1-flash, qwen3-coder-plus), or Antigravity Native models with configurable reasoning_depth (eco/balanced/deep) and bidirectional peer subagent delegation.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        model_id: {
+          type: 'string',
+          description: 'Model ID (e.g. deepseek-reasoner, deepseek-chat, kimi-k2.7-code, glm-5.3, minimax-m3.1-flash, qwen3-coder-plus).'
+        },
+        prompt: {
+          type: 'string',
+          description: 'Task prompt or query for the target model.'
+        },
+        reasoning_depth: {
+          type: 'string',
+          enum: ['eco', 'balanced', 'deep'],
+          description: 'Reasoning depth and thinking token cap (eco, balanced, deep).'
+        },
+        delegate_to_peer_model: {
+          type: 'string',
+          description: 'Optional peer model ID that the target model should call as a subagent (e.g. glm-5.3 or deepseek-chat).'
+        },
+        workspace_root: {
+          type: 'string',
+          description: 'Optional workspace root override.'
+        }
+      },
+      required: ['prompt']
+    }
+  },
+  {
+    name: 'harness_web_search',
+    description:
+      'Search the web across Parallel AI Search (search.parallel.ai/mcp), Tavily AI Search, DuckDuckGo Instant Answer, Jina AI Search (s.jina.ai), Wikipedia Action API, and HackerNews Algolia with Reciprocal Rank Fusion (RRF).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Search query string.'
+        },
+        engine: {
+          type: 'string',
+          enum: ['multi-fusion', 'parallel', 'tavily', 'duckduckgo', 'jina', 'wikipedia', 'hn-algolia'],
+          description: 'Search engine or multi-fusion (default: multi-fusion).'
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum results to return (default: 6).'
+        },
+        workspace_root: {
+          type: 'string',
+          description: 'Optional workspace root override.'
+        }
+      },
+      required: ['query']
+    }
+  },
+  {
+    name: 'harness_message_inject',
+    description:
+      'Inject or convey a message (INJECT_DIRECTIVE, CONVEY_CONTEXT, PEER_CRITIQUE, SELF_IMPROVE_CUE) across agents and models in the active workspace swarm.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        from_agent: { type: 'string', description: 'Sender agent ID (default: main-orchestrator).' },
+        to_agent: { type: 'string', description: 'Recipient agent ID or "all" (default: harness-proposer).' },
+        from_model: { type: 'string', description: 'Sender model ID.' },
+        to_model: { type: 'string', description: 'Recipient model ID (e.g. deepseek-reasoner, kimi-k2.7-code, glm-5.3).' },
+        type: {
+          type: 'string',
+          enum: ['INJECT_DIRECTIVE', 'CONVEY_CONTEXT', 'PEER_CRITIQUE', 'SELF_IMPROVE_CUE'],
+          description: 'Message injection / convey type.'
+        },
+        content: { type: 'string', description: 'Message content to inject and convey.' },
+        reasoning_depth: {
+          type: 'string',
+          enum: ['eco', 'balanced', 'deep'],
+          description: 'Reasoning depth for recipient execution.'
+        },
+        workspace_root: { type: 'string', description: 'Optional workspace root override.' }
+      },
+      required: ['content']
+    }
+  },
+  {
+    name: 'harness_self_improve',
+    description:
+      'Execute a full multi-model Self-Improvement & Cooperation cycle combining Google Research Harness² (Propose -> Probe -> Compose), Cross-Model Peer Critique (DeepSeek + OpenCode Go + Gemini), and runtime Message Bus broadcast.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task: { type: 'string', description: 'Task or capability to self-improve.' },
+        domain: { type: 'string', description: 'Target domain library (default: software-engineering).' },
+        reasoning_depth: {
+          type: 'string',
+          enum: ['eco', 'balanced', 'deep'],
+          description: 'Reasoning depth preset (default: balanced).'
+        },
+        workspace_root: { type: 'string', description: 'Optional workspace root override.' }
+      }
+    }
   }
 ];
 
@@ -400,7 +513,8 @@ function getEngine(args = {}) {
 }
 
 export async function handleToolCall(name, args = {}) {
-  const engine = getEngine(args);
+  const root = resolveActiveWorkspaceRoot(args);
+  const engine = new HarnessKnowledgeEngine(root);
   switch (name) {
     case 'harness_query':
     case 'qmd_query':
@@ -413,7 +527,11 @@ export async function handleToolCall(name, args = {}) {
       return engine.multiGet(args.pattern, { snapshot_id: args.snapshot_id });
     case 'harness_status':
     case 'qmd_status':
-      return engine.getStatus();
+      return {
+        ...engine.getStatus(),
+        models: getEnrichedModelCatalog(root),
+        searchEngines: SEARCH_ENGINE_CATALOG,
+      };
     case 'harness_metadata':
     case 'qmd_metadata':
       return engine.getMetadata();
@@ -440,6 +558,35 @@ export async function handleToolCall(name, args = {}) {
     }
     case 'harness_run_loop':
       return engine.runHarness2Loop(args);
+    case 'harness_model_invoke':
+      return invokeUnifiedModel(root, {
+        modelId: args.model_id || args.modelId,
+        prompt: args.prompt,
+        reasoningDepth: args.reasoning_depth || args.reasoningDepth,
+        delegateToPeerModel: args.delegate_to_peer_model || args.delegateToPeerModel,
+      });
+    case 'harness_web_search':
+      return searchWebMultiEngine(root, {
+        query: args.query,
+        engine: args.engine,
+        limit: args.limit,
+      });
+    case 'harness_message_inject':
+      return injectOrConveySwarmMessage(root, {
+        fromAgent: args.from_agent || args.fromAgent,
+        toAgent: args.to_agent || args.toAgent,
+        fromModel: args.from_model || args.fromModel,
+        toModel: args.to_model || args.toModel,
+        type: args.type,
+        content: args.content,
+        reasoningDepth: args.reasoning_depth || args.reasoningDepth,
+      });
+    case 'harness_self_improve':
+      return runSelfImprovementCoopCycle(root, engine, {
+        ...args,
+        task: args.task || args.problem,
+        reasoningDepth: args.reasoning_depth || args.reasoningDepth,
+      });
     default:
       throw new Error(`Unknown tool: ${name}`);
   }

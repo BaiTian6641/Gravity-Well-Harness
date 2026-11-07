@@ -1,0 +1,8 @@
+{
+  "harness_id": "harness-software-engineering-task-007-multi-model-deepseek-opencode-go-search-and-rsi",
+  "task_id": "task-007-multi-model-deepseek-opencode-go-search-and-rsi",
+  "domain": "software-engineering",
+  "adopted_at": "2026-11-07T05:30:28.865Z",
+  "git_revision": "04028ca",
+  "status": "active"
+}
