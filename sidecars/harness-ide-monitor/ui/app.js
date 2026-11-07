@@ -108,16 +108,35 @@
     });
   });
 
-  // UI State for Swarm Formation & Context DNA
+  // UI State for Swarm Formation, Interactive Canvas & Context DNA
   let latestDashboard = null;
   let settingsInitializedForWs = '';
   let activeFormationId = 'live-harness2';
   let selectedNodeId = null;
+  let hoveredNodeId = null;
   let memberStatusFilter = 'ALL';
   let taskStatusFilter = 'ALL';
   let memberSearchQuery = '';
   let memberSortMode = 'tier';
   let zoomScale = 1.0;
+  let panX = 0;
+  let panY = 0;
+  let isPanningCanvas = false;
+  let panStartX = 0;
+  let panStartY = 0;
+  let panOriginX = 0;
+  let panOriginY = 0;
+  let draggingNodeId = null;
+  let draggingNodeEl = null;
+  let nodeDragMoved = false;
+  let nodeDragStartX = 0;
+  let nodeDragStartY = 0;
+  let nodeOriginX = 0;
+  let nodeOriginY = 0;
+  const nodeOffsets = new Map(); // key: `${formationId}:${nodeId}` -> { x, y }
+  let lastRenderedNodeSignature = '';
+  let lastLiveRevision = '';
+  let isRefreshing = false;
   const expandedDnaKeys = new Set(['injectedRag', 'toolResults']);
 
   const DNA_COLORS = {
@@ -130,6 +149,38 @@
     toolResults: '#14b8a6',
     freeWindow: '#334155',
   };
+
+  const DNA_LABELS = {
+    systemPrompt: 'System Prompt',
+    toolDefinitions: 'Tool Defs',
+    userMessages: 'User Msg',
+    injectedRag: 'Injected RAG',
+    skillInjection: 'Skill Inject',
+    assistantMessages: 'Assistant Msg',
+    toolResults: 'Tool Results',
+    freeWindow: 'Free Window',
+  };
+
+  function getNodeOffset(nodeId) {
+    return nodeOffsets.get(`${activeFormationId}:${nodeId}`) || { x: 0, y: 0 };
+  }
+
+  function setNodeOffset(nodeId, x, y) {
+    nodeOffsets.set(`${activeFormationId}:${nodeId}`, { x, y });
+  }
+
+  function applyStageTransform(immediate = false) {
+    const stage = document.getElementById('hierarchy-stage');
+    const lbl = document.getElementById('zoom-level-label');
+    if (stage) {
+      stage.classList.toggle('no-transition', immediate);
+      stage.style.transform = `translate3d(${panX}px, ${panY}px, 0) scale(${zoomScale})`;
+    }
+    if (lbl) {
+      lbl.textContent = `${Math.round(zoomScale * 100)}%`;
+    }
+    requestAnimationFrame(() => drawHierarchyEdges());
+  }
 
   function renderWorkspaceHeader(data) {
     const wsRoot = data.workspaceRoot || '';
@@ -239,11 +290,151 @@
         ${keys
           .map((k) => {
             const w = Math.max(0, Number(dna[k] || 0));
-            return `<span class="h-node-dna-seg" style="width:${w}%; background:${DNA_COLORS[k]}"></span>`;
+            return `<span class="h-node-dna-seg" data-dna-seg="${k}" style="width:${w}%; background:${DNA_COLORS[k]}"></span>`;
           })
           .join('')}
       </div>
     `;
+  }
+
+  function buildHoverPreviewHtml(formation, node) {
+    if (!node) return '';
+    const dna = node.dna || {};
+    const parentRoles = (node.parentIds || [])
+      .map((pid) => (formation.nodes || []).find((x) => x.id === pid)?.role || pid)
+      .filter(Boolean);
+    const childRoles = (formation.nodes || [])
+      .filter((x) => (x.parentIds || []).includes(node.id))
+      .map((x) => x.role);
+
+    const statusBadge =
+      node.status === 'RUNNING'
+        ? '<span class="status-chip status-active">● RUNNING</span>'
+        : '<span class="pill-badge">✓ COMPLETED</span>';
+
+    const dnaRowsHtml = Object.keys(DNA_LABELS)
+      .map(
+        (k) => `
+        <div class="hover-dna-row">
+          <span class="hover-dna-name"><i style="background:${DNA_COLORS[k]}"></i>${escapeHtml(DNA_LABELS[k])}</span>
+          <strong>${Number(dna[k] || 0)}%</strong>
+        </div>
+      `
+      )
+      .join('');
+
+    return `
+      <div class="hover-preview-top">
+        <div>
+          <div class="hover-preview-role">${escapeHtml(node.role)}</div>
+          <div class="hover-preview-team">${escapeHtml(node.teamName || `Tier ${node.tier}`)}</div>
+        </div>
+        ${statusBadge}
+      </div>
+      <div class="hover-preview-kpis">
+        <div class="hover-kpi-box">
+          <span class="hover-kpi-label">Tokens · Cost</span>
+          <span class="hover-kpi-val">${escapeHtml(node.totalTokensFormatted)} · ${escapeHtml(node.costFormatted)}</span>
+        </div>
+        <div class="hover-kpi-box">
+          <span class="hover-kpi-label">Context Used</span>
+          <span class="hover-kpi-val" style="color:#34d399;">${escapeHtml(node.contextTokensFormatted || '94k')} (${Number(node.contextUsedPct || 0)}%)</span>
+        </div>
+        <div class="hover-kpi-box">
+          <span class="hover-kpi-label">Elapsed · Steps</span>
+          <span class="hover-kpi-val">${escapeHtml(node.durationFormatted)}</span>
+        </div>
+      </div>
+      <div class="inline-pair" style="font-size:10.5px;">
+        <span class="pill-badge">Model: <code>${escapeHtml(node.model)}</code></span>
+        <span class="status-chip ${node.workspace === 'branch' ? 'status-branch' : 'status-active'}">
+          Workspace: ${escapeHtml(node.workspace === 'branch' ? 'branch (Isolated)' : 'inherit')}
+        </span>
+      </div>
+      ${renderNodeDnaBar(dna)}
+      <div class="hover-dna-grid">${dnaRowsHtml}</div>
+      <div class="hover-section-box">
+        <div class="hover-section-title">Live Telemetry Report</div>
+        <div>${escapeHtml(node.latestReport || 'Active')}</div>
+      </div>
+      <div class="hover-section-box" style="border-left-color:#a855f7;">
+        <div class="hover-section-title">Delegated Task Prompt</div>
+        <div>${escapeHtml(node.taskPrompt || '')}</div>
+      </div>
+      <div class="hover-lineage-row">
+        <span>↑ Upstream: <strong>${parentRoles.length > 0 ? escapeHtml(parentRoles.join(', ')) : 'Root (Tier 0)'}</strong></span>
+        <span>↓ Downstream: <strong>${childRoles.length} agents</strong></span>
+      </div>
+    `;
+  }
+
+  function positionHoverPreview(anchorEl, clientX, clientY) {
+    const previewEl = document.getElementById('node-hover-preview');
+    const viewport = document.getElementById('hierarchy-viewport');
+    if (!previewEl || !viewport || previewEl.classList.contains('hidden')) return;
+
+    const vpRect = viewport.getBoundingClientRect();
+    const pw = previewEl.offsetWidth || 310;
+    const ph = previewEl.offsetHeight || 280;
+
+    let left = 14;
+    let top = 14;
+
+    if (anchorEl && viewport.contains(anchorEl)) {
+      const r = anchorEl.getBoundingClientRect();
+      left = r.right - vpRect.left + 12;
+      if (left + pw > vpRect.width - 10) {
+        left = Math.max(10, r.left - vpRect.left - pw - 12);
+      }
+      top = Math.min(Math.max(10, r.top - vpRect.top - 8), Math.max(10, vpRect.height - ph - 12));
+    } else if (typeof clientX === 'number' && typeof clientY === 'number') {
+      left = Math.min(Math.max(10, clientX - vpRect.left + 16), Math.max(10, vpRect.width - pw - 12));
+      top = Math.min(Math.max(10, clientY - vpRect.top - 16), Math.max(10, vpRect.height - ph - 12));
+    }
+
+    previewEl.style.left = `${Math.round(left)}px`;
+    previewEl.style.top = `${Math.round(top)}px`;
+  }
+
+  function showNodeHoverPreview(nodeId, anchorEl) {
+    if (isPanningCanvas || draggingNodeId) return;
+    const formation = getActiveFormation(latestDashboard);
+    const previewEl = document.getElementById('node-hover-preview');
+    if (!formation || !previewEl) return;
+
+    const node = (formation.nodes || []).find((n) => n.id === nodeId);
+    if (!node) return;
+
+    hoveredNodeId = nodeId;
+    previewEl.innerHTML = buildHoverPreviewHtml(formation, node);
+    previewEl.classList.remove('hidden');
+    positionHoverPreview(anchorEl);
+    updateHierarchyVisualFocus(formation);
+  }
+
+  function hideNodeHoverPreview() {
+    const previewEl = document.getElementById('node-hover-preview');
+    if (previewEl) previewEl.classList.add('hidden');
+    if (hoveredNodeId) {
+      hoveredNodeId = null;
+      const formation = getActiveFormation(latestDashboard);
+      if (formation) updateHierarchyVisualFocus(formation);
+    }
+  }
+
+  function updateHierarchyVisualFocus(formation) {
+    const stage = document.getElementById('hierarchy-stage');
+    if (!stage || !formation) return;
+    const focusNodeId = selectedNodeId || hoveredNodeId;
+    const lineage = getLineageSet(formation, focusNodeId);
+
+    stage.querySelectorAll('.h-node-card').forEach((card) => {
+      const nid = card.getAttribute('data-node-id');
+      card.classList.toggle('node-selected', selectedNodeId === nid || hoveredNodeId === nid);
+      card.classList.toggle('node-dimmed', Boolean(lineage && !lineage.has(nid)));
+    });
+
+    drawHierarchyEdges();
   }
 
   function drawHierarchyEdges() {
@@ -254,13 +445,14 @@
 
     const stageRect = stage.getBoundingClientRect();
     const scale = zoomScale || 1;
-    const width = Math.max(stage.scrollWidth, stageRect.width / scale);
-    const height = Math.max(stage.scrollHeight, stageRect.height / scale);
+    const width = Math.max(stage.scrollWidth, stageRect.width / scale, 540);
+    const height = Math.max(stage.scrollHeight, stageRect.height / scale, 440);
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
     svg.style.width = `${width}px`;
     svg.style.height = `${height}px`;
 
-    const lineage = getLineageSet(formation, selectedNodeId);
+    const focusNodeId = selectedNodeId || hoveredNodeId;
+    const lineage = getLineageSet(formation, focusNodeId);
     const pathsHtml = [];
 
     for (const edge of formation.edges || []) {
@@ -294,6 +486,76 @@
     svg.innerHTML = pathsHtml.join('');
   }
 
+  function bindNodeCardInteractions(card) {
+    const nid = card.getAttribute('data-node-id');
+    if (!nid) return;
+
+    card.addEventListener('mouseenter', () => {
+      showNodeHoverPreview(nid, card);
+    });
+
+    card.addEventListener('mouseleave', () => {
+      if (!draggingNodeId) hideNodeHoverPreview();
+    });
+
+    card.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      e.stopPropagation();
+      draggingNodeId = nid;
+      draggingNodeEl = card;
+      nodeDragMoved = false;
+      nodeDragStartX = e.clientX;
+      nodeDragStartY = e.clientY;
+      const curOffset = getNodeOffset(nid);
+      nodeOriginX = curOffset.x;
+      nodeOriginY = curOffset.y;
+      try {
+        card.setPointerCapture(e.pointerId);
+      } catch {}
+    });
+
+    card.addEventListener('pointermove', (e) => {
+      if (draggingNodeId !== nid || !draggingNodeEl) return;
+      const dxScreen = e.clientX - nodeDragStartX;
+      const dyScreen = e.clientY - nodeDragStartY;
+      if (!nodeDragMoved && Math.hypot(dxScreen, dyScreen) > 4) {
+        nodeDragMoved = true;
+        card.classList.add('is-dragging');
+        hideNodeHoverPreview();
+      }
+      if (nodeDragMoved) {
+        const scale = zoomScale || 1;
+        const nextX = Math.round(nodeOriginX + dxScreen / scale);
+        const nextY = Math.round(nodeOriginY + dyScreen / scale);
+        setNodeOffset(nid, nextX, nextY);
+        card.style.transform = `translate3d(${nextX}px, ${nextY}px, 0)`;
+        drawHierarchyEdges();
+      }
+    });
+
+    const finishNodePointer = (e) => {
+      if (draggingNodeId !== nid) return;
+      try {
+        card.releasePointerCapture(e.pointerId);
+      } catch {}
+      card.classList.remove('is-dragging');
+      const wasDragged = nodeDragMoved;
+      draggingNodeId = null;
+      draggingNodeEl = null;
+      nodeDragMoved = false;
+
+      if (!wasDragged) {
+        selectedNodeId = selectedNodeId === nid ? null : nid;
+        renderSwarmTab(latestDashboard);
+      } else {
+        drawHierarchyEdges();
+      }
+    };
+
+    card.addEventListener('pointerup', finishNodePointer);
+    card.addEventListener('pointercancel', finishNodePointer);
+  }
+
   function renderSwarmTab(data) {
     const swarm = data.swarm || {};
     const formation = getActiveFormation(data);
@@ -323,61 +585,119 @@
       tiersMap.get(t).push(node);
     }
     const sortedTiers = Array.from(tiersMap.entries()).sort((a, b) => a[0] - b[0]);
-    const lineage = getLineageSet(formation, selectedNodeId);
+    const focusNodeId = selectedNodeId || hoveredNodeId;
+    const lineage = getLineageSet(formation, focusNodeId);
 
     const tiersContainer = document.getElementById('hierarchy-tiers-container');
-    tiersContainer.innerHTML = sortedTiers
-      .map(
-        ([tierNum, nodes]) => `
-        <div class="hierarchy-tier-row" data-tier="${tierNum}">
-          ${nodes
-            .map((n) => {
-              const isSelected = selectedNodeId === n.id;
-              const isDimmed = lineage && !lineage.has(n.id);
-              const dotClass =
-                n.status === 'RUNNING'
-                  ? 'dot-running'
-                  : n.status === 'COMPLETED'
-                    ? 'dot-completed'
-                    : 'dot-standby';
-              const badgeText = n.isCurrent
-                ? 'Current'
-                : n.workspace === 'branch'
-                  ? 'branch'
-                  : `T${n.tier}`;
-              const badgeClass = n.workspace === 'branch' ? 'badge-branch' : '';
+    const currentSignature = `${activeFormationId}:${(formation.nodes || []).map((n) => n.id).join(',')}`;
 
-              return `
-                <div class="h-node-card ${n.status === 'RUNNING' ? 'node-running' : ''} ${n.isCurrent ? 'node-current' : ''} ${isSelected ? 'node-selected' : ''} ${isDimmed ? 'node-dimmed' : ''}" data-node-id="${escapeHtml(n.id)}">
-                  <div class="h-node-header">
-                    <div class="h-node-title-wrap">
-                      <span class="status-dot ${dotClass}"></span>
-                      <span class="h-node-title" title="${escapeHtml(n.role)}">${escapeHtml(n.role)}</span>
+    // Non-destructive in-place DOM patching when formation topology is unchanged
+    if (
+      currentSignature === lastRenderedNodeSignature &&
+      tiersContainer.querySelectorAll('.h-node-card').length === (formation.nodes || []).length
+    ) {
+      for (const n of formation.nodes || []) {
+        const card = tiersContainer.querySelector(`[data-node-id="${n.id}"]`);
+        if (!card) continue;
+        const isSelected = selectedNodeId === n.id || hoveredNodeId === n.id;
+        const isDimmed = Boolean(lineage && !lineage.has(n.id));
+        card.classList.toggle('node-running', n.status === 'RUNNING');
+        card.classList.toggle('node-current', Boolean(n.isCurrent));
+        card.classList.toggle('node-selected', isSelected);
+        card.classList.toggle('node-dimmed', isDimmed);
+
+        const dotEl = card.querySelector('.status-dot');
+        if (dotEl) {
+          dotEl.className = `status-dot ${
+            n.status === 'RUNNING'
+              ? 'dot-running'
+              : n.status === 'COMPLETED'
+                ? 'dot-completed'
+                : 'dot-standby'
+          }`;
+        }
+        const titleEl = card.querySelector('.h-node-title');
+        if (titleEl) {
+          titleEl.textContent = n.role;
+          titleEl.title = n.role;
+        }
+        const tokEl = card.querySelector('.h-node-tokens');
+        if (tokEl) {
+          tokEl.textContent = `${n.totalTokensFormatted} · ${n.costFormatted}`;
+        }
+        const dna = n.dna || {};
+        card.querySelectorAll('.h-node-dna-seg').forEach((seg) => {
+          const k = seg.getAttribute('data-dna-seg');
+          if (k) seg.style.width = `${Math.max(0, Number(dna[k] || 0))}%`;
+        });
+        const footerSpans = card.querySelectorAll('.h-node-footer span');
+        if (footerSpans[0]) footerSpans[0].textContent = n.durationFormatted;
+        if (footerSpans[1]) footerSpans[1].textContent = `${Number(n.contextUsedPct || 0)}%`;
+      }
+
+      if (hoveredNodeId) {
+        const hoveredNode = (formation.nodes || []).find((n) => n.id === hoveredNodeId);
+        const previewEl = document.getElementById('node-hover-preview');
+        if (hoveredNode && previewEl && !previewEl.classList.contains('hidden')) {
+          previewEl.innerHTML = buildHoverPreviewHtml(formation, hoveredNode);
+        }
+      }
+    } else {
+      lastRenderedNodeSignature = currentSignature;
+      tiersContainer.innerHTML = sortedTiers
+        .map(
+          ([tierNum, nodes]) => `
+          <div class="hierarchy-tier-row" data-tier="${tierNum}">
+            ${nodes
+              .map((n) => {
+                const isSelected = selectedNodeId === n.id || hoveredNodeId === n.id;
+                const isDimmed = lineage && !lineage.has(n.id);
+                const dotClass =
+                  n.status === 'RUNNING'
+                    ? 'dot-running'
+                    : n.status === 'COMPLETED'
+                      ? 'dot-completed'
+                      : 'dot-standby';
+                const badgeText = n.isCurrent
+                  ? 'Current'
+                  : n.workspace === 'branch'
+                    ? 'branch'
+                    : `T${n.tier}`;
+                const badgeClass = n.workspace === 'branch' ? 'badge-branch' : '';
+                const offset = getNodeOffset(n.id);
+                const transformStyle =
+                  offset.x || offset.y
+                    ? `style="transform: translate3d(${offset.x}px, ${offset.y}px, 0);"`
+                    : '';
+
+                return `
+                  <div class="h-node-card ${n.status === 'RUNNING' ? 'node-running' : ''} ${n.isCurrent ? 'node-current' : ''} ${isSelected ? 'node-selected' : ''} ${isDimmed ? 'node-dimmed' : ''}" data-node-id="${escapeHtml(n.id)}" ${transformStyle}>
+                    <div class="h-node-header">
+                      <div class="h-node-title-wrap">
+                        <span class="status-dot ${dotClass}"></span>
+                        <span class="h-node-title" title="${escapeHtml(n.role)}">${escapeHtml(n.role)}</span>
+                      </div>
+                      <span class="h-node-badge ${badgeClass}">${escapeHtml(badgeText)}</span>
                     </div>
-                    <span class="h-node-badge ${badgeClass}">${escapeHtml(badgeText)}</span>
+                    <div class="h-node-tokens">${escapeHtml(n.totalTokensFormatted)} · ${escapeHtml(n.costFormatted)}</div>
+                    ${renderNodeDnaBar(n.dna)}
+                    <div class="h-node-footer">
+                      <span>${escapeHtml(n.durationFormatted)}</span>
+                      <span class="h-node-pct">${Number(n.contextUsedPct || 0)}%</span>
+                    </div>
                   </div>
-                  <div class="h-node-tokens">${escapeHtml(n.totalTokensFormatted)} · ${escapeHtml(n.costFormatted)}</div>
-                  ${renderNodeDnaBar(n.dna)}
-                  <div class="h-node-footer">
-                    <span>${escapeHtml(n.durationFormatted)}</span>
-                    <span class="h-node-pct">${Number(n.contextUsedPct || 0)}%</span>
-                  </div>
-                </div>
-              `;
-            })
-            .join('')}
-        </div>
-      `
-      )
-      .join('');
+                `;
+              })
+              .join('')}
+          </div>
+        `
+        )
+        .join('');
 
-    tiersContainer.querySelectorAll('.h-node-card').forEach((card) => {
-      card.addEventListener('click', () => {
-        const nid = card.getAttribute('data-node-id');
-        selectedNodeId = selectedNodeId === nid ? null : nid;
-        renderSwarmTab(latestDashboard);
+      tiersContainer.querySelectorAll('.h-node-card').forEach((card) => {
+        bindNodeCardInteractions(card);
       });
-    });
+    }
 
     requestAnimationFrame(() => drawHierarchyEdges());
 
@@ -443,8 +763,15 @@
       .join('');
 
     teamsContainer.querySelectorAll('.member-card').forEach((card) => {
+      const mid = card.getAttribute('data-member-id');
+      card.addEventListener('mouseenter', () => {
+        const nodeEl = document.querySelector(`#hierarchy-stage [data-node-id="${mid}"]`);
+        showNodeHoverPreview(mid, nodeEl || card);
+      });
+      card.addEventListener('mouseleave', () => {
+        hideNodeHoverPreview();
+      });
       card.addEventListener('click', () => {
-        const mid = card.getAttribute('data-member-id');
         selectedNodeId = selectedNodeId === mid ? null : mid;
         renderSwarmTab(latestDashboard);
       });
@@ -1018,12 +1345,17 @@
     card.classList.remove('hidden');
   }
 
-  async function refreshDashboard(refreshSearchOnWsChange = false) {
+  async function refreshDashboard(refreshSearchOnWsChange = false, flashPulse = false) {
+    if (isRefreshing) return;
+    isRefreshing = true;
     try {
       const prevWs = currentWorkspaceRoot;
       const data = await apiFetch('/api/dashboard', {});
       if (!data.ok) return;
       latestDashboard = data;
+      if (data.liveRevision) {
+        lastLiveRevision = data.liveRevision;
+      }
       const wsChanged = prevWs && prevWs.toLowerCase() !== String(data.workspaceRoot || '').toLowerCase();
 
       renderWorkspaceHeader(data);
@@ -1033,16 +1365,44 @@
       renderRagTab(data);
       renderSettingsTab(data);
 
+      if (flashPulse) {
+        const runBadge = document.getElementById('swarm-sum-running');
+        if (runBadge) {
+          runBadge.classList.remove('live-pulse-flash');
+          void runBadge.offsetWidth;
+          runBadge.classList.add('live-pulse-flash');
+        }
+      }
+
       if (wsChanged || refreshSearchOnWsChange) {
         await runRagSearch();
       }
     } catch {
       // ignore transient poll error
+    } finally {
+      isRefreshing = false;
+    }
+  }
+
+  async function pollLivePulse() {
+    if (isRefreshing || isPanningCanvas || draggingNodeId) return;
+    try {
+      const pulse = await apiFetch('/api/live-pulse', {});
+      if (!pulse || !pulse.ok) return;
+      if (pulse.liveRevision && pulse.liveRevision !== lastLiveRevision) {
+        const wsChanged =
+          currentWorkspaceRoot &&
+          pulse.workspaceRoot &&
+          currentWorkspaceRoot.toLowerCase() !== pulse.workspaceRoot.toLowerCase();
+        await refreshDashboard(Boolean(wsChanged), true);
+      }
+    } catch {
+      // ignore transient pulse error
     }
   }
 
   // =========================================================================
-  // EVENT LISTENERS & INTERACTIVE CONTROLS
+  // EVENT LISTENERS & INTERACTIVE CONTROLS (PAN, ZOOM, DRAG & HOVER)
   // =========================================================================
   document.getElementById('workspace-switcher-select')?.addEventListener('change', async (e) => {
     const targetPath = e.target.value;
@@ -1077,6 +1437,12 @@
   document.getElementById('formation-select')?.addEventListener('change', (e) => {
     activeFormationId = e.target.value;
     selectedNodeId = null;
+    hoveredNodeId = null;
+    panX = 0;
+    panY = 0;
+    zoomScale = 1.0;
+    lastRenderedNodeSignature = '';
+    applyStageTransform(false);
     if (latestDashboard) renderSwarmTab(latestDashboard);
   });
 
@@ -1085,20 +1451,112 @@
     if (latestDashboard) renderSwarmTab(latestDashboard);
   });
 
-  // Zoom controls on Hierarchy Map
-  const applyZoom = (newScale) => {
-    zoomScale = Math.max(0.65, Math.min(1.4, Number(newScale.toFixed(2))));
-    const stage = document.getElementById('hierarchy-stage');
-    const lbl = document.getElementById('zoom-level-label');
-    if (stage) stage.style.transform = `scale(${zoomScale})`;
-    if (lbl) lbl.textContent = `${Math.round(zoomScale * 100)}%`;
-    requestAnimationFrame(() => drawHierarchyEdges());
+  // Interactive Zoom & Pan Controls on Hierarchy Map (#hierarchy-viewport)
+  const applyZoom = (newScale, anchorClientX, anchorClientY, immediate = false) => {
+    const viewport = document.getElementById('hierarchy-viewport');
+    const prevScale = zoomScale || 1.0;
+    const clamped = Math.max(0.45, Math.min(1.85, Number(newScale.toFixed(2))));
+    if (
+      viewport &&
+      typeof anchorClientX === 'number' &&
+      typeof anchorClientY === 'number'
+    ) {
+      const vpRect = viewport.getBoundingClientRect();
+      const cursorX = anchorClientX - vpRect.left;
+      const cursorY = anchorClientY - vpRect.top;
+      const stagePointX = (cursorX - panX) / prevScale;
+      const stagePointY = (cursorY - panY) / prevScale;
+      panX = Math.round(cursorX - stagePointX * clamped);
+      panY = Math.round(cursorY - stagePointY * clamped);
+    }
+    zoomScale = clamped;
+    applyStageTransform(immediate);
   };
 
-  document.getElementById('btn-zoom-in')?.addEventListener('click', () => applyZoom(zoomScale + 0.1));
-  document.getElementById('btn-zoom-out')?.addEventListener('click', () => applyZoom(zoomScale - 0.1));
-  document.getElementById('btn-zoom-fit')?.addEventListener('click', () => applyZoom(1.0));
+  const resetHierarchyCamera = () => {
+    zoomScale = 1.0;
+    panX = 0;
+    panY = 0;
+    for (const key of Array.from(nodeOffsets.keys())) {
+      if (key.startsWith(`${activeFormationId}:`)) {
+        nodeOffsets.delete(key);
+      }
+    }
+    const stage = document.getElementById('hierarchy-stage');
+    if (stage) {
+      stage.querySelectorAll('.h-node-card').forEach((card) => {
+        card.style.transform = '';
+      });
+    }
+    applyStageTransform(false);
+  };
+
+  document.getElementById('btn-zoom-in')?.addEventListener('click', () => applyZoom(zoomScale + 0.12));
+  document.getElementById('btn-zoom-out')?.addEventListener('click', () => applyZoom(zoomScale - 0.12));
+  document.getElementById('btn-zoom-fit')?.addEventListener('click', () => resetHierarchyCamera());
   window.addEventListener('resize', () => requestAnimationFrame(() => drawHierarchyEdges()));
+
+  const hierarchyViewport = document.getElementById('hierarchy-viewport');
+  if (hierarchyViewport) {
+    // 1. Mouse click-and-drag on canvas background to pan freely
+    hierarchyViewport.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      if (
+        e.target.closest('.h-node-card') ||
+        e.target.closest('.hierarchy-toolbar') ||
+        e.target.closest('button')
+      ) {
+        return;
+      }
+      isPanningCanvas = true;
+      panStartX = e.clientX;
+      panStartY = e.clientY;
+      panOriginX = panX;
+      panOriginY = panY;
+      hierarchyViewport.classList.add('is-panning');
+      hideNodeHoverPreview();
+      try {
+        hierarchyViewport.setPointerCapture(e.pointerId);
+      } catch {}
+    });
+
+    hierarchyViewport.addEventListener('pointermove', (e) => {
+      if (!isPanningCanvas) return;
+      panX = Math.round(panOriginX + (e.clientX - panStartX));
+      panY = Math.round(panOriginY + (e.clientY - panStartY));
+      applyStageTransform(true);
+    });
+
+    const endCanvasPan = (e) => {
+      if (!isPanningCanvas) return;
+      isPanningCanvas = false;
+      hierarchyViewport.classList.remove('is-panning');
+      try {
+        hierarchyViewport.releasePointerCapture(e.pointerId);
+      } catch {}
+      applyStageTransform(false);
+    };
+
+    hierarchyViewport.addEventListener('pointerup', endCanvasPan);
+    hierarchyViewport.addEventListener('pointercancel', endCanvasPan);
+
+    // 2. Mouse wheel / trackpad gesture zoom centered on cursor
+    hierarchyViewport.addEventListener(
+      'wheel',
+      (e) => {
+        e.preventDefault();
+        const delta = e.deltaY < 0 ? 0.1 : -0.1;
+        applyZoom(zoomScale + delta, e.clientX, e.clientY, true);
+      },
+      { passive: false }
+    );
+
+    // 3. Double-click canvas background to reset view
+    hierarchyViewport.addEventListener('dblclick', (e) => {
+      if (e.target.closest('.h-node-card') || e.target.closest('.hierarchy-toolbar')) return;
+      resetHierarchyCamera();
+    });
+  }
 
   // Member & Task Filter Pills
   document.querySelectorAll('#member-filter-pills .filter-pill').forEach((btn) => {
@@ -1297,9 +1755,10 @@
     }
   });
 
-  // Initial load + initial search + live polling
+  // Initial load + initial search + 1-second real-time live pulse stream
   refreshDashboard().then(() => {
     runRagSearch('What evidence supported our previous choice of memory architecture?');
   });
-  setInterval(() => refreshDashboard(false), 3000);
+  setInterval(() => pollLivePulse(), 1000);
+  setInterval(() => refreshDashboard(false), 4000);
 })();

@@ -24,3 +24,7 @@ Tasks within `software-engineering` execute in order and may read only earlier `
 - **[task-002-gravity-well-swarm-hierarchy-context-dna](./harnesses/task-002-gravity-well-swarm-hierarchy-context-dna/EXPERIENCE.md)** (`2026-11-07T01:05:20.347Z`, `status: active`)
   - **Cue**: *When visualizing multi-tier subagent swarms, context window token DNA, or switching workspaces in Antigravity Auxiliary Pane sidecars, combine GetAllCascadeTrajectories + resolveActiveWorkspace with active-workspace.json state sync and tiered SVG Bezier DAG rendering.*
   - **Adopted Harness**: [`./harnesses/task-002-gravity-well-swarm-hierarchy-context-dna/harness/manifest.json`](./harnesses/task-002-gravity-well-swarm-hierarchy-context-dna/harness/manifest.json)
+
+- **[task-003-interactive-hierarchy-live-pulse](./harnesses/task-003-interactive-hierarchy-live-pulse/EXPERIENCE.md)** (`2026-11-07T02:31:29.710Z`, `status: active`)
+  - **Cue**: *When implementing interactive agent hierarchy DAG maps with real-time live telemetry in an Antigravity UI sidecar, combine transform3d(panX, panY) scale(zoomScale) with individual node offsets, a floating hover inspector card, 1s /api/live-pulse delta checks, and non-destructive in-place DOM patching so live updates never reset pan/zoom/drag state.*
+  - **Adopted Harness**: [`./harnesses/task-003-interactive-hierarchy-live-pulse/harness/manifest.json`](./harnesses/task-003-interactive-hierarchy-live-pulse/harness/manifest.json)

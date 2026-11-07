@@ -161,6 +161,16 @@ test('5. Auxiliary Pane UI Sidecar Server responds on /, /api/status, /api/dashb
     assert.equal(htmlRes.status, 200);
     const htmlText = await htmlRes.text();
     assert.ok(htmlText.includes('Gravity Well Harness'));
+    assert.ok(htmlText.includes('node-hover-preview'));
+
+    const pulseRes = await fetch(`${base}/api/live-pulse`, {
+      method: 'POST',
+      body: JSON.stringify({ workspaceRoot: REPO_ROOT }),
+    });
+    assert.equal(pulseRes.status, 200);
+    const pulseData = await pulseRes.json();
+    assert.equal(pulseData.ok, true);
+    assert.ok(typeof pulseData.liveRevision === 'string' && pulseData.liveRevision.length > 0);
 
     const dashRes = await fetch(`${base}/api/dashboard`, {
       method: 'POST',
@@ -170,6 +180,7 @@ test('5. Auxiliary Pane UI Sidecar Server responds on /, /api/status, /api/dashb
     const dashData = await dashRes.json();
     assert.equal(dashData.ok, true);
     assert.equal(dashData.formalName, 'Gravity Well Harness');
+    assert.ok(typeof dashData.liveRevision === 'string' && dashData.liveRevision.length > 0);
     assert.equal(dashData.swarm.configuredSwarmRoles.length, 4);
 
     // Verify Multi-Tier Swarm Hierarchy Formations & Teams

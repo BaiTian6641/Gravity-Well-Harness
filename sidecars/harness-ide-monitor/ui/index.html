@@ -137,13 +137,21 @@
               <div class="hierarchy-tiers-container" id="hierarchy-tiers-container"></div>
             </div>
 
+            <!-- Rich Mouse Hover Preview Card -->
+            <div id="node-hover-preview" class="node-hover-preview hidden" role="tooltip"></div>
+
+            <!-- Bottom-Left Gesture Hint -->
+            <div class="hierarchy-gesture-hint">
+              <span>🖱️ Drag canvas to pan · Drag any node to reposition · Scroll wheel to zoom · Hover node for details</span>
+            </div>
+
             <!-- Floating Bottom-Right Tree Controls (Matches Screenshot 2) -->
             <div class="hierarchy-toolbar">
               <span class="toolbar-label">∟ Tree DAG</span>
-              <button class="toolbar-btn" id="btn-zoom-out" title="Zoom Out">−</button>
+              <button class="toolbar-btn" id="btn-zoom-out" title="Zoom Out (Wheel Down)">−</button>
               <span class="toolbar-zoom-val" id="zoom-level-label">100%</span>
-              <button class="toolbar-btn" id="btn-zoom-in" title="Zoom In">+</button>
-              <button class="toolbar-btn" id="btn-zoom-fit" title="Reset Zoom &amp; Pan">⤢ Fit</button>
+              <button class="toolbar-btn" id="btn-zoom-in" title="Zoom In (Wheel Up)">+</button>
+              <button class="toolbar-btn" id="btn-zoom-fit" title="Center &amp; Reset Layout">⤢ Fit</button>
             </div>
           </div>
         </div>
