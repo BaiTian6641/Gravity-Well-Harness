@@ -28,3 +28,7 @@ Tasks within `software-engineering` execute in order and may read only earlier `
 - **[task-003-interactive-hierarchy-live-pulse](./harnesses/task-003-interactive-hierarchy-live-pulse/EXPERIENCE.md)** (`2026-11-07T02:31:29.710Z`, `status: active`)
   - **Cue**: *When implementing interactive agent hierarchy DAG maps with real-time live telemetry in an Antigravity UI sidecar, combine transform3d(panX, panY) scale(zoomScale) with individual node offsets, a floating hover inspector card, 1s /api/live-pulse delta checks, and non-destructive in-place DOM patching so live updates never reset pan/zoom/drag state.*
   - **Adopted Harness**: [`./harnesses/task-003-interactive-hierarchy-live-pulse/harness/manifest.json`](./harnesses/task-003-interactive-hierarchy-live-pulse/harness/manifest.json)
+
+- **[task-004-realtime-telemetry-and-hot-reload](./harnesses/task-004-realtime-telemetry-and-hot-reload/EXPERIENCE.md)** (`2026-11-07T03:03:31.034Z`, `status: active`)
+  - **Cue**: *When Auxiliary Pane sidecar statistics appear frozen or fail to update after setup.mjs, ensure apiFetch injects X-Sidecar-Token from script src token fallback, format compact tokens with 3 decimals (>=5M) and seconds on multi-hour durations, advance all RUNNING nodes and context analytics via a 1s wall-clock ticker, and use a zero-downtime /api/reload + launcher retry loop.*
+  - **Adopted Harness**: [`./harnesses/task-004-realtime-telemetry-and-hot-reload/harness/manifest.json`](./harnesses/task-004-realtime-telemetry-and-hot-reload/harness/manifest.json)

@@ -21,7 +21,15 @@ import {
   updateAgySidecarConfig,
   writeJsonNoBom,
 } from 'antigravity-sidecar-kit/config';
-import { callLsRpc, manageSidecar } from 'antigravity-sidecar-kit/rpc';
+import {
+  callLsRpc,
+  findListeningPids,
+  getSidecars,
+  isNodeProcess,
+  killPidAndWait,
+  killSidecarProcessByPortOrPid,
+  manageSidecar,
+} from 'antigravity-sidecar-kit/rpc';
 import { HarnessKnowledgeEngine } from './src/rag-engine.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -138,9 +146,57 @@ async function main() {
   updateAgySidecarConfig(SIDECAR_ID, true);
   let sidecarReloadMethod = 'config.json';
   try {
+    let hotReloaded = false;
+    try {
+      const scList = await getSidecars();
+      const existing = (scList?.sidecars || []).find(
+        (s) => (s.sidecarId || s.config?.id || s.id) === SIDECAR_ID
+      );
+      const livePort = Number(existing?.webPort || 0);
+      const token = existing?.baseUrl
+        ? new URL(existing.baseUrl).searchParams.get('token') || ''
+        : '';
+
+      if (livePort > 0) {
+        // 1. Try clean zero-exit reload endpoint if supported
+        try {
+          const r = await fetch(`http://127.0.0.1:${livePort}/api/reload`, {
+            method: 'GET',
+            headers: token ? { 'X-Sidecar-Token': token } : {},
+          });
+          if (r.ok) {
+            hotReloaded = true;
+            await new Promise((res) => setTimeout(res, 350));
+          }
+        } catch {}
+
+        // 2. If old process didn't have /api/reload, terminate child and trigger launcher retry
+        if (!hotReloaded) {
+          try {
+            killSidecarProcessByPortOrPid(SIDECAR_ID);
+          } catch {}
+          await new Promise((res) => setTimeout(res, 250));
+        }
+
+        // 3. Always ensure launcher is not parked on diagnostic retry screen
+        try {
+          await fetch(
+            `http://127.0.0.1:${livePort}/__launcher/retry?token=${encodeURIComponent(token)}`,
+            {
+              method: 'POST',
+              headers: { Origin: `http://127.0.0.1:${livePort}` },
+            }
+          );
+          hotReloaded = true;
+          await new Promise((res) => setTimeout(res, 400));
+        } catch {}
+      }
+    } catch {}
+
     await manageSidecar(SIDECAR_ID, 'SIDECAR_ACTION_ENABLE');
-    await manageSidecar(SIDECAR_ID, 'SIDECAR_ACTION_RESTART');
-    sidecarReloadMethod = 'LanguageServerRPC (ManageSidecar)';
+    sidecarReloadMethod = hotReloaded
+      ? 'LanguageServerRPC (Zero-Downtime Hot-Reload + ManageSidecar)'
+      : 'LanguageServerRPC (ManageSidecar)';
   } catch {
     // Will start on next Antigravity poll/restart
   }

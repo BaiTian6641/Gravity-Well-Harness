@@ -5,8 +5,11 @@ import { runSidecarLauncher } from 'antigravity-sidecar-kit/launcher';
 
 const __dirname = realpathSync(dirname(fileURLToPath(import.meta.url)));
 
-await runSidecarLauncher({
-  targetPath: join(__dirname, 'server.mjs'),
-  sidecarName: 'Harness² Swarm & RAG Monitor',
-  repoRoot: __dirname,
-});
+for (;;) {
+  const code = await runSidecarLauncher({
+    targetPath: join(__dirname, 'server.mjs'),
+    sidecarName: 'Harness² Swarm & RAG Monitor',
+    repoRoot: __dirname,
+  });
+  if (code !== 0) break;
+}

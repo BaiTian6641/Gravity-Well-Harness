@@ -14,10 +14,29 @@
     hostClientWorkspaceUris = [window.sidecar.workspace];
   }
 
+  function resolveUiToken() {
+    try {
+      const qTok = new URLSearchParams(window.location?.search || '').get('token');
+      if (qTok) return (window.__AGY_TOKEN__ = qTok);
+      if (window.__AGY_TOKEN__) return window.__AGY_TOKEN__;
+      const els = document?.querySelectorAll?.('script[src*="token="], link[href*="token="]') || [];
+      for (const el of els) {
+        const raw = el.getAttribute?.('src') || el.getAttribute?.('href') || '';
+        const tok = new URL(raw, 'http://127.0.0.1').searchParams.get('token');
+        if (tok) return (window.__AGY_TOKEN__ = tok);
+      }
+    } catch {}
+    return '';
+  }
+
   const apiFetch = async (endpoint, payload = {}) => {
     const fn = window.sidecar?.fetch || window.fetch.bind(window);
+    const uiToken = resolveUiToken();
+    const sep = endpoint.includes('?') ? '&' : '?';
+    const targetUrl = `${endpoint}${sep}${uiToken ? `token=${encodeURIComponent(uiToken)}&` : ''}_ts=${Date.now()}`;
     const bodyPayload = {
       ...payload,
+      _ts: Date.now(),
       ...( !autoFollowWorkspace && pinnedWorkspaceRoot
         ? { workspaceRoot: pinnedWorkspaceRoot, pinnedWorkspace: true }
         : {} ),
@@ -26,9 +45,14 @@
         : {} ),
       ...( hostConversationId ? { conversationId: hostConversationId } : {} ),
     };
-    const res = await fn(endpoint, {
+    const res = await fn(targetUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      cache: 'no-store',
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-cache, no-store',
+        ...(uiToken ? { 'X-Sidecar-Token': uiToken } : {}),
+      },
       body: JSON.stringify(bodyPayload),
     });
     return res.json();
@@ -135,6 +159,7 @@
   let nodeOriginY = 0;
   const nodeOffsets = new Map(); // key: `${formationId}:${nodeId}` -> { x, y }
   let lastRenderedNodeSignature = '';
+  let lastRenderedMemberSignature = '';
   let lastLiveRevision = '';
   let isRefreshing = false;
   const expandedDnaKeys = new Set(['injectedRag', 'toolResults']);
@@ -631,7 +656,9 @@
           if (k) seg.style.width = `${Math.max(0, Number(dna[k] || 0))}%`;
         });
         const footerSpans = card.querySelectorAll('.h-node-footer span');
-        if (footerSpans[0]) footerSpans[0].textContent = n.durationFormatted;
+        if (footerSpans[0]) {
+          footerSpans[0].textContent = n.durationFormatted;
+        }
         if (footerSpans[1]) footerSpans[1].textContent = `${Number(n.contextUsedPct || 0)}%`;
       }
 
@@ -701,42 +728,72 @@
 
     requestAnimationFrame(() => drawHierarchyEdges());
 
-    // Render Right Top: Swarm Teams & Members (编队成员)
+    // Render Right Top: Swarm Teams & Members (编队成员) with In-Place Live Patching
     const teamsContainer = document.getElementById('swarm-teams-container');
     document.getElementById('team-members-count-badge').textContent =
       `${(formation.nodes || []).length} Agents`;
 
-    teamsContainer.innerHTML = (formation.teams || [])
-      .map((team) => {
-        let members = [...(team.members || [])];
-        if (memberStatusFilter !== 'ALL') {
-          members = members.filter((m) => m.status === memberStatusFilter);
-        }
-        if (memberSearchQuery) {
-          const q = memberSearchQuery.toLowerCase();
-          members = members.filter(
-            (m) =>
-              m.role.toLowerCase().includes(q) ||
-              m.model.toLowerCase().includes(q) ||
-              team.teamName.toLowerCase().includes(q)
-          );
-        }
-        if (memberSortMode === 'tokens') {
-          members.sort((a, b) => (b.totalTokens || 0) - (a.totalTokens || 0));
-        } else if (memberSortMode === 'steps') {
-          members.sort((a, b) => (b.steps || 0) - (a.steps || 0));
-        }
+    const filteredTeams = [];
+    const visibleMemberIds = [];
+    for (const team of formation.teams || []) {
+      let members = [...(team.members || [])];
+      if (memberStatusFilter !== 'ALL') {
+        members = members.filter((m) => m.status === memberStatusFilter);
+      }
+      if (memberSearchQuery) {
+        const q = memberSearchQuery.toLowerCase();
+        members = members.filter(
+          (m) =>
+            m.role.toLowerCase().includes(q) ||
+            m.model.toLowerCase().includes(q) ||
+            team.teamName.toLowerCase().includes(q)
+        );
+      }
+      if (memberSortMode === 'tokens') {
+        members.sort((a, b) => (b.totalTokens || 0) - (a.totalTokens || 0));
+      } else if (memberSortMode === 'steps') {
+        members.sort((a, b) => (b.steps || 0) - (a.steps || 0));
+      }
+      if (members.length > 0) {
+        filteredTeams.push({ teamName: team.teamName, members });
+        for (const m of members) visibleMemberIds.push(m.id);
+      }
+    }
 
-        if (members.length === 0) return '';
-
-        return `
+    const memberSignature = `${activeFormationId}:${memberStatusFilter}:${memberSortMode}:${memberSearchQuery}:${visibleMemberIds.join(',')}`;
+    if (
+      memberSignature === lastRenderedMemberSignature &&
+      teamsContainer.querySelectorAll('.member-card').length === visibleMemberIds.length
+    ) {
+      for (const team of filteredTeams) {
+        for (const m of team.members) {
+          const card = teamsContainer.querySelector(`[data-member-id="${m.id}"]`);
+          if (!card) continue;
+          const isRunning = m.status === 'RUNNING';
+          card.classList.toggle('member-running', isRunning);
+          card.classList.toggle('member-selected', selectedNodeId === m.id);
+          const dot = card.querySelector('.status-dot');
+          if (dot) dot.className = `status-dot ${isRunning ? 'dot-running' : 'dot-completed'}`;
+          const reportEl = card.querySelector('.member-report');
+          if (reportEl) reportEl.textContent = m.latestReport || '';
+          const footerFirst = card.querySelector('.member-footer span');
+          if (footerFirst) {
+            footerFirst.textContent = `${m.contextTokensFormatted} · ${m.durationFormatted}`;
+          }
+        }
+      }
+    } else {
+      lastRenderedMemberSignature = memberSignature;
+      teamsContainer.innerHTML = filteredTeams
+        .map(
+          (team) => `
           <div class="team-group-block">
             <div class="team-group-header">
               <span>${escapeHtml(team.teamName)}</span>
-              <span>${members.length} members</span>
+              <span>${team.members.length} members</span>
             </div>
             <div class="team-members-grid">
-              ${members
+              ${team.members
                 .map((m) => {
                   const isRunning = m.status === 'RUNNING';
                   const isSel = selectedNodeId === m.id;
@@ -758,24 +815,25 @@
                 .join('')}
             </div>
           </div>
-        `;
-      })
-      .join('');
+        `
+        )
+        .join('');
 
-    teamsContainer.querySelectorAll('.member-card').forEach((card) => {
-      const mid = card.getAttribute('data-member-id');
-      card.addEventListener('mouseenter', () => {
-        const nodeEl = document.querySelector(`#hierarchy-stage [data-node-id="${mid}"]`);
-        showNodeHoverPreview(mid, nodeEl || card);
+      teamsContainer.querySelectorAll('.member-card').forEach((card) => {
+        const mid = card.getAttribute('data-member-id');
+        card.addEventListener('mouseenter', () => {
+          const nodeEl = document.querySelector(`#hierarchy-stage [data-node-id="${mid}"]`);
+          showNodeHoverPreview(mid, nodeEl || card);
+        });
+        card.addEventListener('mouseleave', () => {
+          hideNodeHoverPreview();
+        });
+        card.addEventListener('click', () => {
+          selectedNodeId = selectedNodeId === mid ? null : mid;
+          renderSwarmTab(latestDashboard);
+        });
       });
-      card.addEventListener('mouseleave', () => {
-        hideNodeHoverPreview();
-      });
-      card.addEventListener('click', () => {
-        selectedNodeId = selectedNodeId === mid ? null : mid;
-        renderSwarmTab(latestDashboard);
-      });
-    });
+    }
 
     // Render Right Middle: Delegated Tasks (任务)
     const tasksListEl = document.getElementById('swarm-tasks-list');
@@ -1093,8 +1151,9 @@
           <text x="${svgW - padR + 4}" y="${padT + plotH}" fill="#94a3b8" font-size="9">0s</text>
         </svg>
       `;
+      const nowTimeStr = new Date().toLocaleTimeString([], { hour12: false });
       document.getElementById('ctx-trend-footer').textContent =
-        `Turn ${sess.turns || 1} · Step ${sess.steps || trends.length} (${trends.length} samples)`;
+        `Turn ${sess.turns || 1} · Step ${sess.steps || trends.length} (${trends.length} samples) · Live ${nowTimeStr}`;
     }
 
     // 6. Context DNA Browser Accordion
@@ -1385,7 +1444,7 @@
   }
 
   async function pollLivePulse() {
-    if (isRefreshing || isPanningCanvas || draggingNodeId) return;
+    if (isRefreshing) return;
     try {
       const pulse = await apiFetch('/api/live-pulse', {});
       if (!pulse || !pulse.ok) return;
