@@ -2,8 +2,19 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { HarnessKnowledgeEngine } from '../rag-engine.mjs';
-import { getEnrichedModelCatalog, loadHubConfig } from '../model-hub.mjs';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const repoModelHubPath = path.resolve(__dirname, '../../../../src/model-hub.mjs');
+const pluginModelHubPath = path.resolve(__dirname, '../model-hub.mjs');
+const {
+  getEnrichedModelCatalog,
+  loadHubConfig,
+  syncChatBoxModelAndTranscript,
+} = await import(
+  pathToFileURL(fs.existsSync(repoModelHubPath) ? repoModelHubPath : pluginModelHubPath).href
+);
 
 function readStdinJson() {
   try {
@@ -127,6 +138,15 @@ function main() {
       // ignore
     }
 
+    const liveUsage =
+      typeof syncChatBoxModelAndTranscript === 'function'
+        ? syncChatBoxModelAndTranscript(workspaceRoot, {
+            modelName: input.modelName,
+            transcriptPath: input.transcriptPath,
+            conversationId: convId,
+          })
+        : null;
+
     const profile = engine.resolveReasoningProfile();
     const hubCfg = loadHubConfig(workspaceRoot);
     const catalog = getEnrichedModelCatalog(workspaceRoot);
@@ -142,16 +162,20 @@ function main() {
         : `${Math.round((activeModel.contextWindowTokens || 256_000) / 1000)}k`;
     const usedStr = `${((activeModel.usedContextTokens || 55100) / 1000).toFixed(1)}k`;
     const usedPct = Number(activeModel.contextUsedPct || 5.5);
+    const chatBoxLabel = hubCfg.chatBoxNativeModel || input.modelName || activeModel.name;
+    const routing = hubCfg.subagentModelRouting || {};
 
     const inlineHudMarkdown = [
-      `> 🤖 **Active Model**: \`${activeModel.name || hubCfg.activeModelId}\` (\`${activeModel.id || hubCfg.activeModelId}\`) · 🧠 **Depth**: \`${depthLabel} (effort=${effortLabel}, cap=${profile.thinkingBudgetTokens} tok)\` · 📊 **Context Usage**: \`${usedStr} / ${ctxWinStr} (${usedPct}%)\` · 📚 **RAG**: \`${status.totalDocuments} docs\` · [Swarm & RAG Monitor](sidecar://harness-ide-monitor/)`,
-      `> 💡 *In-Chat Model Routing*: Type \`/model <id> [eco|balanced|deep]\` to switch models, or prefix with \`@deepseek\`, \`@kimi\`, \`@glm\`, \`@grok\`, \`@qwen\`, \`@mimo\`, \`@minimax\` in chat to invoke DeepSeek Official / OpenCode Go directly inline.`
+      `> 🤖 **Chat Box Main Agent**: \`${chatBoxLabel}\` · **Hub Model**: \`${activeModel.name || hubCfg.activeModelId}\` (\`${activeModel.id || hubCfg.activeModelId}\`) · 🧠 **Depth**: \`${depthLabel} (effort=${effortLabel}, cap=${profile.thinkingBudgetTokens} tok)\` · 📊 **Context Usage**: \`${usedStr} / ${ctxWinStr} (${usedPct}%)\`${liveUsage?.steps > 0 ? ` (\`${liveUsage.turns} turns · ${liveUsage.steps} steps\`)` : ''} · 📚 **RAG**: \`${status.totalDocuments} docs\` · [Swarm & RAG Monitor](sidecar://harness-ide-monitor/)`,
+      `> 🐝 **Sub-Agent Multi-Model Routing** (\`.vscode/settings.json\`): Proposer → \`${routing.proposerModelId || 'deepseek-v4-pro'}\` · Probers → \`${routing.proberAModelId || 'opencode-go/kimi-k2.7-code'}\` / \`${routing.proberBModelId || 'opencode-go/glm-5.3'}\` / \`${routing.proberCModelId || 'opencode-go/gpt-6-luna'}\` · Composer → \`${routing.composerModelId || 'opencode-go/grok-4.7'}\``,
+      `> 💡 *In-Chat Commands*: Type \`/usage\` or \`/models\` to inspect context usage & subagent models, \`/model <id> [eco|balanced|deep]\` to switch models, or prefix with \`@deepseek\`, \`@kimi\`, \`@glm\`, \`@grok\`, \`@qwen\`, \`@mimo\`, \`@minimax\` to invoke DeepSeek Official / OpenCode Go inline.`
     ].join('\n');
 
     const msg = [
       `[Gravity Well Harness — Harness² & Local RAG IDE Active]`,
       `- Active Workspace: ${workspaceRoot}`,
-      `- Active Hub Model: ${activeModel.name || hubCfg.activeModelId} (${activeModel.id}, provider=${activeModel.providerLabel}, depth=${depthLabel}, reasoning_effort=${effortLabel}, context=${usedStr}/${ctxWinStr} [${usedPct}%])`,
+      `- Chat Box Main Agent Model: ${chatBoxLabel} | Active Hub Model: ${activeModel.name || hubCfg.activeModelId} (${activeModel.id}, provider=${activeModel.providerLabel}, depth=${depthLabel}, reasoning_effort=${effortLabel}, context=${usedStr}/${ctxWinStr} [${usedPct}%])`,
+      `- Sub-Agent Multi-Model Routing (antigravity.harness.swarmRoleModels): Proposer='${routing.proposerModelId}', RAG-Researcher='${routing.ragResearcherModelId}', Prober-A='${routing.proberAModelId}', Prober-B='${routing.proberBModelId}', Prober-C='${routing.proberCModelId}', Verifier='${routing.verifierModelId}', Composer='${routing.composerModelId}'.`,
       `- Indexed Local Documents: ${status.totalDocuments} across project-knowledge, experiment-knowledge, and reference-knowledge.`,
       `- Snapshot Isolation Status: ${lockInfo}`,
       `- Token-Efficiency & Reasoning Depth Guardrail: profile='${profile.reasoningDepth}' (max thinking budget: ${profile.thinkingBudgetTokens} tokens/turn, prober model: '${profile.proberModelTier}', max probe steps: ${profile.maxProbeSteps}, RAG snippet cap: ${profile.ragSnippetMaxChars} chars, early-stop: ${profile.earlyStopOnFirstPass}). Query 'harness_query' (Cue-First) before calling 'harness_get' so user tokens are conserved.`,

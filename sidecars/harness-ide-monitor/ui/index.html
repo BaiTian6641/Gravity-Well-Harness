@@ -42,20 +42,13 @@
       </div>
     </header>
 
-    <!-- ALWAYS-VISIBLE INLINE MODEL SELECTOR (NAME + REASONING DEPTH) & LIVE CONTEXT USAGE BAR -->
+    <!-- ALWAYS-VISIBLE READ-ONLY ACTIVE MODEL TELEMETRY & LIVE CONTEXT USAGE BAR -->
     <div class="inline-model-context-strip" id="inline-model-context-strip">
       <div class="imc-left">
-        <span class="imc-badge">🤖 Model &amp; Depth</span>
-        <select id="header-model-selector" class="input-field select-compact imc-model-select" title="Select Active Model (DeepSeek Official 1M · OpenCode Go Plan · Antigravity Native)"></select>
-        <select id="header-depth-selector" class="input-field select-compact imc-depth-select" title="Set Active Reasoning Depth &amp; DeepSeek/OpenCode reasoning_effort">
-          <option value="eco">ECO · effort=low (1024 tok)</option>
-          <option value="balanced" selected>BALANCED · effort=high (2048 tok)</option>
-          <option value="deep">DEEP · effort=max (8192 tok)</option>
-        </select>
-        <button class="btn btn-secondary btn-xs" id="btn-self-improve-top" title="Run Multi-Model Self-Improvement &amp; Cooperation Cycle (Harness² + Peer Critique)">
-          🧠 Self-Improve Swarm
-        </button>
-        <span class="pill-badge pill-ok" id="inline-vault-badge" title="Configured via Antigravity IDE Settings (.vscode/settings.json · Ctrl+,) · API Keys encrypted in ~/.gemini/config/.secrets.vault.enc (AES-256-GCM)">
+        <span class="imc-badge">🤖 Chat Box Model (Project)</span>
+        <span class="pill-badge pill-accent" id="monitor-active-model-pill" title="Active Main Agent Model synced from Antigravity IDE Chat Box & .vscode/settings.json">DeepSeek V4 Pro (1M)</span>
+        <span class="pill-badge" id="monitor-active-depth-pill" title="Active Reasoning Depth & Effort">BALANCED · effort=high (2048 tok)</span>
+        <span class="pill-badge pill-ok" id="inline-vault-badge" title="Configured via Antigravity IDE Chat Box & Settings · API Keys encrypted in ~/.gemini/config/.secrets.vault.enc (AES-256-GCM)">
           🔒 IDE Settings &amp; Vault
         </span>
       </div>
@@ -127,48 +120,6 @@
             <span class="subagent-progress-text" id="swarm-progress-label">3/5</span>
           </div>
         </div>
-      </div>
-
-      <!-- MULTI-MODEL MESSAGE INJECTION, CONVEY & UNIFIED WEB SEARCH BAR -->
-      <div class="coop-injection-bar" id="multi-model-coop-bar">
-        <div class="coop-row">
-          <span class="coop-label">⚡ Message Injection &amp; Convey:</span>
-          <select id="inject-to-agent" class="input-field select-compact" title="Target Subagent or All Swarm">
-            <option value="harness-proposer">→ Harness² Proposer</option>
-            <option value="harness-prober-1">→ Prober #1 (Candidate A)</option>
-            <option value="harness-prober-2">→ Prober #2 (Candidate B)</option>
-            <option value="harness-prober-3">→ Prober #3 (Candidate C)</option>
-            <option value="harness-sandbox-verifier">→ Regression Verifier</option>
-            <option value="harness-composer">→ Contrastive Composer</option>
-            <option value="all">→ Broadcast to All Swarm</option>
-          </select>
-          <select id="inject-to-model" class="input-field select-compact" title="Target Model (DeepSeek Official / OpenCode Go Plan / Native)"></select>
-          <select id="inject-msg-type" class="input-field select-compact" title="Injection / Cooperation Directive Type">
-            <option value="INJECT_DIRECTIVE">INJECT_DIRECTIVE</option>
-            <option value="CONVEY_CONTEXT">CONVEY_CONTEXT</option>
-            <option value="PEER_CRITIQUE">PEER_CRITIQUE</option>
-            <option value="SELF_IMPROVE_CUE">SELF_IMPROVE_CUE</option>
-          </select>
-          <input type="text" id="inject-msg-input" class="input-field coop-input" placeholder="Inject directive, cross-model handoff, or peer critique (auto-recalls subagent into active 2D grid)…" />
-          <button class="btn btn-primary btn-xs" id="btn-send-injection">⚡ Inject &amp; Convey</button>
-        </div>
-
-        <div class="coop-row coop-search-row">
-          <span class="coop-label">🌐 Multi-Engine Search:</span>
-          <select id="multi-search-engine" class="input-field select-compact" title="Select Search Engine (DeepSeek Search / Parallel AI / Tavily / Free Engines)">
-            <option value="multi-fusion">Multi-Engine RRF Fusion (All)</option>
-            <option value="deepseek-search">DeepSeek Official Search (/v1/tools/search)</option>
-            <option value="parallel">Parallel AI Search (search.parallel.ai/mcp)</option>
-            <option value="tavily">Tavily AI Search (api.tavily.com)</option>
-            <option value="duckduckgo">DuckDuckGo Instant (Free Zero-Key)</option>
-            <option value="jina">Jina AI Search &amp; Reader (s.jina.ai)</option>
-            <option value="wikipedia">Wikipedia Action API (Free Zero-Key)</option>
-            <option value="hn-algolia">HackerNews Algolia (Free Zero-Key)</option>
-          </select>
-          <input type="text" id="multi-search-input" class="input-field coop-input" placeholder="Search across DeepSeek Search, Parallel AI, Tavily, DuckDuckGo, Jina &amp; Wikipedia…" />
-          <button class="btn btn-secondary btn-xs" id="btn-run-multi-search">🔍 Search Web</button>
-        </div>
-        <div id="multi-search-results-drawer" class="multi-search-results hidden"></div>
       </div>
 
       <!-- Main Split View: Left Hierarchy Map + Right Team Members & Tasks -->
@@ -481,55 +432,20 @@
     </section>
 
     <!-- =================================================================== -->
-    <!-- TAB 3: HARNESS² PROPOSE-PROBE-COMPOSE STUDIO                        -->
+    <!-- TAB 3: HARNESS² PROPOSE-PROBE-COMPOSE MONITOR                       -->
     <!-- =================================================================== -->
     <section id="tab-harness2" class="tab-panel">
       <div class="card card-highlight">
         <div class="card-header">
           <div>
-            <span class="eyebrow">GOOGLE RESEARCH HARNESS² · TOKEN-EFFICIENT RECURSIVE LOOP</span>
-            <h2 class="card-title">Propose → Probe → Compose Studio (Adaptive Reasoning Depth)</h2>
+            <span class="eyebrow">GOOGLE RESEARCH HARNESS² · LIVE TRAJECTORY &amp; TOKEN EFFICIENCY MONITOR</span>
+            <h2 class="card-title">Contrastive Candidate Probes &amp; Adaptive Reasoning Depth</h2>
           </div>
           <span class="pill-badge pill-ok" id="h2-active-depth-badge">Depth: BALANCED · ~52.8% Tokens Saved</span>
         </div>
         <p class="help-text">
-          Executes Google Research's contrastive <code>Propose → Probe → Compose</code> loop across <strong>Invariant</strong> + <strong>Domain-Specific</strong> fronts under a frozen <code>snapshotId</code> while bounding thinking tokens, RAG snippet size, and prober model tier so your token budget isn't drained.
+          Monitors Google Research's contrastive <code>Propose → Probe → Compose</code> loop across <strong>Invariant</strong> + <strong>Domain-Specific</strong> fronts under a frozen <code>snapshotId</code> while bounding thinking tokens, RAG snippet size, and prober model tier so your token budget isn't drained.
         </p>
-        <div class="form-grid" style="margin-top: 8px;">
-          <div>
-            <label class="field-label">Task ID</label>
-            <input type="text" id="h2-run-task-id" class="input-field" value="task-005-token-efficient-probe" placeholder="e.g. task-005-token-efficient-probe" />
-          </div>
-          <div>
-            <label class="field-label">Domain Library</label>
-            <input type="text" id="h2-run-domain" class="input-field" value="software-engineering" placeholder="e.g. software-engineering" />
-          </div>
-          <div>
-            <label class="field-label">Reasoning Depth &amp; Token Budget</label>
-            <select id="h2-run-depth" class="input-field">
-              <option value="balanced">Balanced / Adaptive (2,048 thinking cap · flash prober · ~53% saved)</option>
-              <option value="eco">Eco / Token-Saver (1,024 thinking cap · flash_lite prober · ~71% saved)</option>
-              <option value="deep">Deep Reasoning (8,192 thinking cap · inherit/pro · complex tasks)</option>
-            </select>
-          </div>
-          <div>
-            <label class="field-label">Mode &amp; Candidates (K)</label>
-            <div class="inline-pair">
-              <select id="h2-run-mode" class="input-field select-compact">
-                <option value="parallel">Parallel</option>
-                <option value="sequential">Sequential (Early-Stop)</option>
-              </select>
-              <input type="number" id="h2-run-k" class="input-field input-tiny" value="2" min="2" max="5" title="Number of candidate harnesses K" />
-            </div>
-          </div>
-          <div class="full-span">
-            <label class="field-label">Problem / Task Bottleneck to Optimize</label>
-            <input type="text" id="h2-run-problem" class="input-field" value="Optimize multi-agent execution harness with Cue-First RAG retrieval and bounded reasoning depth" />
-          </div>
-          <div class="full-span actions-right">
-            <button class="btn btn-primary" id="btn-run-harness2-loop">⚡ Run Token-Efficient Propose → Probe → Compose</button>
-          </div>
-        </div>
         <div id="h2-last-run-results" class="stack-list" style="margin-top: 12px;"></div>
       </div>
 
@@ -545,16 +461,6 @@
           During a comparison of <em>K</em> candidate harnesses (<code>Propose → Probe → Compose</code>), locking a snapshot guarantees every candidate reads the exact same historical knowledge cutoff without cross-candidate contamination.
         </p>
         <div id="active-lock-details" class="lock-details-box"></div>
-        <div class="controls-row">
-          <input type="text" id="snap-domain-input" class="input-field select-medium" value="software-engineering" placeholder="Domain (e.g. software-engineering)" />
-          <select id="snap-mode-select" class="input-field select-compact">
-            <option value="parallel">Parallel Swarm</option>
-            <option value="sequential">Sequential</option>
-          </select>
-          <input type="number" id="snap-k-input" class="input-field input-tiny" value="2" min="1" max="6" title="Candidate count K" />
-          <button class="btn btn-primary" id="btn-lock-snapshot">🔒 Freeze Snapshot for Probe</button>
-          <button class="btn btn-secondary" id="btn-release-snapshot">🔓 Release Lock</button>
-        </div>
       </div>
 
       <div class="card">
@@ -565,56 +471,6 @@
           </div>
         </div>
         <div id="experiences-list" class="stack-list"></div>
-      </div>
-
-      <div class="card">
-        <div class="card-header">
-          <div>
-            <span class="eyebrow">RECORD EMPIRICAL PROVENANCE</span>
-            <h3 class="card-title">Save New Harness² Experience Lesson (EXPERIENCE.md)</h3>
-          </div>
-        </div>
-        <div class="form-grid">
-          <div>
-            <label class="field-label">Task ID *</label>
-            <input type="text" id="exp-task-id" class="input-field" placeholder="e.g. task-002-subagent-retry" />
-          </div>
-          <div>
-            <label class="field-label">Domain *</label>
-            <input type="text" id="exp-domain" class="input-field" value="software-engineering" />
-          </div>
-          <div class="full-span">
-            <label class="field-label">Title *</label>
-            <input type="text" id="exp-title" class="input-field" placeholder="e.g. EXPERIENCE: Enforcing Retry Backoff in Branched Subagents" />
-          </div>
-          <div class="full-span">
-            <label class="field-label">INDEX.md Conditional Cue ("When...") *</label>
-            <input type="text" id="exp-cue" class="input-field" placeholder="When a prober subagent encounters transient RPC timeouts, apply exponential backoff..." />
-          </div>
-          <div class="full-span">
-            <label class="field-label">1. What Task or Problem Produced It? *</label>
-            <textarea id="exp-problem" class="input-field textarea-compact" rows="2" placeholder="Describe the task, bottleneck, or failure condition..."></textarea>
-          </div>
-          <div class="full-span">
-            <label class="field-label">3. What Was Actually Observed Across Probes? *</label>
-            <textarea id="exp-observed" class="input-field textarea-compact" rows="2" placeholder="Contrast baseline behavior vs. candidate harness behavior with metrics..."></textarea>
-          </div>
-          <div>
-            <label class="field-label">4. Supporting Evidence Paths (comma-separated)</label>
-            <input type="text" id="exp-evidence" class="input-field" placeholder="test/harness-ide.test.mjs, docs/ARCHITECTURE.md" />
-          </div>
-          <div>
-            <label class="field-label">5. Currency Status</label>
-            <select id="exp-status" class="input-field">
-              <option value="active">active (Verified &amp; Adopted — Adds to INDEX.md)</option>
-              <option value="candidate">candidate (Unverified Probe Note — Hidden during Snapshot Lock)</option>
-              <option value="superseded">superseded (Historical Only)</option>
-            </select>
-          </div>
-          <div class="full-span actions-right">
-            <button class="btn btn-primary" id="btn-record-experience">💾 Record EXPERIENCE.md &amp; Update INDEX.md</button>
-          </div>
-        </div>
       </div>
     </section>
 
@@ -669,48 +525,6 @@
           <button class="btn btn-secondary" id="btn-close-viewer">✕ Close</button>
         </div>
         <pre id="viewer-doc-content" class="code-viewer"></pre>
-      </div>
-
-      <div class="card">
-        <div class="card-header">
-          <div>
-            <span class="eyebrow">CURATE VERSIONED MARKDOWN</span>
-            <h3 class="card-title">Add Project ADR / Reference Note</h3>
-          </div>
-        </div>
-        <div class="form-grid">
-          <div>
-            <label class="field-label">Target Collection</label>
-            <select id="note-collection" class="input-field">
-              <option value="project-knowledge">project-knowledge (.harness/knowledge/project)</option>
-              <option value="reference-knowledge">reference-knowledge (.harness/knowledge/reference)</option>
-              <option value="experiment-knowledge">experiment-knowledge (.harness/knowledge/experiments)</option>
-            </select>
-          </div>
-          <div>
-            <label class="field-label">Filename (.md)</label>
-            <input type="text" id="note-filename" class="input-field" placeholder="e.g. ADR-002-api-contract.md" />
-          </div>
-          <div class="full-span">
-            <label class="field-label">Title</label>
-            <input type="text" id="note-title" class="input-field" placeholder="e.g. ADR-002: Android &amp; Linux API Contract" />
-          </div>
-          <div>
-            <label class="field-label">Domain</label>
-            <input type="text" id="note-domain" class="input-field" value="architecture" />
-          </div>
-          <div>
-            <label class="field-label">Tags (comma-separated)</label>
-            <input type="text" id="note-tags" class="input-field" value="adr, architecture, constraints" />
-          </div>
-          <div class="full-span">
-            <label class="field-label">Markdown Content</label>
-            <textarea id="note-content" class="input-field textarea-compact" rows="4" placeholder="Write decision rationale, constraints, and supporting evidence..."></textarea>
-          </div>
-          <div class="full-span actions-right">
-            <button class="btn btn-primary" id="btn-save-note">➕ Save Markdown Note &amp; Refresh Index</button>
-          </div>
-        </div>
       </div>
     </section>
   </div>

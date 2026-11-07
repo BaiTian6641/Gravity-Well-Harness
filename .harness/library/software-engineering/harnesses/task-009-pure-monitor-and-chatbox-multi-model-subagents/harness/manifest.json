@@ -1,0 +1,8 @@
+{
+  "harness_id": "harness-software-engineering-task-009-pure-monitor-and-chatbox-multi-model-subagents",
+  "task_id": "task-009-pure-monitor-and-chatbox-multi-model-subagents",
+  "domain": "software-engineering",
+  "adopted_at": "2026-11-07T06:45:46.795Z",
+  "git_revision": "380e7ef",
+  "status": "active"
+}

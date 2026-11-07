@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { REASONING_DEPTH_PROFILES } from './rag-engine.mjs';
@@ -484,6 +485,17 @@ export const DEFAULT_MODEL_CATALOG = [
     name: 'Gemini 4 Argon High (Antigravity Native)',
     provider: 'antigravity-native',
     providerLabel: 'Antigravity Native',
+    modelVersion: 'MODEL_PLACEHOLDER_M417',
+    aliases: [
+      'Gemini 4 Argon (High)',
+      'Gemini 4 Argon High',
+      'Gemini 4 Argon',
+      'gemini-4-argon',
+      'MODEL_PLACEHOLDER_M417',
+      'pro',
+      'inherit',
+      'auto',
+    ],
     endpoint: 'antigravity://native/gemini-4-argon-high',
     wireFormat: 'antigravity-native',
     roleHint: 'Root Orchestrator & Contrastive Composer',
@@ -497,15 +509,72 @@ export const DEFAULT_MODEL_CATALOG = [
     costPer1MTokensUsd: 1.45,
   },
   {
-    id: 'gemini-4-flash',
-    name: 'Gemini 4 Flash (Antigravity Native)',
+    id: 'gemini-4-argon-medium',
+    name: 'Gemini 4 Argon Medium (Antigravity Native)',
     provider: 'antigravity-native',
     providerLabel: 'Antigravity Native',
-    endpoint: 'antigravity://native/gemini-4-flash',
+    modelVersion: 'MODEL_PLACEHOLDER_M418',
+    aliases: [
+      'Gemini 4 Argon (Medium)',
+      'Gemini 4 Argon Medium',
+      'MODEL_PLACEHOLDER_M418',
+    ],
+    endpoint: 'antigravity://native/gemini-4-argon-medium',
+    wireFormat: 'antigravity-native',
+    roleHint: 'Balanced Main Orchestrator & Multi-Step Planner',
+    defaultReasoningDepth: 'balanced',
+    defaultReasoningEffort: 'high',
+    supportsThinking: true,
+    supportsTools: true,
+    canCallSubagents: true,
+    canBeSubagent: true,
+    contextWindowTokens: 1_000_000,
+    costPer1MTokensUsd: 0.95,
+  },
+  {
+    id: 'gemini-4-argon-low',
+    name: 'Gemini 4 Argon Low (Antigravity Native)',
+    provider: 'antigravity-native',
+    providerLabel: 'Antigravity Native',
+    modelVersion: 'MODEL_PLACEHOLDER_M419',
+    aliases: [
+      'Gemini 4 Argon (Low)',
+      'Gemini 4 Argon Low',
+      'MODEL_PLACEHOLDER_M419',
+    ],
+    endpoint: 'antigravity://native/gemini-4-argon-low',
+    wireFormat: 'antigravity-native',
+    roleHint: 'Low-Latency Native Orchestrator & Fast Iteration',
+    defaultReasoningDepth: 'eco',
+    defaultReasoningEffort: 'low',
+    supportsThinking: true,
+    supportsTools: true,
+    canCallSubagents: true,
+    canBeSubagent: true,
+    contextWindowTokens: 1_000_000,
+    costPer1MTokensUsd: 0.55,
+  },
+  {
+    id: 'gemini-3.8-flash-high',
+    name: 'Gemini 3.8 Flash High (Antigravity Native)',
+    provider: 'antigravity-native',
+    providerLabel: 'Antigravity Native',
+    modelVersion: 'MODEL_PLACEHOLDER_M420',
+    aliases: [
+      'Gemini 3.8 Flash (High)',
+      'Gemini 3.8 Flash High',
+      'Gemini 3.8 Flash',
+      'gemini-3.8-flash',
+      'gemini-4-flash',
+      'Gemini 4 Flash',
+      'MODEL_PLACEHOLDER_M420',
+      'flash',
+    ],
+    endpoint: 'antigravity://native/gemini-3.8-flash-high',
     wireFormat: 'antigravity-native',
     roleHint: 'Fast Branched Prober & RAG Researcher',
-    defaultReasoningDepth: 'balanced',
-    defaultReasoningEffort: 'low',
+    defaultReasoningDepth: 'deep',
+    defaultReasoningEffort: 'high',
     supportsThinking: true,
     supportsTools: true,
     canCallSubagents: true,
@@ -514,10 +583,66 @@ export const DEFAULT_MODEL_CATALOG = [
     costPer1MTokensUsd: 0.35,
   },
   {
+    id: 'gemini-3.8-flash-medium',
+    name: 'Gemini 3.8 Flash Medium (Antigravity Native)',
+    provider: 'antigravity-native',
+    providerLabel: 'Antigravity Native',
+    modelVersion: 'MODEL_PLACEHOLDER_M421',
+    aliases: [
+      'Gemini 3.8 Flash (Medium)',
+      'Gemini 3.8 Flash Medium',
+      'MODEL_PLACEHOLDER_M421',
+    ],
+    endpoint: 'antigravity://native/gemini-3.8-flash-medium',
+    wireFormat: 'antigravity-native',
+    roleHint: 'Balanced High-Throughput Subagent Prober',
+    defaultReasoningDepth: 'balanced',
+    defaultReasoningEffort: 'high',
+    supportsThinking: true,
+    supportsTools: true,
+    canCallSubagents: true,
+    canBeSubagent: true,
+    contextWindowTokens: 1_000_000,
+    costPer1MTokensUsd: 0.25,
+  },
+  {
+    id: 'gemini-3.8-flash-low',
+    name: 'Gemini 3.8 Flash Low (Antigravity Native)',
+    provider: 'antigravity-native',
+    providerLabel: 'Antigravity Native',
+    modelVersion: 'MODEL_PLACEHOLDER_M422',
+    aliases: [
+      'Gemini 3.8 Flash (Low)',
+      'Gemini 3.8 Flash Low',
+      'MODEL_PLACEHOLDER_M422',
+      'flash_lite',
+    ],
+    endpoint: 'antigravity://native/gemini-3.8-flash-low',
+    wireFormat: 'antigravity-native',
+    roleHint: 'Ultra-Fast Lightweight Subagent & RAG Lookup',
+    defaultReasoningDepth: 'eco',
+    defaultReasoningEffort: 'low',
+    supportsThinking: true,
+    supportsTools: true,
+    canCallSubagents: true,
+    canBeSubagent: true,
+    contextWindowTokens: 1_000_000,
+    costPer1MTokensUsd: 0.15,
+  },
+  {
     id: 'claude-sonnet-5-5',
     name: 'Claude Sonnet 5.5 (Antigravity Native · 1M)',
     provider: 'antigravity-native',
     providerLabel: 'Antigravity Native',
+    modelVersion: 'claude-sonnet-5-5',
+    aliases: [
+      'Claude Sonnet 5.5 (High)',
+      'Claude Sonnet 5.5 (Medium)',
+      'Claude Sonnet 5.5 (Low)',
+      'Claude Sonnet 5.5',
+      'Claude 4.6 Sonnet (Thinking)',
+      'claude-sonnet-4-6',
+    ],
     endpoint: 'https://api.anthropic.com/v1/messages',
     wireFormat: 'anthropic-messages',
     roleHint: '1M-Context Production Coding & Multi-Agent Verification',
@@ -535,6 +660,14 @@ export const DEFAULT_MODEL_CATALOG = [
     name: 'Claude Opus 5.5 (Antigravity Native · 1M)',
     provider: 'antigravity-native',
     providerLabel: 'Antigravity Native',
+    modelVersion: 'claude-opus-5-5',
+    aliases: [
+      'Claude Opus 5.5 (High)',
+      'Claude Opus 5.5 (Thinking)',
+      'Claude Opus 5.5',
+      'Claude 4.6 Opus (Thinking)',
+      'claude-opus-4-6',
+    ],
     endpoint: 'https://api.anthropic.com/v1/messages',
     wireFormat: 'anthropic-messages',
     roleHint: 'Flagship Long-Horizon Architecture & Composer',
@@ -546,6 +679,29 @@ export const DEFAULT_MODEL_CATALOG = [
     canBeSubagent: true,
     contextWindowTokens: 1_000_000,
     costPer1MTokensUsd: 4.0,
+  },
+  {
+    id: 'gpt-oss-120b-medium',
+    name: 'GPT-OSS 120B Medium (Antigravity Native)',
+    provider: 'antigravity-native',
+    providerLabel: 'Antigravity Native',
+    modelVersion: 'gpt-oss-120b-medium',
+    aliases: [
+      'GPT-OSS 120B (Medium)',
+      'GPT-OSS 120B',
+      'gpt-oss-120b',
+    ],
+    endpoint: 'antigravity://native/gpt-oss-120b-medium',
+    wireFormat: 'antigravity-native',
+    roleHint: 'Open-Weight Reasoning & Code Verification Specialist',
+    defaultReasoningDepth: 'balanced',
+    defaultReasoningEffort: 'high',
+    supportsThinking: true,
+    supportsTools: true,
+    canCallSubagents: true,
+    canBeSubagent: true,
+    contextWindowTokens: 256_000,
+    costPer1MTokensUsd: 0.3,
   },
 ];
 
@@ -633,6 +789,10 @@ function getHubConfigFile(workspaceRoot) {
   return path.join(workspaceRoot, '.harness', 'runtime', 'model-search-hub.json');
 }
 
+function getChatContextUsageFile(workspaceRoot) {
+  return path.join(workspaceRoot, '.harness', 'runtime', 'chat-context-usage.json');
+}
+
 function getMessageBusFile(workspaceRoot) {
   return path.join(workspaceRoot, '.harness', 'runtime', 'message-bus.json');
 }
@@ -645,17 +805,286 @@ function maskKey(raw) {
 }
 
 /**
- * Resolves legacy model aliases (e.g. `kimi-k2.7-code` -> `opencode-go/kimi-k2.7-code`)
+ * Finds a model entry in `DEFAULT_MODEL_CATALOG` by ID, Antigravity Chat Box `modelName`,
+ * `modelVersion`, or alias. Returns `null` if no match is found.
+ */
+export function findModelInCatalog(modelIdOrName) {
+  const raw = String(modelIdOrName || '').trim();
+  if (!raw) return null;
+  const norm = raw.toLowerCase();
+
+  const exact = DEFAULT_MODEL_CATALOG.find(
+    (m) => m.id === raw || m.id.toLowerCase() === norm
+  );
+  if (exact) return exact;
+
+  const byAlias = DEFAULT_MODEL_CATALOG.find(
+    (m) =>
+      m.name.toLowerCase() === norm ||
+      (m.modelVersion && m.modelVersion.toLowerCase() === norm) ||
+      (Array.isArray(m.aliases) && m.aliases.some((a) => a.toLowerCase() === norm))
+  );
+  if (byAlias) return byAlias;
+
+  const prefixed = DEFAULT_MODEL_CATALOG.find(
+    (m) => m.id.toLowerCase() === `opencode-go/${norm}`
+  );
+  if (prefixed) return prefixed;
+
+  const suffixMatch = DEFAULT_MODEL_CATALOG.find((m) =>
+    m.id.toLowerCase().endsWith(`/${norm}`)
+  );
+  if (suffixMatch) return suffixMatch;
+
+  // Normalized fuzzy match for Antigravity IDE Chat Box labels
+  if (norm.includes('gemini 4 argon') || norm.includes('gemini-4-argon')) {
+    if (norm.includes('low')) {
+      return DEFAULT_MODEL_CATALOG.find((m) => m.id === 'gemini-4-argon-low') || null;
+    }
+    if (norm.includes('medium')) {
+      return DEFAULT_MODEL_CATALOG.find((m) => m.id === 'gemini-4-argon-medium') || null;
+    }
+    return DEFAULT_MODEL_CATALOG.find((m) => m.id === 'gemini-4-argon-high') || null;
+  }
+  if (
+    norm.includes('gemini 3.8 flash') ||
+    norm.includes('gemini-3.8-flash') ||
+    norm.includes('gemini 4 flash') ||
+    norm.includes('gemini-4-flash')
+  ) {
+    if (norm.includes('low') || norm.includes('lite')) {
+      return DEFAULT_MODEL_CATALOG.find((m) => m.id === 'gemini-3.8-flash-low') || null;
+    }
+    if (norm.includes('medium')) {
+      return DEFAULT_MODEL_CATALOG.find((m) => m.id === 'gemini-3.8-flash-medium') || null;
+    }
+    return DEFAULT_MODEL_CATALOG.find((m) => m.id === 'gemini-3.8-flash-high') || null;
+  }
+  if (norm.includes('claude') && norm.includes('sonnet')) {
+    return DEFAULT_MODEL_CATALOG.find((m) => m.id === 'claude-sonnet-5-5') || null;
+  }
+  if (norm.includes('claude') && norm.includes('opus')) {
+    return DEFAULT_MODEL_CATALOG.find((m) => m.id === 'claude-opus-5-5') || null;
+  }
+  if (norm.includes('gpt-oss') || norm.includes('120b')) {
+    return DEFAULT_MODEL_CATALOG.find((m) => m.id === 'gpt-oss-120b-medium') || null;
+  }
+
+  return null;
+}
+
+/**
+ * Resolves model IDs, Antigravity Chat Box `modelName` labels, and legacy model aliases
+ * (e.g. `"Gemini 4 Argon (High)"` -> `gemini-4-argon-high`, `kimi-k2.7-code` -> `opencode-go/kimi-k2.7-code`).
  */
 export function resolveModelMeta(modelId) {
-  if (!modelId) return DEFAULT_MODEL_CATALOG[0];
-  const exact = DEFAULT_MODEL_CATALOG.find((m) => m.id === modelId);
-  if (exact) return exact;
-  const prefixed = DEFAULT_MODEL_CATALOG.find((m) => m.id === `opencode-go/${modelId}`);
-  if (prefixed) return prefixed;
-  const suffixMatch = DEFAULT_MODEL_CATALOG.find((m) => m.id.endsWith(`/${modelId}`));
-  if (suffixMatch) return suffixMatch;
-  return DEFAULT_MODEL_CATALOG[0];
+  return findModelInCatalog(modelId) || DEFAULT_MODEL_CATALOG[0];
+}
+
+function estimateTokensFromText(input) {
+  if (!input) return 0;
+  const text = typeof input === 'string' ? input : JSON.stringify(input);
+  if (!text) return 0;
+  return Math.max(1, Math.ceil(text.length / 4));
+}
+
+/**
+ * Loads the persisted real conversation context usage computed from Antigravity's `transcript.jsonl`.
+ */
+export function loadChatContextUsage(workspaceRoot) {
+  const file = getChatContextUsageFile(workspaceRoot);
+  if (!fs.existsSync(file)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Syncs the Main Agent model selected in the Antigravity IDE Chat Box (`input.modelName`)
+ * and parses the live conversation transcript (`input.transcriptPath` / `transcript.jsonl`)
+ * to compute real context token usage across turns, steps, user prompts, assistant responses,
+ * chain-of-thought thinking traces, and tool results.
+ */
+export function syncChatBoxModelAndTranscript(
+  workspaceRoot,
+  { modelName, transcriptPath, conversationId } = {}
+) {
+  let currentCfg = loadHubConfig(workspaceRoot);
+  const cleanModelName = String(modelName || '').trim();
+
+  if (cleanModelName) {
+    const matched =
+      cleanModelName.toLowerCase() !== 'auto'
+        ? findModelInCatalog(cleanModelName)
+        : null;
+    const patch = {
+      chatBoxNativeModel: cleanModelName,
+    };
+    if (
+      matched &&
+      (!currentCfg.userPinnedModelOverride ||
+        matched.provider === 'deepseek-official' ||
+        matched.provider === 'opencode-go')
+    ) {
+      const nextDepth =
+        currentCfg.modelReasoningDepths?.[matched.id] ||
+        matched.defaultReasoningDepth ||
+        currentCfg.activeReasoningDepth ||
+        'balanced';
+      patch.activeModelId = matched.id;
+      patch.activeReasoningDepth = nextDepth;
+      patch.activeReasoningEffort =
+        matched.defaultReasoningEffort || currentCfg.activeReasoningEffort || 'high';
+    }
+    currentCfg = saveHubConfig(workspaceRoot, patch);
+  }
+
+  let resolvedTranscriptPath = String(transcriptPath || '').trim();
+  if (!resolvedTranscriptPath || !fs.existsSync(resolvedTranscriptPath)) {
+    try {
+      const telemetryFile = path.join(workspaceRoot, '.harness', 'runtime', 'telemetry.json');
+      if (fs.existsSync(telemetryFile)) {
+        const tel = JSON.parse(fs.readFileSync(telemetryFile, 'utf8'));
+        const sessions = Object.values(tel.sessions || {});
+        const matchSess =
+          (conversationId && tel.sessions?.[conversationId]) ||
+          sessions.find((s) => s.transcriptPath && fs.existsSync(s.transcriptPath));
+        if (matchSess?.transcriptPath && fs.existsSync(matchSess.transcriptPath)) {
+          resolvedTranscriptPath = matchSess.transcriptPath;
+        }
+      }
+    } catch {}
+  }
+
+  if (
+    (!resolvedTranscriptPath || !fs.existsSync(resolvedTranscriptPath)) &&
+    conversationId
+  ) {
+    const candidateBrainTranscript = path.join(
+      os.homedir(),
+      '.gemini',
+      'antigravity',
+      'brain',
+      conversationId,
+      '.system_generated',
+      'logs',
+      'transcript.jsonl'
+    );
+    if (fs.existsSync(candidateBrainTranscript)) {
+      resolvedTranscriptPath = candidateBrainTranscript;
+    }
+  }
+
+  if (resolvedTranscriptPath && fs.existsSync(resolvedTranscriptPath)) {
+    let turns = 0;
+    let steps = 0;
+    let userTokens = 0;
+    let assistantTokens = 0;
+    let thinkingTokens = 0;
+    let toolResultTokens = 0;
+
+    try {
+      const rawContent = fs.readFileSync(resolvedTranscriptPath, 'utf8');
+      const lines = rawContent.split(/\r?\n/).filter((l) => l.trim().length > 0);
+      for (const line of lines) {
+        let row;
+        try {
+          row = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (!row || typeof row !== 'object') continue;
+        steps += 1;
+
+        const stepType = String(row.type || '').toUpperCase();
+        const stepSource = String(row.source || '').toUpperCase();
+        const role = String(row.role || '').toLowerCase();
+
+        if (row.thinking || row.reasoning_content) {
+          thinkingTokens += estimateTokensFromText(row.thinking || row.reasoning_content);
+        }
+
+        if (
+          stepType === 'USER_INPUT' ||
+          stepSource === 'USER_EXPLICIT' ||
+          role === 'user'
+        ) {
+          turns += 1;
+          userTokens += estimateTokensFromText(row.content || row.text || row.prompt || '');
+        } else if (
+          stepType === 'PLANNER_RESPONSE' ||
+          stepSource === 'MODEL' ||
+          role === 'assistant'
+        ) {
+          assistantTokens += estimateTokensFromText(row.content || row.text || '');
+          if (row.tool_calls) {
+            assistantTokens += estimateTokensFromText(row.tool_calls);
+          }
+        } else {
+          toolResultTokens += estimateTokensFromText(
+            row.content || row.output || row.result || row.tool_responses || ''
+          );
+        }
+      }
+    } catch {}
+
+    const usedTokens = userTokens + assistantTokens + thinkingTokens + toolResultTokens;
+    const activeMeta = resolveModelMeta(currentCfg.activeModelId);
+    const contextWindowTokens = activeMeta.contextWindowTokens || 1_000_000;
+    const contextUsedPct = Number(
+      ((usedTokens / contextWindowTokens) * 100).toFixed(2)
+    );
+
+    const summary = {
+      conversationId: conversationId || 'default-session',
+      transcriptPath: resolvedTranscriptPath,
+      modelName: cleanModelName || currentCfg.chatBoxNativeModel || activeMeta.name,
+      resolvedModelId: activeMeta.id,
+      turns,
+      steps,
+      userTokens,
+      assistantTokens,
+      thinkingTokens,
+      toolResultTokens,
+      usedTokens,
+      contextWindowTokens,
+      contextUsedPct,
+      updatedAt: new Date().toISOString(),
+    };
+
+    try {
+      const usageFile = getChatContextUsageFile(workspaceRoot);
+      fs.mkdirSync(path.dirname(usageFile), { recursive: true });
+      fs.writeFileSync(usageFile, JSON.stringify(summary, null, 2), 'utf8');
+    } catch {}
+
+    return summary;
+  }
+
+  const existing = loadChatContextUsage(workspaceRoot);
+  if (existing) {
+    return existing;
+  }
+
+  const activeMeta = resolveModelMeta(currentCfg.activeModelId);
+  return {
+    conversationId: conversationId || 'default-session',
+    transcriptPath: resolvedTranscriptPath || '',
+    modelName: cleanModelName || currentCfg.chatBoxNativeModel || activeMeta.name,
+    resolvedModelId: activeMeta.id,
+    turns: 0,
+    steps: 0,
+    userTokens: 0,
+    assistantTokens: 0,
+    thinkingTokens: 0,
+    toolResultTokens: 0,
+    usedTokens: 0,
+    contextWindowTokens: activeMeta.contextWindowTokens || 1_000_000,
+    contextUsedPct: 0,
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 function getVscodeSettingsFile(workspaceRoot) {
@@ -740,6 +1169,11 @@ export function loadHubConfig(workspaceRoot) {
       saved.activeModelId ||
       ideSettings['antigravity.harness.activeModel'] ||
       'deepseek-v4-pro',
+    chatBoxNativeModel:
+      saved.chatBoxNativeModel ||
+      ideSettings['antigravity.harness.chatBoxNativeModel'] ||
+      'Gemini 4 Argon (High)',
+    userPinnedModelOverride: Boolean(saved.userPinnedModelOverride),
     activeReasoningDepth:
       saved.activeReasoningDepth ||
       ideSettings['antigravity.harness.reasoningDepth'] ||
@@ -915,6 +1349,11 @@ export function saveHubConfig(workspaceRoot, patch = {}) {
   const next = {
     ...current,
     activeModelId: patch.activeModelId || current.activeModelId,
+    chatBoxNativeModel: patch.chatBoxNativeModel || current.chatBoxNativeModel,
+    userPinnedModelOverride:
+      patch.userPinnedModelOverride !== undefined
+        ? Boolean(patch.userPinnedModelOverride)
+        : current.userPinnedModelOverride,
     activeReasoningDepth: patch.activeReasoningDepth || current.activeReasoningDepth,
     activeReasoningEffort: patch.activeReasoningEffort || current.activeReasoningEffort,
     subagentModelRouting: {
@@ -960,6 +1399,7 @@ export function saveHubConfig(workspaceRoot, patch = {}) {
       $schema: '../schemas/antigravity-settings.schema.json',
       ...existingVs,
       'antigravity.harness.activeModel': next.activeModelId,
+      'antigravity.harness.chatBoxNativeModel': next.chatBoxNativeModel,
       'antigravity.harness.reasoningDepth': next.activeReasoningDepth,
       'antigravity.harness.reasoningEffort': next.activeReasoningEffort,
       'antigravity.harness.deepseek.baseUrl': next.providers.deepseek.baseUrl,
@@ -976,6 +1416,22 @@ export function saveHubConfig(workspaceRoot, patch = {}) {
   return loadHubConfig(workspaceRoot);
 }
 
+function resolveTelemetryFallbackUsedTokens(workspaceRoot) {
+  try {
+    const telemetryFile = path.join(workspaceRoot, '.harness', 'runtime', 'telemetry.json');
+    if (fs.existsSync(telemetryFile)) {
+      const tel = JSON.parse(fs.readFileSync(telemetryFile, 'utf8'));
+      const sessions = Object.values(tel.sessions || {});
+      const totalCalls = sessions.reduce((acc, s) => acc + Number(s.toolCallCount || 0), 0);
+      const eventsCount = Array.isArray(tel.recentEvents) ? tel.recentEvents.length : 0;
+      if (totalCalls > 0 || eventsCount > 0) {
+        return Math.min(240_000, 12_400 + totalCalls * 1850 + eventsCount * 620);
+      }
+    }
+  } catch {}
+  return 55_100;
+}
+
 /**
  * Returns the full enriched model catalog including each model's active reasoning depth,
  * official DeepSeek/OpenCode `reasoning_effort`, thinking token budget, live context window usage,
@@ -983,7 +1439,11 @@ export function saveHubConfig(workspaceRoot, patch = {}) {
  */
 export function getEnrichedModelCatalog(workspaceRoot, contextAnalytics = null) {
   const cfg = loadHubConfig(workspaceRoot);
-  const usedCtx = contextAnalytics?.currentWindow?.usedTokens || 55_100;
+  const liveChatUsage = loadChatContextUsage(workspaceRoot);
+  const usedCtx =
+    contextAnalytics?.currentWindow?.usedTokens ||
+    (liveChatUsage && liveChatUsage.usedTokens > 0 ? liveChatUsage.usedTokens : 0) ||
+    resolveTelemetryFallbackUsedTokens(workspaceRoot);
 
   return DEFAULT_MODEL_CATALOG.map((m, idx) => {
     const depthKey = cfg.modelReasoningDepths?.[m.id] || m.defaultReasoningDepth || 'balanced';
@@ -1034,6 +1494,7 @@ export function getEnrichedModelCatalog(workspaceRoot, contextAnalytics = null) 
       assignedRoles,
       usedContextTokens: modelUsedTokens,
       contextUsedPct,
+      liveTranscriptUsage: isSelectedMain ? liveChatUsage : null,
       providerReady,
       authStatus,
     };

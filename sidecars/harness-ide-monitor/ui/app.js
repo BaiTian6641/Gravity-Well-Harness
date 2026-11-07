@@ -261,8 +261,6 @@
     return String(val);
   }
 
-  let lastModelCatalogSig = '';
-
   function renderInlineModelAndContextStrip(data) {
     const hub = data.modelHub || {};
     const catalog = hub.catalog || [];
@@ -271,53 +269,14 @@
     const activeModel = catalog.find((m) => m.id === activeModelId) || catalog[0] || {};
     const activeDepth = activeModel.reasoningDepth || cfg.activeReasoningDepth || 'balanced';
 
-    const headerSelect = document.getElementById('header-model-selector');
-    const injectModelSelect = document.getElementById('inject-to-model');
-    const depthSelect = document.getElementById('header-depth-selector');
-
-    const sig = `${activeModelId}:${activeDepth}:${catalog
-      .map((m) => `${m.id}:${m.reasoningDepth}:${m.contextUsedPct}`)
-      .join('|')}`;
-
-    if (sig !== lastModelCatalogSig && catalog.length > 0) {
-      lastModelCatalogSig = sig;
-      const groups = new Map();
-      for (const m of catalog) {
-        const gName = m.providerLabel || m.provider || 'Models';
-        if (!groups.has(gName)) groups.set(gName, []);
-        groups.get(gName).push(m);
-      }
-
-      const buildOptionsHtml = (selectedId) =>
-        Array.from(groups.entries())
-          .map(
-            ([gLabel, items]) => `
-            <optgroup label="${escapeHtml(gLabel)}">
-              ${items
-                .map((m) => {
-                  const depthUpper = String(m.reasoningDepth || 'balanced').toUpperCase();
-                  const effort = m.reasoningEffort || 'high';
-                  const ctxWin = formatCompactContext(m.contextWindowTokens || 256000);
-                  const isSel = m.id === selectedId ? 'selected' : '';
-                  return `<option value="${escapeHtml(m.id)}" ${isSel}>${escapeHtml(m.name)} [${depthUpper} · effort=${escapeHtml(effort)}] (${ctxWin} ctx · ${Number(m.contextUsedPct || 0)}%)</option>`;
-                })
-                .join('')}
-            </optgroup>
-          `
-          )
-          .join('');
-
-      if (headerSelect) {
-        headerSelect.innerHTML = buildOptionsHtml(activeModelId);
-      }
-      if (injectModelSelect) {
-        const curInjectModel = injectModelSelect.value || 'opencode-go/kimi-k2.7-code';
-        injectModelSelect.innerHTML = buildOptionsHtml(curInjectModel);
-      }
+    const modelPill = document.getElementById('monitor-active-model-pill');
+    if (modelPill) {
+      modelPill.textContent = `${activeModel.name || activeModelId} [${activeModel.providerLabel || activeModel.provider || 'Antigravity'}]`;
     }
 
-    if (depthSelect && document.activeElement !== depthSelect) {
-      depthSelect.value = activeDepth;
+    const depthPill = document.getElementById('monitor-active-depth-pill');
+    if (depthPill) {
+      depthPill.textContent = `${String(activeDepth).toUpperCase()} · effort=${activeModel.reasoningEffort || 'high'} (${Number(activeModel.thinkingBudgetTokens || 2048).toLocaleString()} tok)`;
     }
 
     // Update Always-Visible Inline Context Usage Bar in Antigravity UI
@@ -1625,7 +1584,7 @@
     if (lastRunEl) {
       const run = h2.lastRun;
       if (!run) {
-        lastRunEl.innerHTML = `<div class="muted-text">Click <strong>⚡ Run Token-Efficient Propose → Probe → Compose</strong> above to execute a live Google Harness² contrastive comparison under a frozen snapshot.</div>`;
+        lastRunEl.innerHTML = `<div class="muted-text">No Harness² contrastive probe run recorded yet in this workspace.</div>`;
       } else {
         const eff = run.tokenEfficiency || {};
         const rows = [run.baselineTrajectory, ...(run.probeTrajectories || [])].filter(Boolean);
@@ -1711,11 +1670,6 @@
             <div class="inline-pair">
               <span class="status-chip status-active">${escapeHtml(doc.domain)} • ${escapeHtml(doc.status)}</span>
               <button class="icon-btn btn-inspect-doc" data-docid="${escapeHtml(doc.docid)}">Inspect Source</button>
-              ${
-                doc.task_id
-                  ? `<button class="icon-btn btn-promote-doc" data-taskid="${escapeHtml(doc.task_id)}">Promote to ADR</button>`
-                  : ''
-              }
             </div>
           </div>
           ${doc.cue ? `<div class="muted-text"><strong>Cue:</strong> <em>${escapeHtml(doc.cue)}</em></div>` : ''}
@@ -1730,20 +1684,6 @@
           const docid = btn.getAttribute('data-docid');
           document.querySelector('[data-tab="rag"]').click();
           openDocumentViewer(docid);
-        });
-      });
-
-      expList.querySelectorAll('.btn-promote-doc').forEach((btn) => {
-        btn.addEventListener('click', async () => {
-          const taskId = btn.getAttribute('data-taskid');
-          const res = await apiFetch('/api/harness2/experience', {
-            action: 'promote',
-            task_id_or_docid: taskId,
-          });
-          if (res.ok) {
-            showToast(`Promoted '${taskId}' to Project Knowledge (${res.adrPath})`);
-            await refreshDashboard();
-          }
         });
       });
     }
@@ -2154,357 +2094,6 @@
       await refreshDashboard();
       await runRagSearch();
     }
-  });
-
-  document.getElementById('btn-lock-snapshot').addEventListener('click', async () => {
-    const domain = document.getElementById('snap-domain-input').value.trim() || 'software-engineering';
-    const mode = document.getElementById('snap-mode-select').value;
-    const k = Number(document.getElementById('snap-k-input').value || 2);
-    const res = await apiFetch('/api/harness2/snapshot', {
-      action: 'create',
-      domain,
-      mode,
-      k,
-    });
-    if (res.ok && res.lock) {
-      showToast(
-        `Snapshot Isolation Lock '${res.lock.snapshotId}' created (${res.lock.eligibleDocCount} eligible docs frozen).`
-      );
-      await refreshDashboard();
-    }
-  });
-
-  document.getElementById('btn-run-harness2-loop')?.addEventListener('click', async () => {
-    const btn = document.getElementById('btn-run-harness2-loop');
-    const task_id =
-      document.getElementById('h2-run-task-id')?.value.trim() || `task-${Date.now()}`;
-    const domain =
-      document.getElementById('h2-run-domain')?.value.trim() || 'software-engineering';
-    const reasoning_depth = document.getElementById('h2-run-depth')?.value || 'balanced';
-    const mode = document.getElementById('h2-run-mode')?.value || 'parallel';
-    const k = Number(document.getElementById('h2-run-k')?.value || 2);
-    const problem =
-      document.getElementById('h2-run-problem')?.value.trim() ||
-      'Optimize multi-agent execution harness with Cue-First RAG retrieval and bounded reasoning depth';
-
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = '⏳ Proposing → Probing → Composing…';
-    }
-    try {
-      const res = await apiFetch('/api/harness2/run', {
-        task_id,
-        domain,
-        reasoning_depth,
-        mode,
-        k,
-        problem,
-        record_to_library: true,
-      });
-      if (res.ok) {
-        const savedPct = res.tokenEfficiency?.totalTokensSavedPct ?? 52.8;
-        const savedTok = Number(res.tokenEfficiency?.totalTokensSaved || 0).toLocaleString();
-        showToast(
-          `🏆 Harness² Composed Winner '${res.winnerCandidateId}' (Score ${res.winnerScore}) · Saved ${savedTok} tokens (-${savedPct}%)!`
-        );
-        await refreshDashboard();
-      }
-    } finally {
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = '⚡ Run Token-Efficient Propose → Probe → Compose';
-      }
-    }
-  });
-
-  document.getElementById('set-h2-reasoning-depth')?.addEventListener('change', (e) => {
-    const val = e.target.value;
-    const thinkEl = document.getElementById('set-h2-thinking-budget');
-    const modelEl = document.getElementById('set-h2-prober-model');
-    const snipEl = document.getElementById('set-h2-snippet-cap');
-    const earlyEl = document.getElementById('set-h2-early-stop');
-    if (val === 'eco') {
-      if (thinkEl) thinkEl.value = '1024';
-      if (modelEl) modelEl.value = 'flash_lite';
-      if (snipEl) snipEl.value = '320';
-      if (earlyEl) earlyEl.checked = true;
-    } else if (val === 'balanced') {
-      if (thinkEl) thinkEl.value = '2048';
-      if (modelEl) modelEl.value = 'flash';
-      if (snipEl) snipEl.value = '500';
-      if (earlyEl) earlyEl.checked = true;
-    } else if (val === 'deep') {
-      if (thinkEl) thinkEl.value = '8192';
-      if (modelEl) modelEl.value = 'inherit';
-      if (snipEl) snipEl.value = '1200';
-      if (earlyEl) earlyEl.checked = false;
-    }
-  });
-
-  document.getElementById('btn-release-snapshot').addEventListener('click', async () => {
-    const res = await apiFetch('/api/harness2/snapshot', { action: 'release' });
-    if (res.ok) {
-      showToast('Snapshot Isolation Lock released.');
-      await refreshDashboard();
-    }
-  });
-
-  document.getElementById('btn-record-experience').addEventListener('click', async () => {
-    const task_id = document.getElementById('exp-task-id').value.trim();
-    const domain = document.getElementById('exp-domain').value.trim() || 'software-engineering';
-    const title = document.getElementById('exp-title').value.trim();
-    const cue = document.getElementById('exp-cue').value.trim();
-    const problem = document.getElementById('exp-problem').value.trim();
-    const observed_behavior = document.getElementById('exp-observed').value.trim();
-    const evidenceRaw = document.getElementById('exp-evidence').value.trim();
-    const status = document.getElementById('exp-status').value;
-
-    if (!task_id || !problem || !observed_behavior) {
-      showToast('Please fill in Task ID, Problem, and Observed Behavior.');
-      return;
-    }
-
-    const supporting_evidence = evidenceRaw
-      ? evidenceRaw.split(',').map((s) => s.trim()).filter(Boolean)
-      : [];
-
-    const res = await apiFetch('/api/harness2/experience', {
-      action: 'record',
-      task_id,
-      domain,
-      title,
-      cue,
-      problem,
-      observed_behavior,
-      supporting_evidence,
-      status,
-    });
-
-    if (res.ok) {
-      showToast(`Recorded ${res.docid} (${res.experiencePath}) and updated INDEX.md!`);
-      document.getElementById('exp-task-id').value = '';
-      document.getElementById('exp-title').value = '';
-      document.getElementById('exp-cue').value = '';
-      document.getElementById('exp-problem').value = '';
-      document.getElementById('exp-observed').value = '';
-      await refreshDashboard();
-    }
-  });
-
-  document.getElementById('btn-save-note').addEventListener('click', async () => {
-    const collection = document.getElementById('note-collection').value;
-    const filename = document.getElementById('note-filename').value.trim();
-    const title = document.getElementById('note-title').value.trim();
-    const domain = document.getElementById('note-domain').value.trim() || 'architecture';
-    const tags = document.getElementById('note-tags').value.trim();
-    const content = document.getElementById('note-content').value.trim();
-
-    if (!filename || !title || !content) {
-      showToast('Please provide Filename, Title, and Markdown Content.');
-      return;
-    }
-
-    const res = await apiFetch('/api/rag/doc', {
-      action: 'save',
-      collection,
-      filename,
-      title,
-      domain,
-      tags,
-      content,
-    });
-
-    if (res.ok) {
-      showToast(`Saved ${res.path} (${res.docid}) and refreshed index!`);
-      document.getElementById('note-filename').value = '';
-      document.getElementById('note-title').value = '';
-      document.getElementById('note-content').value = '';
-      await refreshDashboard();
-      await runRagSearch(title);
-    }
-  });
-
-  // =========================================================================
-  // MULTI-MODEL HUB, MESSAGE INJECTION, WEB SEARCH & SELF-IMPROVEMENT WIRING
-  // =========================================================================
-  document.getElementById('header-model-selector')?.addEventListener('change', async (e) => {
-    const modelId = e.target.value;
-    const depth = document.getElementById('header-depth-selector')?.value || 'balanced';
-    const res = await apiFetch('/api/models/config', {
-      action: 'save',
-      config: {
-        activeModelId: modelId,
-        activeReasoningDepth: depth,
-        swarmRoleModels: { 'main-orchestrator': modelId },
-      },
-    });
-    if (res && res.ok) {
-      lastModelCatalogSig = '';
-      lastRenderedNodeSignature = '';
-      lastRenderedMemberSignature = '';
-      settingsInitializedForWs = '';
-      showToast(`🤖 Active Model switched to ${modelId} (depth: ${depth.toUpperCase()})`);
-      await refreshDashboard(false);
-    }
-  });
-
-  document.getElementById('header-depth-selector')?.addEventListener('change', async (e) => {
-    const depth = e.target.value;
-    const modelId =
-      document.getElementById('header-model-selector')?.value || 'deepseek-v4-pro';
-    const res = await apiFetch('/api/models/config', {
-      action: 'save',
-      config: {
-        activeModelId: modelId,
-        activeReasoningDepth: depth,
-        modelReasoningOverrides: { [modelId]: depth },
-      },
-    });
-    if (res && res.ok) {
-      lastModelCatalogSig = '';
-      lastRenderedNodeSignature = '';
-      lastRenderedMemberSignature = '';
-      settingsInitializedForWs = '';
-      showToast(`🧠 Reasoning Depth set to ${depth.toUpperCase()} for ${modelId}`);
-      await refreshDashboard(false);
-    }
-  });
-
-  document.getElementById('btn-self-improve-top')?.addEventListener('click', async () => {
-    const btn = document.getElementById('btn-self-improve-top');
-    const proposerModel =
-      document.getElementById('header-model-selector')?.value || 'deepseek-v4-pro';
-    const reasoningDepth =
-      document.getElementById('header-depth-selector')?.value || 'balanced';
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = '⏳ Self-Improving…';
-    }
-    try {
-      const res = await apiFetch('/api/harness2/self-improve', {
-        taskId: `rsi-${Date.now()}`,
-        domain: 'software-engineering',
-        problem:
-          'Multi-model self-improvement & cross-model peer verification across DeepSeek Official and OpenCode Go Coding Plan',
-        proposerModel,
-        proberModels: [
-          'opencode-go/kimi-k2.7-code',
-          'opencode-go/glm-5.3',
-          'deepseek-flash',
-        ],
-        composerModel: 'opencode-go/gpt-6-luna',
-        reasoningDepth,
-        recordToLibrary: true,
-      });
-      if (res && res.ok) {
-        lastRenderedNodeSignature = '';
-        lastRenderedMemberSignature = '';
-        showToast(
-          `🏆 Multi-Model Self-Improvement Winner: ${res.winner?.candidateId} (${res.winner?.modelId}) · Saved ${res.harness2Run?.tokenEfficiency?.totalTokensSavedPct || 52.8}% tokens!`
-        );
-        await refreshDashboard(false);
-      }
-    } finally {
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = '🧠 Self-Improve Swarm';
-      }
-    }
-  });
-
-  const handleSendInjection = async () => {
-    const toAgent = document.getElementById('inject-to-agent')?.value || 'harness-proposer';
-    const toModel =
-      document.getElementById('inject-to-model')?.value || 'opencode-go/kimi-k2.7-code';
-    const fromModel =
-      document.getElementById('header-model-selector')?.value || 'deepseek-v4-pro';
-    const messageType =
-      document.getElementById('inject-msg-type')?.value || 'INJECT_DIRECTIVE';
-    const reasoningDepth =
-      document.getElementById('header-depth-selector')?.value || 'balanced';
-    const inputEl = document.getElementById('inject-msg-input');
-    const content = inputEl?.value?.trim() || '';
-    if (!content) {
-      showToast('Enter a directive, context handoff, or peer critique to inject.');
-      return;
-    }
-    const res = await apiFetch('/api/swarm/message-inject', {
-      action: 'inject',
-      fromAgent: 'main-orchestrator',
-      fromModel,
-      toAgent,
-      toModel,
-      messageType,
-      reasoningDepth,
-      content,
-      autoRecallTarget: true,
-    });
-    if (res && res.ok) {
-      if (inputEl) inputEl.value = '';
-      lastRenderedNodeSignature = '';
-      lastRenderedMemberSignature = '';
-      showToast(
-        `⚡ Injected [${messageType}] to ${toAgent} (${toModel}) — subagent active on 2D graph!`
-      );
-      await refreshDashboard(false);
-    }
-  };
-
-  document.getElementById('btn-send-injection')?.addEventListener('click', handleSendInjection);
-  document.getElementById('inject-msg-input')?.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') handleSendInjection();
-  });
-
-  const handleMultiEngineSearch = async () => {
-    const engine = document.getElementById('multi-search-engine')?.value || 'multi-fusion';
-    const inputEl = document.getElementById('multi-search-input');
-    const drawerEl = document.getElementById('multi-search-results-drawer');
-    const query = inputEl?.value?.trim() || '';
-    if (!query) {
-      showToast('Enter a search query for Multi-Engine Web Search.');
-      return;
-    }
-    if (drawerEl) {
-      drawerEl.classList.remove('hidden');
-      drawerEl.innerHTML = `<div class="muted-text">🔍 Searching <code>${escapeHtml(engine)}</code> for "${escapeHtml(query)}"…</div>`;
-    }
-    const res = await apiFetch('/api/search/multi', {
-      query,
-      engine,
-      maxResults: 6,
-    });
-    if (res && res.ok && drawerEl) {
-      const results = res.results || [];
-      drawerEl.innerHTML = `
-        <div class="list-item-header" style="margin-bottom:4px;">
-          <span class="muted-text">Found <strong>${results.length}</strong> results via <code>${escapeHtml((res.enginesQueried || [engine]).join(', '))}</code></span>
-          <button class="icon-btn" id="btn-close-multi-search">✕ Close</button>
-        </div>
-        ${results
-          .map(
-            (r) => `
-          <div class="multi-search-item">
-            <div>
-              <a href="${escapeHtml(r.url || '#')}" target="_blank" rel="noopener noreferrer">${escapeHtml(r.title)}</a>
-              <span class="pill-badge" style="margin-left:6px;">${escapeHtml(r.source || engine)}</span>
-            </div>
-            <div class="muted-text">${escapeHtml(r.snippet || '')}</div>
-          </div>
-        `
-          )
-          .join('')}
-      `;
-      drawerEl.querySelector('#btn-close-multi-search')?.addEventListener('click', () => {
-        drawerEl.classList.add('hidden');
-      });
-    }
-  };
-
-  document
-    .getElementById('btn-run-multi-search')
-    ?.addEventListener('click', handleMultiEngineSearch);
-  document.getElementById('multi-search-input')?.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') handleMultiEngineSearch();
   });
 
   // Initial load + initial search + 1-second real-time live pulse stream

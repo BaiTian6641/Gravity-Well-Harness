@@ -1,7 +1,7 @@
 {
   "$schema": "../schemas/antigravity-settings.schema.json",
-  "antigravity.harness.activeModel": "deepseek-v4-pro",
-  "antigravity.harness.reasoningDepth": "balanced",
+  "antigravity.harness.activeModel": "gemini-4-argon-high",
+  "antigravity.harness.reasoningDepth": "deep",
   "antigravity.harness.reasoningEffort": "high",
   "antigravity.harness.deepseek.baseUrl": "https://api.deepseek.com",
   "antigravity.harness.opencodeGo.baseUrl": "https://opencode.ai/inference/go/openai/v1",
@@ -24,5 +24,6 @@
   "antigravity.harness.harness2.defaultCandidatesK": 2,
   "antigravity.harness.harness2.proberModelTier": "inherit",
   "antigravity.harness.harness2.ragSnippetMaxChars": 500,
-  "antigravity.harness.harness2.earlyStopOnFirstPass": true
+  "antigravity.harness.harness2.earlyStopOnFirstPass": true,
+  "antigravity.harness.chatBoxNativeModel": "gemini-4-argon-high"
 }

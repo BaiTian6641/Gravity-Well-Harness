@@ -22,6 +22,11 @@ import {
 } from 'antigravity-sidecar-kit/workspace';
 import { HarnessKnowledgeEngine } from './rag-engine.mjs';
 import {
+  setSecretInVault,
+  getSecretVaultStatusSummary,
+  SUPPORTED_SECRET_KEYS,
+} from './secret-vault.mjs';
+import {
   loadHubConfig,
   saveHubConfig,
   getEnrichedModelCatalog,
@@ -31,6 +36,8 @@ import {
   invokeUnifiedModel,
   searchWebMultiEngine,
   runSelfImprovementCoopCycle,
+  syncChatBoxModelAndTranscript,
+  loadChatContextUsage,
   SEARCH_ENGINE_CATALOG,
 } from './model-hub.mjs';
 
@@ -3175,6 +3182,36 @@ export function createHarnessMonitorApp() {
     },
     'POST'
   );
+
+  const handleVaultSignin = async (reqData = {}) => {
+    const payload = reqData?.body || reqData || {};
+    const keyName = String(payload.keyName || payload.key_name || '').trim();
+    const secretValue = String(payload.secretValue ?? payload.secret_value ?? '').trim();
+    if (!keyName || !SUPPORTED_SECRET_KEYS.includes(keyName)) {
+      return {
+        ok: false,
+        error: `Unsupported keyName. Supported keys: ${SUPPORTED_SECRET_KEYS.join(', ')}`,
+      };
+    }
+    const vaultRes = setSecretInVault(keyName, secretValue);
+    return {
+      ok: true,
+      keyName,
+      configured: Boolean(secretValue),
+      vaultPath: '~/.gemini/config/.secrets.vault.enc',
+      cipher: 'AES-256-GCM (mode 0600)',
+      updatedAt: vaultRes.updatedAt,
+      secretVault: getSecretVaultStatusSummary(),
+    };
+  };
+  app.api('/api/vault/signin', handleVaultSignin, 'POST');
+
+  const handleVaultStatus = async () => ({
+    ok: true,
+    secretVault: getSecretVaultStatusSummary(),
+  });
+  app.api('/api/vault/status', handleVaultStatus, 'GET');
+  app.api('/api/vault/status', handleVaultStatus, 'POST');
 
   return app;
 }

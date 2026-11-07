@@ -56,7 +56,7 @@
     "defaultCandidatesK": 2,
     "strictSnapshotIsolation": true,
     "autoRecordExperiencePrompt": true,
-    "reasoningDepth": "balanced",
+    "reasoningDepth": "deep",
     "thinkingBudgetTokens": 2048,
     "maxCandidateTokens": 24000,
     "maxProbeSteps": 6,

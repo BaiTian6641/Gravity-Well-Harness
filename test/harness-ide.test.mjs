@@ -564,7 +564,7 @@ test('8. Multi-Model Hub (DeepSeek Official + OpenCode Go), Bidirectional Subage
     assert.ok(rsiData.peerCritiques.length >= 2);
     assert.ok(rsiData.winner.score >= 0.85);
 
-    // 5. Verify Antigravity IDE Settings (.vscode/settings.json), Pure Monitor Sidecar UI, and AES-256-GCM Secret Vault (Zero Leakage)
+    // 5. Verify Antigravity IDE Settings (.vscode/settings.json), Pure Debugging & Preview Sidecar UI, Chat Box Model Sync, and AES-256-GCM Secret Vault (Zero Leakage)
     const indexHtml = fs.readFileSync(
       path.join(REPO_ROOT, 'sidecars', 'harness-ide-monitor', 'ui', 'index.html'),
       'utf8'
@@ -574,8 +574,35 @@ test('8. Multi-Model Hub (DeepSeek Official + OpenCode Go), Bidirectional Subage
       'Sidecar Monitor UI must be strictly a Monitor page without a Settings tab'
     );
     assert.ok(
+      !indexHtml.includes('id="header-model-selector"'),
+      'Sidecar Monitor UI must not have a model selection dropdown on the main page (model selection belongs to Antigravity IDE Chat Box)'
+    );
+    assert.ok(
+      !indexHtml.includes('id="multi-model-coop-bar"'),
+      'Sidecar Monitor UI must not include interactive message injection forms'
+    );
+    assert.ok(
       !indexHtml.includes('type="password"'),
       'Sidecar Monitor UI must not contain password/API key input fields'
+    );
+
+    // Verify official Antigravity Chat Box modelName sync & /usage View Usage in pre-invocation.mjs
+    const usageHookRes = spawnSync('node', [path.join(hooksDir, 'pre-invocation.mjs')], {
+      input: JSON.stringify({
+        conversationId: 'test-conv-chatbox-sync',
+        workspacePaths: [REPO_ROOT],
+        modelName: 'Gemini 4 Argon (High)',
+        lastUserInput: '/usage',
+      }),
+      encoding: 'utf8',
+    });
+    assert.equal(usageHookRes.status, 0);
+    const usageHookJson = JSON.parse(usageHookRes.stdout.trim());
+    const usageBanner =
+      usageHookJson.injectSteps?.[0]?.systemMessage?.metadata?.user_markdown || '';
+    assert.ok(
+      usageBanner.includes('Gemini 4 Argon'),
+      'Expected pre-invocation hook to sync Gemini 4 Argon (High) from Antigravity chat box modelName'
     );
 
     const ideSettingsPath = path.join(REPO_ROOT, '.vscode', 'settings.json');
@@ -583,6 +610,7 @@ test('8. Multi-Model Hub (DeepSeek Official + OpenCode Go), Bidirectional Subage
     const ideSettings = JSON.parse(fs.readFileSync(ideSettingsPath, 'utf8'));
     assert.ok(ideSettings['antigravity.harness.activeModel'], 'Expected antigravity.harness.activeModel in IDE settings');
     assert.ok(ideSettings['antigravity.harness.reasoningDepth'], 'Expected antigravity.harness.reasoningDepth in IDE settings');
+    assert.ok(ideSettings['antigravity.harness.swarmRoleModels'], 'Expected antigravity.harness.swarmRoleModels for multi-model subagent role routing');
 
     // Test storing a synthetic API key via /api/models/config and verifying zero leakage in disk JSON or HTTP responses
     const testSecretVal = 'sk-test-vault-never-leak-9988776655443322';
@@ -640,6 +668,23 @@ test('8. Multi-Model Hub (DeepSeek Official + OpenCode Go), Bidirectional Subage
         'Bearer [REDACTED_API_KEY]'
       );
       assert.ok(getSecretVaultStatusSummary().cipher.includes('AES-256-GCM'));
+
+      // Verify /api/vault/signin and /api/vault/status direct loopback sign-in procedure
+      const vaultSigninRes = await fetch(`${base}/api/vault/signin`, {
+        method: 'POST',
+        body: JSON.stringify({
+          keyName: 'DEEPSEEK_API_KEY',
+          secretValue: testSecretVal,
+        }),
+      });
+      assert.equal(vaultSigninRes.status, 200);
+      const vaultSigninJson = await vaultSigninRes.json();
+      assert.equal(vaultSigninJson.ok, true);
+      assert.equal(vaultSigninJson.configured, true);
+      assert.ok(
+        !JSON.stringify(vaultSigninJson).includes(testSecretVal),
+        '/api/vault/signin must never echo or leak the API key'
+      );
     } finally {
       // Restore previous DEEPSEEK_API_KEY vault state
       if (prevDeepSeekCred.hasKey && prevDeepSeekCred.source.includes('aes-256-gcm-vault')) {
