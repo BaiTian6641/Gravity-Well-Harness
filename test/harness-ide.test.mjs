@@ -4,14 +4,21 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { HarnessKnowledgeEngine } from '../src/rag-engine.mjs';
+import { HarnessKnowledgeEngine, tokenize } from '../src/rag-engine.mjs';
 import {
   setSecretInVault,
   resolveSecretCredential,
   getSecretVaultStatusSummary,
   redactSecrets,
+  validateCredentialOrigin,
 } from '../src/secret-vault.mjs';
-import { handleToolCall } from '../mcp/harness-rag-server.mjs';
+import {
+  invokeUnifiedModel,
+  injectOrConveySwarmMessage,
+  consumePendingSwarmMessages,
+} from '../src/model-hub.mjs';
+import { ContextResilienceManager } from '../src/context-resilience.mjs';
+import { handleToolCall, handleJsonRpcMessage } from '../mcp/harness-rag-server.mjs';
 import { createHarnessMonitorApp } from '../sidecars/harness-ide-monitor/server.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -705,5 +712,508 @@ test('8. Multi-Model Hub (DeepSeek Official + OpenCode Go), Bidirectional Subage
     }
   } finally {
     await app.close();
+  }
+});
+
+test('9. F01, F03, F06 & F12: Immutable Snapshot Blobs, CAS Locks, Missing/Traversal Snapshot Rejection, Promotion Gate, CJK Tokenization & Truthful Loop', () => {
+  const engine = new HarnessKnowledgeEngine(REPO_ROOT);
+
+  // F12: Chinese/CJK tokenization produces characters and bigrams
+  const cjkTokens = tokenize('内存架构证据与快照隔离');
+  assert.ok(cjkTokens.length >= 6, `Expected CJK tokens & bigrams, got ${cjkTokens.length}`);
+  assert.ok(cjkTokens.includes('内存') || cjkTokens.includes('快照'));
+
+  // F03: Missing or path-traversal snapshot_id fails closed
+  const badQuery = engine.query({
+    query: 'memory architecture',
+    snapshotId: '../package',
+  });
+  assert.equal(badQuery.results.length, 0);
+  assert.equal(badQuery.snapshotIsolation.error, 'INVALID_OR_MISSING_SNAPSHOT');
+
+  const badGet = engine.getDocument('ADR-001', '../package');
+  assert.equal(badGet.found, false);
+  assert.equal(badGet.error, 'INVALID_OR_MISSING_SNAPSHOT');
+
+  // F03: Create snapshot lock with ownerRunId and verify CAS lock protection + content-addressed blob immutability
+  const lock = engine.createSnapshotLock({
+    domain: 'software-engineering',
+    k: 2,
+    mode: 'parallel',
+    ownerRunId: 'run-alpha',
+    description: 'F03 immutable blob and CAS lock test',
+  });
+  assert.equal(lock.active, true);
+  assert.equal(lock.ownerRunId, 'run-alpha');
+  const snapFile = path.join(REPO_ROOT, '.harness', 'snapshots', `${lock.snapshotId}.json`);
+
+  try {
+    // Another run without force cannot overwrite or release run-alpha's lock
+    const conflictLock = engine.createSnapshotLock({
+      domain: 'software-engineering',
+      ownerRunId: 'run-beta',
+    });
+    assert.equal(conflictLock.ok, false);
+    assert.equal(conflictLock.error, 'SNAPSHOT_LOCK_ACTIVE_BY_ANOTHER_RUN');
+
+    const wrongRelease = engine.releaseSnapshotLock({ ownerRunId: 'run-beta' });
+    assert.equal(wrongRelease.released, false);
+    assert.equal(wrongRelease.error, 'SNAPSHOT_LOCK_OWNED_BY_ANOTHER_RUN');
+
+    // Verify frozen document content is served from immutable snapshot even if live index changes
+    const docSnap = engine.getDocument('ADR-001', lock.snapshotId);
+    assert.equal(docSnap.found, true);
+    assert.equal(docSnap.fromImmutableSnapshot, true);
+    assert.ok(docSnap.content.includes('ADR-001'));
+  } finally {
+    const rightRelease = engine.releaseSnapshotLock({ ownerRunId: 'run-alpha' });
+    assert.equal(rightRelease.released, true);
+    if (fs.existsSync(snapFile)) fs.unlinkSync(snapFile);
+  }
+
+  // F01: runHarness2Loop fails closed when requiredArtifacts are missing or allowSimulation is false without evaluator
+  const missingArtRun = engine.runHarness2Loop({
+    taskId: 'test-f01-missing-artifact',
+    domain: 'software-engineering',
+    problem: 'Produce verified artifact',
+    requiredArtifacts: ['.harness/non-existent-required-output-12345.json'],
+    adoptWinner: true,
+  });
+  assert.equal(missingArtRun.ok, false);
+  assert.equal(missingArtRun.status, 'failed');
+  assert.equal(missingArtRun.error, 'REQUIRED_ARTIFACT_MISSING');
+  assert.equal(missingArtRun.passedVerification, false);
+  assert.equal(missingArtRun.adoptedExperience || null, null);
+
+  const strictNoEvalRun = engine.runHarness2Loop({
+    taskId: 'test-f01-strict-no-eval',
+    domain: 'software-engineering',
+    problem: 'Strict execution without evaluator',
+    allowSimulation: false,
+    adoptWinner: false,
+  });
+  assert.equal(strictNoEvalRun.ok, false);
+  assert.equal(strictNoEvalRun.error, 'NO_VERIFIED_EXECUTION_OR_EVALUATOR');
+
+  // F06 & F03: Long task_id collision avoidance + Promotion Gate requires evaluationReceipt for candidate entries
+  const longPrefix = 'task-identical-16char-prefix-test';
+  const recA = engine.recordExperience({
+    task_id: `${longPrefix}-alpha`,
+    domain: 'software-engineering',
+    title: 'Candidate Alpha',
+    problem: 'Test collision A',
+    observed_behavior: 'Observed A',
+    status: 'candidate',
+  });
+  const recB = engine.recordExperience({
+    task_id: `${longPrefix}-beta`,
+    domain: 'software-engineering',
+    title: 'Candidate Beta',
+    problem: 'Test collision B',
+    observed_behavior: 'Observed B',
+    status: 'candidate',
+  });
+  try {
+    assert.notEqual(recA.docid, recB.docid, 'Long task_id values sharing 16-char prefix must not collide');
+
+    // Ungated promotion of candidate without evaluationReceipt must fail
+    const ungatedPromo = engine.promoteExperienceToProjectKnowledge({
+      experienceDocId: recA.docid,
+    });
+    assert.equal(ungatedPromo.ok, false);
+    assert.equal(ungatedPromo.error, 'PROMOTION_REQUIRES_EVALUATION_RECEIPT');
+  } finally {
+    const dirA = path.dirname(path.join(REPO_ROOT, recA.relativePath));
+    const dirB = path.dirname(path.join(REPO_ROOT, recB.relativePath));
+    if (fs.existsSync(dirA)) fs.rmSync(dirA, { recursive: true, force: true });
+    if (fs.existsSync(dirB)) fs.rmSync(dirB, { recursive: true, force: true });
+    engine.buildIndex();
+  }
+});
+
+test('10. F02, F04, F05 & F13: Credential Origin Allowlist, Strict Provider Execution, Recipient-Isolated Message Bus', async () => {
+  // F05: Credential Origin Allowlist validation
+  const validDeepSeek = validateCredentialOrigin(
+    'DEEPSEEK_API_KEY',
+    'https://api.deepseek.com/chat/completions'
+  );
+  assert.equal(validDeepSeek.ok, true);
+
+  const untrustedOrigin = validateCredentialOrigin(
+    'DEEPSEEK_API_KEY',
+    'https://evil-collector.example.com/v1/chat/completions'
+  );
+  assert.equal(untrustedOrigin.ok, false);
+
+  const insecureHttp = validateCredentialOrigin(
+    'DEEPSEEK_API_KEY',
+    'http://api.deepseek.com/chat/completions'
+  );
+  assert.equal(insecureHttp.ok, false);
+
+  // F02 & F05: Unknown model ID and strict execution checks
+  const unknownModelRes = await invokeUnifiedModel(REPO_ROOT, {
+    modelId: 'non-existent-model-xyz',
+    prompt: 'Test unknown model',
+  });
+  assert.equal(unknownModelRes.ok, false);
+  assert.equal(unknownModelRes.status, 'unsupported');
+
+  const nativeStrictRes = await invokeUnifiedModel(REPO_ROOT, {
+    modelId: 'gemini-4-argon',
+    prompt: 'Test native host model in strict HTTP mode',
+    allowSimulation: false,
+  });
+  assert.equal(nativeStrictRes.ok, false);
+  assert.equal(nativeStrictRes.status, 'unsupported');
+
+  // F04: Recipient-isolated transactional message bus & broadcast per-recipient acks
+  const msgBusFile = path.join(REPO_ROOT, '.harness', 'runtime', 'message-bus.json');
+  if (fs.existsSync(msgBusFile)) fs.unlinkSync(msgBusFile);
+
+  try {
+    // 20 concurrent sends must lose 0 messages
+    await Promise.all(
+      Array.from({ length: 20 }, (_, idx) =>
+        injectOrConveySwarmMessage(REPO_ROOT, {
+          fromAgent: 'orchestrator',
+          toAgent: idx % 2 === 0 ? 'worker-a' : 'worker-b',
+          content: `Concurrent msg #${idx}`,
+          executeTargetModel: false,
+        })
+      )
+    );
+    // Also inject a broadcast message
+    await injectOrConveySwarmMessage(REPO_ROOT, {
+      fromAgent: 'orchestrator',
+      toAgent: 'all',
+      content: 'Broadcast directive to all workers',
+      executeTargetModel: false,
+    });
+
+    // Consume for worker-a: must receive 10 direct messages + 1 broadcast = 11 messages, and NEVER worker-b's messages
+    const forWorkerA = consumePendingSwarmMessages(REPO_ROOT, 'worker-a');
+    assert.equal(forWorkerA.length, 11);
+    assert.ok(forWorkerA.every((m) => m.toAgent === 'worker-a' || m.toAgent === 'all'));
+
+    // Re-consuming for worker-a immediately returns 0 (already acked by worker-a)
+    const forWorkerASecond = consumePendingSwarmMessages(REPO_ROOT, 'worker-a');
+    assert.equal(forWorkerASecond.length, 0);
+
+    // Consume for worker-b: must STILL receive all 10 direct messages for worker-b + the 1 broadcast = 11 messages
+    const forWorkerB = consumePendingSwarmMessages(REPO_ROOT, 'worker-b');
+    assert.equal(forWorkerB.length, 11);
+    assert.ok(forWorkerB.every((m) => m.toAgent === 'worker-b' || m.toAgent === 'all'));
+  } finally {
+    if (fs.existsSync(msgBusFile)) fs.unlinkSync(msgBusFile);
+  }
+});
+
+test('11. F09, F11 & F15: Batched Subagent Hook Decoding, MCP JSON-RPC Protocol Conformance & HTTP Method/Origin Guards', async () => {
+  // F11: Batched invoke_subagent with two same-role workers creates two distinct RUNNING entries
+  const hooksDir = path.join(REPO_ROOT, 'plugin', 'harness-ide', 'scripts', 'hooks');
+  const convId = `test-f11-batch-subagents-${Date.now()}`;
+  const batchHookRes = spawnSync('node', [path.join(hooksDir, 'post-tool-use.mjs')], {
+    input: JSON.stringify({
+      conversationId: convId,
+      workspacePaths: [REPO_ROOT],
+      stepIdx: 10,
+      toolCall: {
+        name: 'invoke_subagent',
+        args: {
+          Subagents: [
+            {
+              Role: 'Verification Engineer',
+              TypeName: 'harness-verifier',
+              Workspace: 'branch',
+              Prompt: 'Verify module A',
+            },
+            {
+              Role: 'Verification Engineer',
+              TypeName: 'harness-verifier',
+              Workspace: 'branch',
+              Prompt: 'Verify module B',
+            },
+          ],
+        },
+      },
+    }),
+    encoding: 'utf8',
+  });
+  assert.equal(batchHookRes.status, 0);
+
+  // Simulate 10 subsequent parent tool calls — neither subagent may be auto-completed by step count
+  for (let s = 11; s <= 20; s++) {
+    spawnSync('node', [path.join(hooksDir, 'post-tool-use.mjs')], {
+      input: JSON.stringify({
+        conversationId: convId,
+        workspacePaths: [REPO_ROOT],
+        stepIdx: s,
+        toolCall: { name: 'read_file', args: { Path: 'README.md' } },
+      }),
+      encoding: 'utf8',
+    });
+  }
+
+  const telPath = path.join(REPO_ROOT, '.harness', 'runtime', 'telemetry.json');
+  const telJson = JSON.parse(fs.readFileSync(telPath, 'utf8'));
+  const sessionSubs = telJson.sessions?.[convId]?.subagents || [];
+  assert.equal(sessionSubs.length, 2, 'Both same-role batched subagents must be recorded distinctly');
+  assert.notEqual(sessionSubs[0].id, sessionSubs[1].id);
+  assert.equal(sessionSubs[0].status, 'RUNNING');
+  assert.equal(sessionSubs[1].status, 'RUNNING');
+
+  // F15: MCP JSON-RPC protocol conformance (-32601 unknown method, -32602 invalid params/protocolVersion)
+  const badInit = await handleJsonRpcMessage({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: { protocolVersion: '1999-01-01' },
+  });
+  assert.equal(badInit.error?.code, -32602);
+
+  const unknownMethod = await handleJsonRpcMessage({
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'unknown/method',
+    params: {},
+  });
+  assert.equal(unknownMethod.error?.code, -32601);
+
+  const missingParamCall = await handleJsonRpcMessage({
+    jsonrpc: '2.0',
+    id: 3,
+    method: 'tools/call',
+    params: { name: 'harness_query', arguments: { workspace_root: REPO_ROOT } },
+  });
+  assert.equal(missingParamCall.error?.code, -32602);
+
+  // F09: Local HTTP server enforces Method (405 on GET) and Origin (403 on foreign Origin)
+  const app = createHarnessMonitorApp();
+  await app.run(0);
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const getMutatingRes = await fetch(`${base}/api/models/config`, { method: 'GET' });
+    assert.equal(getMutatingRes.status, 405);
+
+    const foreignOriginRes = await fetch(`${base}/api/models/config`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Origin: 'https://evil.example',
+      },
+      body: JSON.stringify({ workspaceRoot: REPO_ROOT }),
+    });
+    assert.equal(foreignOriginRes.status, 403);
+  } finally {
+    await app.close();
+  }
+});
+
+test('12. F10 & F14: Python Upstream Substrate/BenchmarkAdapter Seams & Sidecar Package Completeness', () => {
+  // F14: Verify sidecars/harness-ide-monitor/package.json includes all runtime modules
+  const sidecarPkg = JSON.parse(
+    fs.readFileSync(path.join(REPO_ROOT, 'sidecars', 'harness-ide-monitor', 'package.json'), 'utf8')
+  );
+  for (const requiredFile of [
+    'server.mjs',
+    'rag-engine.mjs',
+    'model-hub.mjs',
+    'secret-vault.mjs',
+    'context-resilience.mjs',
+  ]) {
+    assert.ok(
+      sidecarPkg.files.includes(requiredFile),
+      `sidecars/harness-ide-monitor/package.json files array must include ${requiredFile}`
+    );
+  }
+
+  // F10: Verify Python Substrate and BenchmarkAdapter methods
+  const pyCode = [
+    'import json',
+    'from adapters.harness2_antigravity_executor import AntigravityExecutor, BenchmarkAdapter',
+    'ex = AntigravityExecutor(workspace_root=".")',
+    'surf = ex.surface()',
+    'pre = ex.preflight()',
+    'bench = BenchmarkAdapter(required_files=["README.md"])',
+    'deliv = bench.delivered(".", ["README.md"])',
+    'val = bench.validate_tree("plugin/harness-ide")',
+    'print(json.dumps({"surface_ok": "editable_components" in surf, "preflight_ok": pre["ok"], "delivered_ok": deliv["ok"], "validate_ok": val["ok"]}))',
+  ].join('; ');
+  const pyRes = spawnSync('python', ['-c', pyCode], {
+    cwd: REPO_ROOT,
+    encoding: 'utf8',
+    timeout: 10000,
+  });
+  assert.equal(pyRes.status, 0, `Python Substrate check failed: ${pyRes.stderr}`);
+  const parsed = JSON.parse(pyRes.stdout.trim());
+  assert.equal(parsed.surface_ok, true);
+  assert.equal(parsed.preflight_ok, true);
+  assert.equal(parsed.delivered_ok, true);
+  assert.equal(parsed.validate_ok, true);
+});
+
+test('13. CTX-01..CTX-12: Gemini 4 Argon Context Resilience (Requirement Ledger, Contract Registry, Atomic Checkpoints & Escalation)', () => {
+  const tempTaskId = 'test-ctx-resilience-suite';
+  const ctxMgr = new ContextResilienceManager(REPO_ROOT);
+  const taskDir = ctxMgr._resolveSafeTaskDir(tempTaskId);
+
+  try {
+    // CTX-06 & CTX-07: Requirement Ledger prevents unwired UI controls (empty consumerRefs) or missing provider credentials from becoming verified
+    assert.throws(
+      () =>
+        ctxMgr.upsertRequirementLedger(tempTaskId, {
+          objective: 'Test CTX-06 unwired control rejection',
+          requirements: [
+            {
+              id: 'REQ-UNWIRED',
+              behavior: 'Unwired UI button with no backend consumer',
+              state: 'verified',
+              acceptanceChecks: ['check-1'],
+              evidenceRefs: ['test/harness-ide.test.mjs'],
+              consumerRefs: [],
+            },
+          ],
+        }),
+      /CTX-06 violation/
+    );
+
+    assert.throws(
+      () =>
+        ctxMgr.upsertRequirementLedger(tempTaskId, {
+          objective: 'Test CTX-07 missing provider credential rejection',
+          requirements: [
+            {
+              id: 'REQ-NO-CRED',
+              behavior: 'Live external provider call without credentials',
+              state: 'verified',
+              requiresProviderCredentials: true,
+              providerCredentialAvailable: false,
+              acceptanceChecks: ['check-1'],
+              evidenceRefs: ['test/harness-ide.test.mjs'],
+              consumerRefs: ['src/model-hub.mjs'],
+            },
+          ],
+        }),
+      /CTX-07 violation/
+    );
+
+    // Valid Requirement Ledger upsert
+    const ledger = ctxMgr.upsertRequirementLedger(tempTaskId, {
+      objective: 'Verify Argon Context Resilience end-to-end',
+      userCorrection: 'Never expose plaintext API keys or use private host RPCs',
+      requirements: [
+        {
+          id: 'REQ-01',
+          behavior: 'Validate cross-file units and schemas',
+          state: 'verified',
+          acceptanceChecks: ['validateContracts returns ok: true'],
+          evidenceRefs: ['test/harness-ide.test.mjs'],
+          consumerRefs: [{ file: 'src/context-resilience.mjs', symbol: 'validateContracts' }],
+        },
+        {
+          id: 'REQ-02',
+          behavior: 'Complete remaining integration',
+          state: 'implemented',
+        },
+      ],
+    });
+    assert.equal(ledger.requirements.length, 2);
+    assert.equal(ledger.userCorrections.length, 1);
+
+    // CTX-01: Register contract catches unit mismatch ('ms' vs 's') immediately
+    assert.throws(
+      () =>
+        ctxMgr.registerContract(tempTaskId, {
+          contractId: 'CONTRACT-TIMEOUT-MISMATCH',
+          symbolName: 'workerTimeout',
+          unit: 'ms',
+          consumerUnit: 's',
+        }),
+      /CTX-01 Unit mismatch/
+    );
+
+    // CTX-02 & CTX-05: Register contract and detect key drift when storageKey is absent from consumer file
+    ctxMgr.registerContract(tempTaskId, {
+      contractId: 'CONTRACT-KEY-DRIFT',
+      symbolName: 'activeModelId',
+      storageKey: 'NON_EXISTENT_DRIFTED_STORAGE_KEY_999',
+      unit: 'string',
+      consumerUnit: 'string',
+      producerFile: 'README.md',
+      consumerFile: 'README.md',
+    });
+    const validation = ctxMgr.validateContracts(tempTaskId);
+    assert.equal(validation.ok, false);
+    assert.ok(validation.issues.some((i) => i.code === 'CTX-02_KEY_DRIFT_PRODUCER'));
+    assert.ok(validation.issues.some((i) => i.code === 'CTX-02_KEY_DRIFT_CONSUMER'));
+
+    // CTX-04, CTX-09 & CTX-10: Atomic checkpoint write + recovery from simulated interruption before pointer swap
+    const cp1 = ctxMgr.writeCheckpoint(tempTaskId, {
+      activeWorkers: [
+        {
+          workerId: 'worker-sub-1',
+          parentId: 'main-orchestrator',
+          ownership: ['src/context-resilience.mjs'],
+          openChecks: ['REQ-02'],
+        },
+      ],
+      nextAction: 'Verify REQ-02',
+    });
+    assert.equal(cp1.checkpointRevision, 1);
+    assert.equal(cp1.contextMetrics.quality, 'unavailable');
+
+    assert.throws(
+      () =>
+        ctxMgr.writeCheckpoint(tempTaskId, {
+          nextAction: 'Interrupted checkpoint',
+          simulateCrashBeforePointerSwap: true,
+        }),
+      /CTX-09 simulated interruption/
+    );
+
+    // Current checkpoint pointer still points to intact rev 1
+    const loadedCp = ctxMgr.loadLatestCheckpoint(tempTaskId);
+    assert.equal(loadedCp.checkpointRevision, 1);
+    assert.equal(loadedCp.nextAction, 'Verify REQ-02');
+
+    // CTX-04: Subagent resume state restoration from checkpoint
+    const restoredWorker = ctxMgr.restoreSubagentFromCheckpoint(tempTaskId, 'worker-sub-1');
+    assert.equal(restoredWorker.ok, true);
+    assert.equal(restoredWorker.workerId, 'worker-sub-1');
+    assert.deepEqual(restoredWorker.ownership, ['src/context-resilience.mjs']);
+    assert.equal(restoredWorker.materialUserCorrections.length, 1);
+
+    // CTX-08: Bounded tool output externalization
+    const largeLog = Array.from(
+      { length: 100 },
+      (_, i) => `Line ${i + 1}: ERROR_CODE_42 failure detail`
+    ).join('\n');
+    const bounded = ctxMgr.storeBoundedToolOutput(tempTaskId, 'npm_test', largeLog, 300);
+    assert.equal(bounded.stored, true);
+    assert.equal(bounded.truncated, true);
+    assert.ok(fs.existsSync(path.join(REPO_ROOT, bounded.artifactRef)));
+
+    // CTX-11: Provenance vs. source conflict resolution (present source code wins over stale note)
+    const conflictRes = ctxMgr.resolveNoteVsSourceConflict({
+      retrievedNote: { docid: 'EXP-OLD-001' },
+      sourceFile: 'package.json',
+    });
+    assert.equal(conflictRes.authority, 'present_source_code');
+    assert.equal(conflictRes.reReadSourceRequired, true);
+
+    // CTX-12: Bounded no-progress escalation after 3 stagnant attempts
+    ctxMgr.recordAttemptProgress(tempTaskId, { madeProgress: false, maxStagnantAttempts: 3 });
+    ctxMgr.recordAttemptProgress(tempTaskId, { madeProgress: false, maxStagnantAttempts: 3 });
+    const attempt3 = ctxMgr.recordAttemptProgress(tempTaskId, {
+      madeProgress: false,
+      maxStagnantAttempts: 3,
+    });
+    assert.equal(attempt3.shouldStopRetryLoop, true);
+    assert.equal(attempt3.status, 'escalated_focused_restart');
+  } finally {
+    if (fs.existsSync(taskDir)) {
+      fs.rmSync(taskDir, { recursive: true, force: true });
+    }
   }
 });

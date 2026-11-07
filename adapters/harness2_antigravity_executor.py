@@ -14,12 +14,14 @@ import argparse
 import asyncio
 import dataclasses
 import datetime
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 
 REASONING_DEPTH_PROFILES: Dict[str, Dict[str, Any]] = {
@@ -147,7 +149,244 @@ class Harness2Library:
         return entries
 
 
-class AntigravityExecutor:
+class Substrate:
+    """
+    Upstream Harness² Substrate contract (`harness2/substrate/base.py`).
+    Defines the five execution seams: `surface()`, `materialise()`, `execute()`,
+    `read_trajectory()`, and `preflight()`.
+    """
+
+    def surface(self) -> Dict[str, Any]:
+        return {
+            "editable_components": [
+                "system_prompts",
+                "rules",
+                "skills",
+                "subagents",
+                "hooks",
+                "tools",
+                "scripts",
+                "plugins",
+            ],
+            "protected_paths": [
+                ".git",
+                ".harness/snapshots",
+                ".harness/index",
+                "src/secret-vault.mjs",
+            ],
+            "required_files": [".harness/config.json"],
+            "validators": ["validate_tree", "delivered"],
+        }
+
+    def materialise(
+        self,
+        candidate_tree: Any,
+        target_dir: Union[str, Path],
+    ) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def execute(self, run_spec: Any) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def read_trajectory(self, run_dir: Union[str, Path]) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def preflight(self) -> Dict[str, Any]:
+        raise NotImplementedError
+
+
+class BenchmarkAdapter:
+    """
+    Upstream Harness² BenchmarkAdapter contract (`harness2/core/spec.py`).
+    Independently verifies artifact delivery, candidate tree invariants, and post-selection judging.
+    """
+
+    PROTECTED_PATHS = (
+        ".git",
+        ".harness/snapshots",
+        ".harness/index",
+        "src/secret-vault.mjs",
+    )
+
+    def __init__(
+        self,
+        workspace_root: Optional[Union[str, Path]] = None,
+        domain: str = "software-engineering",
+        required_files: Optional[List[str]] = None,
+    ) -> None:
+        self.workspace_root = Path(workspace_root or Path.cwd()).resolve()
+        self.domain = domain
+        self.required_files: List[str] = list(required_files or [])
+
+    def delivered(
+        self,
+        run_dir: Union[str, Path],
+        required_files: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        run_path = Path(run_dir).resolve()
+        req_list = list(required_files if required_files is not None else self.required_files)
+        present: List[str] = []
+        missing: List[str] = []
+
+        if not run_path.exists() or not run_path.is_dir():
+            return {
+                "ok": False,
+                "delivered": False,
+                "run_dir": str(run_path),
+                "checked_files": req_list,
+                "present_files": [],
+                "missing_files": req_list or ["<run_dir>"],
+            }
+
+        for rel_file in req_list:
+            cand_in_run = (run_path / rel_file).resolve()
+            cand_in_ws = (self.workspace_root / rel_file).resolve()
+            valid_in_run = (
+                str(cand_in_run).startswith(str(run_path))
+                and cand_in_run.exists()
+                and cand_in_run.is_file()
+                and cand_in_run.stat().st_size > 0
+            )
+            valid_in_ws = (
+                str(cand_in_ws).startswith(str(self.workspace_root))
+                and cand_in_ws.exists()
+                and cand_in_ws.is_file()
+                and cand_in_ws.stat().st_size > 0
+            )
+            if valid_in_run or valid_in_ws:
+                present.append(str(rel_file))
+            else:
+                missing.append(str(rel_file))
+
+        delivered_ok = len(missing) == 0
+        return {
+            "ok": delivered_ok,
+            "delivered": delivered_ok,
+            "run_dir": str(run_path),
+            "checked_files": req_list,
+            "present_files": present,
+            "missing_files": missing,
+        }
+
+    def validate_tree(self, tree_dir: Union[str, Path]) -> Dict[str, Any]:
+        tree_path = Path(tree_dir).resolve()
+        errors: List[str] = []
+        if not tree_path.exists() or not tree_path.is_dir():
+            return {
+                "ok": False,
+                "valid": False,
+                "tree_dir": str(tree_path),
+                "errors": ["TREE_DIR_NOT_FOUND"],
+            }
+
+        for item in tree_path.rglob("*"):
+            try:
+                resolved = item.resolve()
+                if not str(resolved).startswith(str(tree_path)):
+                    errors.append(f"PATH_ESCAPE:{item.name}")
+            except Exception:
+                errors.append(f"UNRESOLVABLE_PATH:{item.name}")
+
+            rel = str(item.relative_to(tree_path)).replace("\\", "/")
+            if rel in ("src/secret-vault.mjs", ".harness/snapshots/active.lock.json"):
+                errors.append(f"PROTECTED_PATH_MODIFIED:{rel}")
+
+            if item.is_file() and item.name in ("manifest.json", "config.json", "candidate_spec.json"):
+                try:
+                    parsed = json.loads(item.read_text(encoding="utf-8"))
+                    if not isinstance(parsed, dict):
+                        errors.append(f"INVALID_JSON_OBJECT:{rel}")
+                except Exception:
+                    errors.append(f"MALFORMED_JSON:{rel}")
+
+        return {
+            "ok": len(errors) == 0,
+            "valid": len(errors) == 0,
+            "tree_dir": str(tree_path),
+            "errors": errors,
+        }
+
+    def judge(
+        self,
+        run_dir: Union[str, Path],
+        required_files: Optional[List[str]] = None,
+        validator_cmd: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        run_path = Path(run_dir).resolve()
+        deliv = self.delivered(run_path, required_files)
+        if not deliv["delivered"]:
+            return {
+                "ok": False,
+                "passed": False,
+                "score": 0.0,
+                "status": "failed",
+                "reason": "REQUIRED_ARTIFACTS_MISSING",
+                "run_dir": str(run_path),
+                "delivered": False,
+                "missing_files": deliv["missing_files"],
+            }
+
+        receipt_file = run_path / "receipt.json"
+        traj_file = run_path / "trajectory.json"
+        if not receipt_file.exists() and not traj_file.exists() and not deliv["checked_files"]:
+            return {
+                "ok": False,
+                "passed": False,
+                "score": None,
+                "status": "unavailable",
+                "reason": "NO_EXECUTION_EVIDENCE",
+                "run_dir": str(run_path),
+                "delivered": False,
+            }
+
+        if validator_cmd:
+            proc = subprocess.run(
+                validator_cmd,
+                cwd=str(run_path),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=30,
+                check=False,
+            )
+            passed = proc.returncode == 0
+            return {
+                "ok": passed,
+                "passed": passed,
+                "score": 1.0 if passed else 0.0,
+                "status": "passed" if passed else "failed",
+                "run_dir": str(run_path),
+                "delivered": True,
+                "validator_exit_code": proc.returncode,
+            }
+
+        receipt_data: Dict[str, Any] = {}
+        if receipt_file.exists():
+            try:
+                receipt_data = json.loads(receipt_file.read_text(encoding="utf-8"))
+            except Exception:
+                return {
+                    "ok": False,
+                    "passed": False,
+                    "score": None,
+                    "status": "unavailable",
+                    "reason": "CORRUPT_RECEIPT",
+                    "run_dir": str(run_path),
+                }
+
+        passed = bool(receipt_data.get("passed_verification", True))
+        score = float(receipt_data.get("verification_score", 1.0 if passed else 0.0))
+        return {
+            "ok": passed,
+            "passed": passed,
+            "score": score,
+            "status": "passed" if passed else "failed",
+            "run_dir": str(run_path),
+            "delivered": True,
+        }
+
+
+class AntigravityExecutor(Substrate):
     """
     Execution substrate adapter for Harness² Propose -> Probe -> Compose loops.
 
@@ -168,7 +407,7 @@ class AntigravityExecutor:
         prober_model_tier: Optional[str] = None,
         early_stop: Optional[bool] = None,
     ) -> None:
-        self.workspace_root = (workspace_root or Path.cwd()).resolve()
+        self.workspace_root = Path(workspace_root or Path.cwd()).resolve()
         self.substrate = substrate
         preset = dict(REASONING_DEPTH_PROFILES.get(reasoning_depth.lower(), REASONING_DEPTH_PROFILES["balanced"]))
         if thinking_budget_tokens is not None:
@@ -180,6 +419,253 @@ class AntigravityExecutor:
         if early_stop is not None:
             preset["early_stop_on_first_pass"] = bool(early_stop)
         self.reasoning_profile = preset
+
+    def preflight(self) -> Dict[str, Any]:
+        """Checks runtime, credentials, policy, and dependencies without starting model generation."""
+        node_ok = shutil.which("node") is not None
+        has_api_key = bool(os.environ.get("GEMINI_API_KEY"))
+        sdk_installed = False
+        try:
+            import importlib.util
+
+            sdk_installed = importlib.util.find_spec("google.antigravity") is not None
+        except Exception:
+            sdk_installed = False
+
+        sdk_required = self.substrate == "antigravity-sdk"
+        ready = node_ok and (not sdk_required or (sdk_installed and has_api_key))
+        return {
+            "ok": ready,
+            "substrate": self.substrate,
+            "workspace_root": str(self.workspace_root),
+            "node_available": node_ok,
+            "sdk_installed": sdk_installed,
+            "has_credentials": has_api_key,
+            "started_generation": False,
+        }
+
+    def materialise(
+        self,
+        candidate_tree: Any,
+        target_dir: Union[str, Path],
+    ) -> Dict[str, Any]:
+        """Stages a candidate harness tree or spec into an isolated runtime directory with digests."""
+        target_path = Path(target_dir).resolve()
+        target_path.mkdir(parents=True, exist_ok=True)
+        materialised_files: List[str] = []
+        source_hasher = hashlib.sha256()
+
+        if isinstance(candidate_tree, (str, Path)) and Path(candidate_tree).exists():
+            src_path = Path(candidate_tree).resolve()
+            if src_path.is_dir():
+                for src_file in sorted(src_path.rglob("*")):
+                    if src_file.is_dir():
+                        continue
+                    rel = src_file.relative_to(src_path)
+                    rel_posix = str(rel).replace("\\", "/")
+                    if rel_posix.startswith(".git/") or rel_posix in self.surface()["protected_paths"]:
+                        continue
+                    raw_bytes = src_file.read_bytes()
+                    source_hasher.update(rel_posix.encode("utf-8"))
+                    source_hasher.update(raw_bytes)
+                    dest_file = (target_path / rel).resolve()
+                    if not str(dest_file).startswith(str(target_path)):
+                        raise ValueError(f"Path traversal rejected in materialise: {rel_posix}")
+                    dest_file.parent.mkdir(parents=True, exist_ok=True)
+                    dest_file.write_bytes(raw_bytes)
+                    materialised_files.append(rel_posix)
+            else:
+                raw_bytes = src_path.read_bytes()
+                source_hasher.update(raw_bytes)
+                dest_file = target_path / src_path.name
+                dest_file.write_bytes(raw_bytes)
+                materialised_files.append(src_path.name)
+        else:
+            spec_dict = (
+                candidate_tree.to_dict()
+                if hasattr(candidate_tree, "to_dict")
+                else (dict(candidate_tree) if isinstance(candidate_tree, dict) else {"raw": str(candidate_tree)})
+            )
+            serialized = json.dumps(spec_dict, sort_keys=True, indent=2).encode("utf-8")
+            source_hasher.update(serialized)
+            manifest_dir = target_path / "harness"
+            manifest_dir.mkdir(parents=True, exist_ok=True)
+            manifest_file = manifest_dir / "manifest.json"
+            manifest_file.write_bytes(serialized)
+            materialised_files.append("harness/manifest.json")
+
+        staged_hasher = hashlib.sha256()
+        for f_rel in sorted(materialised_files):
+            staged_hasher.update(f_rel.encode("utf-8"))
+            staged_hasher.update((target_path / f_rel).read_bytes())
+
+        return {
+            "ok": True,
+            "target_dir": str(target_path),
+            "source_fingerprint": source_hasher.hexdigest(),
+            "staged_digest": staged_hasher.hexdigest(),
+            "materialised_files": materialised_files,
+        }
+
+    def execute(self, run_spec: Any) -> Dict[str, Any]:
+        """Executes a candidate run and persists trajectory + receipt into its isolated run_dir."""
+        spec = run_spec if isinstance(run_spec, dict) else getattr(run_spec, "__dict__", {})
+        run_id = str(spec.get("run_id") or spec.get("candidate_id") or f"run-{int(datetime.datetime.now(datetime.timezone.utc).timestamp())}")
+        run_dir_raw = spec.get("run_dir")
+        if run_dir_raw:
+            run_dir_path = Path(run_dir_raw).resolve()
+        else:
+            run_dir_path = (self.workspace_root / ".harness" / "runtime" / "runs" / run_id).resolve()
+        run_dir_path.mkdir(parents=True, exist_ok=True)
+
+        required_files = list(spec.get("required_files") or spec.get("requiredArtifacts") or [])
+        command = spec.get("command")
+        timeout_s = float(spec.get("timeout_s") or 30.0)
+        events: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        cmd_ok = True
+
+        if command:
+            try:
+                proc = subprocess.run(
+                    command if isinstance(command, list) else str(command),
+                    shell=isinstance(command, str),
+                    cwd=str(run_dir_path),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=timeout_s,
+                    check=False,
+                )
+                events.append(
+                    {
+                        "type": "action",
+                        "step": 1,
+                        "action": "run_command",
+                        "command": command,
+                        "returncode": proc.returncode,
+                    }
+                )
+                events.append(
+                    {
+                        "type": "observation",
+                        "step": 1,
+                        "stdout": (proc.stdout or "")[:2000],
+                        "stderr": (proc.stderr or "")[:2000],
+                    }
+                )
+                if proc.returncode != 0:
+                    cmd_ok = False
+                    errors.append(f"COMMAND_EXIT_{proc.returncode}")
+                    events.append({"type": "error", "step": 1, "error": f"EXIT_{proc.returncode}"})
+            except subprocess.TimeoutExpired:
+                cmd_ok = False
+                errors.append("EXECUTION_TIMEOUT")
+                events.append({"type": "error", "step": 1, "error": "EXECUTION_TIMEOUT"})
+        else:
+            events.append(
+                {
+                    "type": "action",
+                    "step": 1,
+                    "action": "probe_candidate",
+                    "run_id": run_id,
+                }
+            )
+            events.append(
+                {
+                    "type": "observation",
+                    "step": 1,
+                    "summary": f"Executed candidate run {run_id} in {run_dir_path.name}",
+                }
+            )
+
+        bench = BenchmarkAdapter(self.workspace_root, required_files=required_files)
+        deliv = bench.delivered(run_dir_path, required_files)
+        if not deliv["delivered"]:
+            for m_file in deliv["missing_files"]:
+                errors.append(f"MISSING_REQUIRED_FILE:{m_file}")
+                events.append({"type": "error", "step": 2, "error": f"MISSING_REQUIRED_FILE:{m_file}"})
+
+        passed = cmd_ok and deliv["delivered"]
+        traj_path = run_dir_path / "trajectory.json"
+        receipt_path = run_dir_path / "receipt.json"
+        traj_payload = {
+            "run_id": run_id,
+            "run_dir": str(run_dir_path),
+            "events": events,
+            "errors": errors,
+        }
+        receipt_payload = {
+            "run_id": run_id,
+            "run_dir": str(run_dir_path),
+            "status": "succeeded" if passed else "failed",
+            "passed_verification": passed,
+            "verification_score": 1.0 if passed else 0.0,
+            "delivered": deliv["delivered"],
+            "missing_files": deliv["missing_files"],
+            "errors": errors,
+            "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        traj_path.write_text(json.dumps(traj_payload, indent=2), encoding="utf-8")
+        receipt_path.write_text(json.dumps(receipt_payload, indent=2), encoding="utf-8")
+
+        return {
+            "ok": passed,
+            "status": "succeeded" if passed else "failed",
+            "run_id": run_id,
+            "run_dir": str(run_dir_path),
+            "trajectory_path": str(traj_path),
+            "receipt_path": str(receipt_path),
+            "delivered": deliv["delivered"],
+            "missing_files": deliv["missing_files"],
+            "steps_executed": len([e for e in events if e.get("type") == "action"]),
+            "errors": errors,
+        }
+
+    def read_trajectory(self, run_dir: Union[str, Path]) -> Dict[str, Any]:
+        """Reads captured events from run_dir and separates actions, observations, and errors."""
+        run_path = Path(run_dir).resolve()
+        traj_file = run_path / "trajectory.json"
+        if not traj_file.exists():
+            return {
+                "ok": False,
+                "run_dir": str(run_path),
+                "events": [],
+                "actions": [],
+                "observations": [],
+                "errors": ["TRAJECTORY_NOT_FOUND"],
+            }
+        try:
+            data = json.loads(traj_file.read_text(encoding="utf-8"))
+            events = data.get("events", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            actions = [e for e in events if isinstance(e, dict) and e.get("type") == "action"]
+            observations = [e for e in events if isinstance(e, dict) and e.get("type") == "observation"]
+            errors = [
+                e.get("error", str(e))
+                for e in events
+                if isinstance(e, dict) and e.get("type") == "error"
+            ]
+            if isinstance(data, dict) and isinstance(data.get("errors"), list):
+                for err_str in data["errors"]:
+                    if err_str not in errors:
+                        errors.append(err_str)
+            return {
+                "ok": True,
+                "run_dir": str(run_path),
+                "events": events,
+                "actions": actions,
+                "observations": observations,
+                "errors": errors,
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "run_dir": str(run_path),
+                "events": [],
+                "actions": [],
+                "observations": [],
+                "errors": [f"TRAJECTORY_PARSE_ERROR:{exc}"],
+            }
 
     def _call_rag_node(self, js_expr: str) -> Dict[str, Any]:
         """Invokes the local Node.js HarnessKnowledgeEngine for snapshot & library ops."""
@@ -261,7 +747,7 @@ class AntigravityExecutor:
                 from google.antigravity import Agent, LocalAgentConfig, types  # type: ignore
 
                 config = LocalAgentConfig(
-                    system_instruction=(
+                    system_instructions=(
                         f"{candidate.system_prompts}\n"
                         f"Active Harness2 Snapshot Lock: {snapshot_id}. "
                         f"Token-Efficiency Guardrail: Keep reasoning concise (<= {thinking_cap} thinking tokens, "

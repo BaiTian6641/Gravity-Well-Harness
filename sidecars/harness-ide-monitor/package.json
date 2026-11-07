@@ -10,6 +10,9 @@
     "launch.mjs",
     "server.mjs",
     "rag-engine.mjs",
+    "model-hub.mjs",
+    "secret-vault.mjs",
+    "context-resilience.mjs",
     "ui"
   ],
   "engines": {

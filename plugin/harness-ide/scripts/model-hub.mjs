@@ -5,8 +5,10 @@ import crypto from 'node:crypto';
 import { REASONING_DEPTH_PROFILES } from './rag-engine.mjs';
 import {
   getSecretVaultStatusSummary,
+  redactSecrets,
   resolveSecretCredential,
   setSecretInVault,
+  validateCredentialOrigin,
 } from './secret-vault.mjs';
 
 /**
@@ -797,6 +799,87 @@ function getMessageBusFile(workspaceRoot) {
   return path.join(workspaceRoot, '.harness', 'runtime', 'message-bus.json');
 }
 
+function getMessageBusLockFile(workspaceRoot) {
+  return path.join(workspaceRoot, '.harness', 'runtime', 'message-bus.lock');
+}
+
+const SLEEP_ARRAY = new Int32Array(new SharedArrayBuffer(4));
+function sleepSyncMs(ms) {
+  try {
+    Atomics.wait(SLEEP_ARRAY, 0, 0, Math.max(1, ms));
+  } catch {
+    const deadline = Date.now() + Math.max(1, ms);
+    while (Date.now() < deadline) {
+      // spin fallback
+    }
+  }
+}
+
+function writeJsonAtomic(filePath, payload) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tmpFile = `${filePath}.tmp.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`;
+  const serialized = JSON.stringify(payload, null, 2);
+  fs.writeFileSync(tmpFile, serialized, { encoding: 'utf8', mode: 0o600 });
+  let renamed = false;
+  for (let i = 0; i < 5; i += 1) {
+    try {
+      fs.renameSync(tmpFile, filePath);
+      renamed = true;
+      break;
+    } catch (err) {
+      if (i < 4 && err && (err.code === 'EPERM' || err.code === 'EACCES' || err.code === 'EBUSY')) {
+        sleepSyncMs(5 * (i + 1));
+        continue;
+      }
+      break;
+    }
+  }
+  if (!renamed) {
+    fs.writeFileSync(filePath, serialized, { encoding: 'utf8', mode: 0o600 });
+    try {
+      if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
+    } catch {}
+  }
+}
+
+function withMessageBusLock(workspaceRoot, fn, maxRetries = 250) {
+  const lockFile = getMessageBusLockFile(workspaceRoot);
+  fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+  let fd = null;
+  for (let attempt = 0; attempt < maxRetries; attempt += 1) {
+    try {
+      fd = fs.openSync(lockFile, 'wx');
+      fs.writeFileSync(fd, `${process.pid}:${Date.now()}`, 'utf8');
+      break;
+    } catch (err) {
+      if (err && err.code === 'EEXIST') {
+        try {
+          const stat = fs.statSync(lockFile);
+          if (Date.now() - stat.mtimeMs > 5000) {
+            fs.unlinkSync(lockFile);
+            continue;
+          }
+        } catch {}
+        sleepSyncMs(4);
+        continue;
+      }
+      break;
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+      try {
+        if (fs.existsSync(lockFile)) fs.unlinkSync(lockFile);
+      } catch {}
+    }
+  }
+}
+
 function maskKey(raw) {
   const s = String(raw || '').trim();
   if (!s) return '';
@@ -1056,8 +1139,7 @@ export function syncChatBoxModelAndTranscript(
 
     try {
       const usageFile = getChatContextUsageFile(workspaceRoot);
-      fs.mkdirSync(path.dirname(usageFile), { recursive: true });
-      fs.writeFileSync(usageFile, JSON.stringify(summary, null, 2), 'utf8');
+      writeJsonAtomic(usageFile, summary);
     } catch {}
 
     return summary;
@@ -1105,7 +1187,7 @@ function loadIdeSettings(workspaceRoot) {
  * Loads the persisted Model, OpenCode Go, DeepSeek, and Search Engine configuration
  * from Antigravity IDE Settings (`.vscode/settings.json`) and `.harness/runtime/model-search-hub.json`.
  * API keys are resolved via `src/secret-vault.mjs` (AES-256-GCM Vault / `~/.env` / env)
- * and NEVER included as plaintext in returned config objects.
+ * and NEVER included as plaintext in returned config objects or left on disk (F13).
  */
 export function loadHubConfig(workspaceRoot) {
   const file = getHubConfigFile(workspaceRoot);
@@ -1119,26 +1201,61 @@ export function loadHubConfig(workspaceRoot) {
   }
   const ideSettings = loadIdeSettings(workspaceRoot);
 
-  // Migrate any legacy plaintext keys into AES-256-GCM vault and purge from saved JSON
+  // Transactional plaintext key migration (F13): encrypt into vault and immediately scrub from disk
+  let migratedFromHubFile = false;
   if (saved.providers?.deepseek?.apiKey) {
     setSecretInVault('DEEPSEEK_API_KEY', saved.providers.deepseek.apiKey);
     delete saved.providers.deepseek.apiKey;
+    migratedFromHubFile = true;
+  }
+  if (saved.providers?.['deepseek-official']?.apiKey) {
+    setSecretInVault('DEEPSEEK_API_KEY', saved.providers['deepseek-official'].apiKey);
+    delete saved.providers['deepseek-official'].apiKey;
+    migratedFromHubFile = true;
   }
   if (saved.providers?.opencodeGo?.apiKey) {
     setSecretInVault('OPENCODE_API_KEY', saved.providers.opencodeGo.apiKey);
     delete saved.providers.opencodeGo.apiKey;
+    migratedFromHubFile = true;
+  }
+  if (saved.providers?.['opencode-go']?.apiKey) {
+    setSecretInVault('OPENCODE_API_KEY', saved.providers['opencode-go'].apiKey);
+    delete saved.providers['opencode-go'].apiKey;
+    migratedFromHubFile = true;
   }
   if (saved.search?.tavilyApiKey) {
     setSecretInVault('TAVILY_API_KEY', saved.search.tavilyApiKey);
     delete saved.search.tavilyApiKey;
+    migratedFromHubFile = true;
+  }
+  if (saved.searchEngines?.tavily?.apiKey) {
+    setSecretInVault('TAVILY_API_KEY', saved.searchEngines.tavily.apiKey);
+    delete saved.searchEngines.tavily.apiKey;
+    migratedFromHubFile = true;
   }
   if (saved.search?.parallelApiKey) {
     setSecretInVault('PARALLEL_API_KEY', saved.search.parallelApiKey);
     delete saved.search.parallelApiKey;
+    migratedFromHubFile = true;
+  }
+  if (saved.searchEngines?.parallel?.apiKey) {
+    setSecretInVault('PARALLEL_API_KEY', saved.searchEngines.parallel.apiKey);
+    delete saved.searchEngines.parallel.apiKey;
+    migratedFromHubFile = true;
   }
   if (saved.search?.jinaApiKey) {
     setSecretInVault('JINA_API_KEY', saved.search.jinaApiKey);
     delete saved.search.jinaApiKey;
+    migratedFromHubFile = true;
+  }
+  if (saved.searchEngines?.jina?.apiKey) {
+    setSecretInVault('JINA_API_KEY', saved.searchEngines.jina.apiKey);
+    delete saved.searchEngines.jina.apiKey;
+    migratedFromHubFile = true;
+  }
+
+  if (migratedFromHubFile && fs.existsSync(file)) {
+    writeJsonAtomic(file, saved);
   }
 
   const deepseekSec = resolveSecretCredential('DEEPSEEK_API_KEY');
@@ -1163,6 +1280,19 @@ export function loadHubConfig(workspaceRoot) {
   }
 
   const ideRoleModels = ideSettings['antigravity.harness.swarmRoleModels'] || {};
+
+  const deepseekBaseUrl =
+    saved.providers?.deepseek?.baseUrl ||
+    saved.providers?.['deepseek-official']?.baseUrl ||
+    ideSettings['antigravity.harness.deepseek.baseUrl'] ||
+    'https://api.deepseek.com';
+  const normalizedDeepseekBase = String(deepseekBaseUrl).replace(/\/+$/, '');
+
+  const opencodeBaseUrl =
+    saved.providers?.opencodeGo?.baseUrl ||
+    saved.providers?.['opencode-go']?.baseUrl ||
+    ideSettings['antigravity.harness.opencodeGo.baseUrl'] ||
+    'https://opencode.ai/inference/go/openai/v1';
 
   const config = {
     activeModelId:
@@ -1220,17 +1350,25 @@ export function loadHubConfig(workspaceRoot) {
     },
     providers: {
       deepseek: {
-        enabled: saved.providers?.deepseek?.enabled ?? true,
-        baseUrl:
-          saved.providers?.deepseek?.baseUrl ||
-          ideSettings['antigravity.harness.deepseek.baseUrl'] ||
-          'https://api.deepseek.com',
-        chatCompletionsUrl: 'https://api.deepseek.com/chat/completions',
-        responsesUrl: 'https://api.deepseek.com/responses',
+        enabled:
+          saved.providers?.deepseek?.enabled ??
+          saved.providers?.['deepseek-official']?.enabled ??
+          true,
+        baseUrl: deepseekBaseUrl,
+        chatCompletionsUrl:
+          saved.providers?.deepseek?.chatCompletionsUrl ||
+          `${normalizedDeepseekBase}/chat/completions`,
+        responsesUrl:
+          saved.providers?.deepseek?.responsesUrl || `${normalizedDeepseekBase}/responses`,
         anthropicBaseUrl:
-          saved.providers?.deepseek?.anthropicBaseUrl || 'https://api.deepseek.com/anthropic',
-        searchUrl: 'https://api.deepseek.com/v1/tools/search',
-        fetchUrl: 'https://api.deepseek.com/v1/tools/fetch',
+          saved.providers?.deepseek?.anthropicBaseUrl ||
+          `${normalizedDeepseekBase}/anthropic`,
+        searchUrl:
+          saved.providers?.deepseek?.searchUrl ||
+          `${normalizedDeepseekBase}/v1/tools/search`,
+        fetchUrl:
+          saved.providers?.deepseek?.fetchUrl ||
+          `${normalizedDeepseekBase}/v1/tools/fetch`,
         hasKey: deepseekSec.hasKey,
         hasApiKey: deepseekSec.hasKey,
         keySource: deepseekSec.source,
@@ -1238,21 +1376,26 @@ export function loadHubConfig(workspaceRoot) {
         preserveReasoningContent: true,
       },
       opencodeGo: {
-        enabled: saved.providers?.opencodeGo?.enabled ?? true,
+        enabled:
+          saved.providers?.opencodeGo?.enabled ??
+          saved.providers?.['opencode-go']?.enabled ??
+          true,
         providerId: 'opencode-go',
         planType: 'opencode-go-coding-plan',
-        baseUrl:
-          saved.providers?.opencodeGo?.baseUrl ||
-          ideSettings['antigravity.harness.opencodeGo.baseUrl'] ||
-          'https://opencode.ai/inference/go/openai/v1',
+        baseUrl: opencodeBaseUrl,
         openaiEndpoint:
           saved.providers?.opencodeGo?.openaiEndpoint ||
-          'https://opencode.ai/inference/go/openai/v1/chat/completions',
+          saved.providers?.['opencode-go']?.openaiEndpoint ||
+          (opencodeBaseUrl !== 'https://opencode.ai/inference/go/openai/v1'
+            ? `${String(opencodeBaseUrl).replace(/\/+$/, '')}/chat/completions`
+            : 'https://opencode.ai/inference/go/openai/v1/chat/completions'),
         responsesEndpoint:
           saved.providers?.opencodeGo?.responsesEndpoint ||
+          saved.providers?.['opencode-go']?.responsesEndpoint ||
           'https://opencode.ai/inference/go/openai/v1/responses',
         anthropicEndpoint:
           saved.providers?.opencodeGo?.anthropicEndpoint ||
+          saved.providers?.['opencode-go']?.anthropicEndpoint ||
           'https://opencode.ai/inference/go/anthropic/v1/messages',
         modelsCatalogUrl: 'https://models.opencode.ai/api.json',
         localServerUrl:
@@ -1279,6 +1422,18 @@ export function loadHubConfig(workspaceRoot) {
         'wikipedia',
         'hn-algolia',
       ],
+      tavilyEndpoint:
+        saved.search?.tavilyEndpoint ||
+        saved.searchEngines?.tavily?.endpoint ||
+        'https://api.tavily.com/search',
+      parallelEndpoint:
+        saved.search?.parallelEndpoint ||
+        saved.searchEngines?.parallel?.endpoint ||
+        'https://api.parallel.ai/v1beta/search',
+      jinaEndpoint:
+        saved.search?.jinaEndpoint ||
+        saved.searchEngines?.jina?.endpoint ||
+        'https://s.jina.ai/',
       hasTavilyKey: tavilySec.hasKey,
       tavilyKeySource: tavilySec.source,
       hasParallelKey: parallelSec.hasKey,
@@ -1388,8 +1543,7 @@ export function saveHubConfig(workspaceRoot, patch = {}) {
   delete next.secretVault;
 
   const file = getHubConfigFile(workspaceRoot);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(next, null, 2), 'utf8');
+  writeJsonAtomic(file, next);
 
   // Sync non-secret preferences to Antigravity IDE Settings (.vscode/settings.json)
   try {
@@ -1407,8 +1561,7 @@ export function saveHubConfig(workspaceRoot, patch = {}) {
       'antigravity.harness.search.defaultEngine': next.search.defaultEngine,
       'antigravity.harness.swarmRoleModels': next.subagentModelRouting,
     };
-    fs.mkdirSync(path.dirname(vsFile), { recursive: true });
-    fs.writeFileSync(vsFile, JSON.stringify(updatedVs, null, 2), 'utf8');
+    writeJsonAtomic(vsFile, updatedVs);
   } catch {
     // ignore if workspace is read-only
   }
@@ -1524,26 +1677,35 @@ export function loadMessageBus(workspaceRoot) {
 }
 
 /**
- * Saves the Inter-Agent Message Injection & Convey Bus state.
+ * Saves the Inter-Agent Message Injection & Convey Bus state atomically.
+ * Never drops unconsumed messages (`!m.consumed`) during retention pruning (F04).
  */
 export function saveMessageBus(workspaceRoot, bus) {
   const file = getMessageBusFile(workspaceRoot);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const allMessages = Array.isArray(bus.messages) ? bus.messages : [];
+  let consumedCount = 0;
+  const retainedMessages = allMessages.filter((m) => {
+    if (!m || typeof m !== 'object') return false;
+    if (!m.consumed) return true;
+    consumedCount += 1;
+    return consumedCount <= 80;
+  });
+
   const payload = {
     revision: Number(bus.revision || 1),
     updatedAt: new Date().toISOString(),
-    messages: (bus.messages || []).slice(0, 80),
+    messages: retainedMessages,
   };
-  fs.writeFileSync(file, JSON.stringify(payload, null, 2), 'utf8');
+  writeJsonAtomic(file, payload);
   return payload;
 }
 
 /**
- * Injects or conveys a message across agents/models in the swarm.
+ * Injects or conveys a message across agents/models in the swarm with file locking
+ * and atomic persistence (F04).
  */
 export async function injectOrConveySwarmMessage(workspaceRoot, input = {}) {
   const cfg = loadHubConfig(workspaceRoot);
-  const bus = loadMessageBus(workspaceRoot);
 
   const fromAgent = input.fromAgent || 'main-orchestrator';
   const toAgent = input.toAgent || 'harness-proposer';
@@ -1566,7 +1728,9 @@ export async function injectOrConveySwarmMessage(workspaceRoot, input = {}) {
   }
 
   const nowIso = new Date().toISOString();
-  const msgId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const msgId =
+    input.id ||
+    `msg-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
 
   const entry = {
     id: msgId,
@@ -1578,7 +1742,12 @@ export async function injectOrConveySwarmMessage(workspaceRoot, input = {}) {
     priority,
     reasoningDepth,
     content,
+    workspaceRoot: path.resolve(workspaceRoot || process.cwd()),
+    runId: input.runId || null,
+    candidateId: input.candidateId || null,
     status: 'INJECTED',
+    consumed: false,
+    deliveries: {},
     pendingForPreInvocation: true,
     createdAt: nowIso,
     deliveredAt: null,
@@ -1600,45 +1769,179 @@ export async function injectOrConveySwarmMessage(workspaceRoot, input = {}) {
     entry.executionMode = modelReply.mode;
   }
 
-  bus.messages.unshift(entry);
-  bus.revision = (bus.revision || 1) + 1;
-  saveMessageBus(workspaceRoot, bus);
+  const savedBus = withMessageBusLock(workspaceRoot, () => {
+    const bus = loadMessageBus(workspaceRoot);
+    const existingIdx = bus.messages.findIndex((m) => m && m.id === entry.id);
+    if (existingIdx >= 0) {
+      bus.messages[existingIdx] = entry;
+    } else {
+      bus.messages.unshift(entry);
+    }
+    bus.revision = (bus.revision || 1) + 1;
+    return saveMessageBus(workspaceRoot, bus);
+  });
 
   return {
     ok: true,
     message: entry,
-    busRevision: bus.revision,
+    busRevision: savedBus.revision,
   };
 }
 
 /**
- * Consumes pending injected messages for PreInvocation hook injection into Antigravity.
+ * Transactional per-recipient message consumer (F04).
+ * A message matches `targetAgent` ONLY if:
+ * - `!targetAgent || targetAgent === 'all'` (explicitly requesting all messages), OR
+ * - `m.toAgent === targetAgent`, OR
+ * - `m.toAgent === 'all'` (broadcast).
  */
-export function consumePendingInjectedMessages(workspaceRoot, targetAgent = 'main-orchestrator') {
-  const bus = loadMessageBus(workspaceRoot);
-  const pending = [];
-  let changed = false;
+export function consumePendingSwarmMessages(workspaceRoot, targetAgent, options = {}) {
+  return withMessageBusLock(workspaceRoot, () => {
+    const bus = loadMessageBus(workspaceRoot);
+    const pending = [];
+    let changed = false;
+    const nowIso = new Date().toISOString();
+    const reqTarget = targetAgent ? String(targetAgent).trim() : '';
+    const isAllRequest = !reqTarget || reqTarget === 'all';
 
-  for (const m of bus.messages) {
-    if (
-      m.pendingForPreInvocation !== false &&
-      (m.status === 'INJECTED' || m.pendingForPreInvocation === true) &&
-      (m.toAgent === targetAgent || m.toAgent === 'all' || targetAgent === 'any' || Boolean(m.toAgent))
-    ) {
-      pending.push(m);
-      m.pendingForPreInvocation = false;
-      m.status = 'DELIVERED';
-      m.deliveredAt = m.deliveredAt || new Date().toISOString();
-      changed = true;
+    for (const m of bus.messages) {
+      if (!m || typeof m !== 'object') continue;
+      if (options.runId && m.runId && m.runId !== options.runId) continue;
+      if (options.candidateId && m.candidateId && m.candidateId !== options.candidateId) continue;
+
+      m.deliveries = m.deliveries && typeof m.deliveries === 'object' ? m.deliveries : {};
+
+      const isBroadcast = m.toAgent === 'all';
+      const matchesRecipient =
+        isAllRequest || m.toAgent === reqTarget || isBroadcast;
+
+      if (!matchesRecipient) {
+        continue;
+      }
+
+      if (isBroadcast && !isAllRequest) {
+        if (m.deliveries[reqTarget]?.state === 'consumed') {
+          continue;
+        }
+        m.deliveries[reqTarget] = {
+          state: 'consumed',
+          ackedAt: nowIso,
+        };
+        m.status = 'DELIVERED';
+        m.deliveredAt = m.deliveredAt || nowIso;
+        pending.push(m);
+        changed = true;
+        continue;
+      }
+
+      if (m.toAgent === reqTarget && !isAllRequest) {
+        if (m.consumed === true || m.deliveries[reqTarget]?.state === 'consumed') {
+          continue;
+        }
+        m.deliveries[reqTarget] = {
+          state: 'consumed',
+          ackedAt: nowIso,
+        };
+        m.consumed = true;
+        m.pendingForPreInvocation = false;
+        m.status = 'DELIVERED';
+        m.deliveredAt = m.deliveredAt || nowIso;
+        pending.push(m);
+        changed = true;
+        continue;
+      }
+
+      if (isAllRequest) {
+        if (m.consumed === true) {
+          continue;
+        }
+        const key = m.toAgent || 'all';
+        m.deliveries[key] = {
+          state: 'consumed',
+          ackedAt: nowIso,
+        };
+        m.consumed = true;
+        m.pendingForPreInvocation = false;
+        m.status = 'DELIVERED';
+        m.deliveredAt = m.deliveredAt || nowIso;
+        pending.push(m);
+        changed = true;
+      }
     }
+
+    if (changed) {
+      bus.revision = (bus.revision || 1) + 1;
+      saveMessageBus(workspaceRoot, bus);
+    }
+
+    return pending;
+  });
+}
+
+/**
+ * Consumes pending injected messages for PreInvocation hook injection into Antigravity.
+ * Delegates to `consumePendingSwarmMessages`, and for the host `'main-orchestrator'` hook also
+ * surfaces synchronous peer reply receipts initiated by `'main-orchestrator'`.
+ */
+export function consumePendingInjectedMessages(
+  workspaceRoot,
+  targetAgent = 'main-orchestrator',
+  options = {}
+) {
+  const direct = consumePendingSwarmMessages(workspaceRoot, targetAgent, options);
+  if (direct.length > 0 || targetAgent !== 'main-orchestrator') {
+    return direct;
   }
 
-  if (changed) {
-    bus.revision = (bus.revision || 1) + 1;
-    saveMessageBus(workspaceRoot, bus);
-  }
+  return withMessageBusLock(workspaceRoot, () => {
+    const bus = loadMessageBus(workspaceRoot);
+    const pending = [];
+    let changed = false;
+    const nowIso = new Date().toISOString();
 
-  return pending;
+    for (const m of bus.messages) {
+      if (!m || typeof m !== 'object') continue;
+      if (
+        m.fromAgent === 'main-orchestrator' &&
+        Boolean(m.replySummary) &&
+        m.pendingForPreInvocation !== false &&
+        !m.preInvocationNotified
+      ) {
+        m.preInvocationNotified = true;
+        m.pendingForPreInvocation = false;
+        m.deliveredAt = m.deliveredAt || nowIso;
+        pending.push(m);
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      bus.revision = (bus.revision || 1) + 1;
+      saveMessageBus(workspaceRoot, bus);
+    }
+
+    return pending;
+  });
+}
+
+function classifyHttpFailureStatus(httpStatus) {
+  if (httpStatus === 401 || httpStatus === 403) return 'unauthorized';
+  if (httpStatus === 429) return 'rate_limited';
+  if (httpStatus === 408 || httpStatus === 504) return 'timed_out';
+  return 'failed';
+}
+
+function classifyExceptionStatus(err) {
+  const name = String(err?.name || '');
+  const msg = String(err?.message || '');
+  if (
+    name === 'TimeoutError' ||
+    name === 'AbortError' ||
+    /timed?\s*out|timeout|aborted/i.test(msg)
+  ) {
+    return 'timed_out';
+  }
+  return 'failed';
 }
 
 /**
@@ -1651,7 +1954,64 @@ export function consumePendingInjectedMessages(workspaceRoot, targetAgent = 'mai
  */
 export async function invokeUnifiedModel(workspaceRoot, options = {}) {
   const cfg = loadHubConfig(workspaceRoot);
-  const modelMeta = resolveModelMeta(options.modelId || cfg.activeModelId || 'deepseek-v4-pro');
+  const explicitModelId = options.modelId ?? options.model_id;
+
+  if (
+    explicitModelId !== undefined &&
+    explicitModelId !== null &&
+    String(explicitModelId).trim() !== ''
+  ) {
+    const matched = findModelInCatalog(explicitModelId);
+    if (!matched) {
+      return {
+        ok: false,
+        status: 'unsupported',
+        error: `Unknown model identifier: ${explicitModelId}`,
+        modelId: String(explicitModelId),
+      };
+    }
+  }
+
+  const targetModelId = explicitModelId || cfg.activeModelId || 'deepseek-v4-pro';
+  const modelMeta = findModelInCatalog(targetModelId);
+  if (!modelMeta) {
+    return {
+      ok: false,
+      status: 'unsupported',
+      error: `Unknown model identifier: ${targetModelId}`,
+      modelId: String(targetModelId),
+    };
+  }
+
+  // Enforce provider enablement before any network or simulation path (F05)
+  if (
+    (modelMeta.provider === 'deepseek-official' && cfg.providers?.deepseek?.enabled === false) ||
+    (modelMeta.provider === 'opencode-go' && cfg.providers?.opencodeGo?.enabled === false)
+  ) {
+    return {
+      ok: false,
+      status: 'disabled',
+      error: `Provider ${modelMeta.provider} is disabled`,
+      modelId: modelMeta.id,
+      provider: modelMeta.provider,
+    };
+  }
+
+  const isStrict =
+    options.strictExecution === true ||
+    options.strict_execution === true ||
+    options.allowSimulation === false ||
+    options.allow_simulation === false;
+
+  if (modelMeta.provider === 'antigravity-native' && isStrict) {
+    return {
+      ok: false,
+      status: 'unsupported',
+      error: 'Native Antigravity models execute in the host session, not via standalone HTTP worker',
+      modelId: modelMeta.id,
+      provider: modelMeta.provider,
+    };
+  }
 
   const reasoningDepth =
     options.reasoningDepth ||
@@ -1670,162 +2030,342 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
     options.systemPrompt ||
     `You are an autonomous agent node in Gravity Well Harness running on ${modelMeta.name} (${modelMeta.providerLabel}) with reasoningDepth=${reasoningDepth.toUpperCase()} (reasoning_effort=${reasoningEffort}, thinkingBudget=${depthProfile.thinkingBudgetTokens} tokens).`;
 
-  // 1. Live DeepSeek Official API call when DEEPSEEK_API_KEY is configured in Secret Vault / ~/.env
-  const deepseekSecret = resolveSecretCredential('DEEPSEEK_API_KEY');
-  if (modelMeta.provider === 'deepseek-official' && deepseekSecret.hasKey) {
-    try {
-      const baseUrl = cfg.providers.deepseek.baseUrl.replace(/\/+$/, '');
-      const url = `${baseUrl}/chat/completions`;
-      const apiModelName =
-        modelMeta.id === 'deepseek-chat'
-          ? 'deepseek-flash'
-          : modelMeta.id === 'deepseek-reasoner'
-            ? 'deepseek-v4-pro'
-            : modelMeta.id;
-      const enableThinking = modelMeta.supportsThinking && reasoningEffort !== 'none';
+  const runCoordinatorPeerDelegation = async () => {
+    if (!options.delegateToPeerModel) return null;
+    return invokeUnifiedModel(workspaceRoot, {
+      modelId: options.delegateToPeerModel,
+      reasoningDepth: 'eco',
+      prompt: `[Sub-task delegated by ${modelMeta.id}]: ${prompt}`,
+      delegateToPeerModel: null,
+      strictExecution: options.strictExecution,
+      allowSimulation: options.allowSimulation,
+    });
+  };
 
-      const body = {
-        model: apiModelName,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          ...(Array.isArray(options.history) ? options.history : []),
-          { role: 'user', content: prompt },
-        ],
-        reasoning_effort: reasoningEffort,
-        thinking: { type: enableThinking ? 'enabled' : 'disabled' },
-        max_tokens: Math.min(8192, Math.max(512, depthProfile.thinkingBudgetTokens * 2)),
+  // 1. Live DeepSeek Official API call
+  if (modelMeta.provider === 'deepseek-official') {
+    const baseUrl = String(cfg.providers.deepseek.baseUrl || 'https://api.deepseek.com').replace(
+      /\/+$/,
+      ''
+    );
+    const url = `${baseUrl}/chat/completions`;
+    const originCheck = validateCredentialOrigin('DEEPSEEK_API_KEY', url);
+    if (!originCheck.allowed) {
+      return {
+        ok: false,
+        status: 'unauthorized_origin',
+        error: originCheck.reason,
+        origin: originCheck.origin,
+        modelId: modelMeta.id,
+        provider: modelMeta.provider,
       };
+    }
 
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${deepseekSecret.value}`,
-        },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(15_000),
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        const msg = data.choices?.[0]?.message || {};
+    const deepseekSecret = resolveSecretCredential('DEEPSEEK_API_KEY');
+    if (!deepseekSecret.hasKey) {
+      if (isStrict) {
         return {
-          ok: true,
-          mode: 'live-deepseek-api',
+          ok: false,
+          status: 'unauthorized',
+          error: 'Missing required DEEPSEEK_API_KEY credential for deepseek-official provider',
           modelId: modelMeta.id,
-          modelVersion: modelMeta.modelVersion || apiModelName,
-          modelName: modelMeta.name,
           provider: modelMeta.provider,
-          endpoint: url,
-          reasoningDepth,
-          reasoningEffort,
-          thinkingBudgetTokens: depthProfile.thinkingBudgetTokens,
-          reasoningContent: msg.reasoning_content || '',
-          content: msg.content || '',
-          preserveHistoryMessage: {
-            role: 'assistant',
-            content: msg.content || '',
-            ...(msg.reasoning_content ? { reasoning_content: msg.reasoning_content } : {}),
-          },
-          usage: data.usage || null,
         };
       }
-    } catch {
-      // Fall through to local co-op synthesis if network/key fails
-    }
-  }
+    } else {
+      try {
+        const apiModelName =
+          modelMeta.id === 'deepseek-chat'
+            ? 'deepseek-flash'
+            : modelMeta.id === 'deepseek-reasoner'
+              ? 'deepseek-v4-pro'
+              : modelMeta.id;
+        const enableThinking = modelMeta.supportsThinking && reasoningEffort !== 'none';
 
-  // 2. Live OpenCode Go Coding Plan API call when OPENCODE_API_KEY is configured in Secret Vault / ~/.env
-  const opencodeSecret = resolveSecretCredential([
-    'OPENCODE_GO_API_KEY',
-    'OPENCODE_API_KEY',
-    'OPENCODE_ZEN_API_KEY',
-  ]);
-  if (modelMeta.provider === 'opencode-go' && opencodeSecret.hasKey) {
-    try {
-      const strippedModelId = modelMeta.id.replace(/^opencode-go\//, '');
-      const isAnthropicWire = modelMeta.wireFormat === 'opencode-go-anthropic';
-      const url = isAnthropicWire
-        ? cfg.providers.opencodeGo.anthropicEndpoint
-        : cfg.providers.opencodeGo.openaiEndpoint;
-
-      const headers = {
-        'Content-Type': 'application/json',
-        'x-opencode-session': cfg.providers.opencodeGo.sessionHeader,
-      };
-      let body;
-      if (isAnthropicWire) {
-        headers['x-api-key'] = opencodeSecret.value;
-        headers['anthropic-version'] = '2023-06-01';
-        body = {
-          model: strippedModelId,
-          system: systemPrompt,
-          max_tokens: Math.min(8192, Math.max(512, depthProfile.thinkingBudgetTokens * 2)),
-          messages: [{ role: 'user', content: prompt }],
-        };
-      } else {
-        headers.Authorization = `Bearer ${opencodeSecret.value}`;
-        body = {
-          model: strippedModelId,
+        const body = {
+          model: apiModelName,
           messages: [
             { role: 'system', content: systemPrompt },
             ...(Array.isArray(options.history) ? options.history : []),
             { role: 'user', content: prompt },
           ],
+          reasoning_effort: reasoningEffort,
+          thinking: { type: enableThinking ? 'enabled' : 'disabled' },
           max_tokens: Math.min(8192, Math.max(512, depthProfile.thinkingBudgetTokens * 2)),
         };
-      }
 
-      const res = await fetch(url, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(15_000),
-      });
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${deepseekSecret.value}`,
+          },
+          body: JSON.stringify(body),
+          redirect: 'manual',
+          signal: AbortSignal.timeout(Number(options.timeoutMs || 15_000)),
+        });
 
-      if (res.ok) {
-        const data = await res.json();
-        const contentText = isAnthropicWire
-          ? (data.content || []).map((c) => c.text || '').join('\n')
-          : data.choices?.[0]?.message?.content || '';
-        const reasoningText = isAnthropicWire
-          ? (data.content || []).find((c) => c.type === 'thinking')?.thinking || ''
-          : data.choices?.[0]?.message?.reasoning_content || '';
-        return {
-          ok: true,
-          mode: 'live-opencode-go-api',
-          modelId: modelMeta.id,
-          modelName: modelMeta.name,
-          provider: modelMeta.provider,
-          endpoint: url,
-          sessionHeader: cfg.providers.opencodeGo.sessionHeader,
-          reasoningDepth,
-          reasoningEffort,
-          thinkingBudgetTokens: depthProfile.thinkingBudgetTokens,
-          reasoningContent: reasoningText,
-          content: contentText,
-          usage: data.usage || null,
-        };
+        if (
+          (res.status >= 300 && res.status < 400) ||
+          res.type === 'opaqueredirect'
+        ) {
+          return {
+            ok: false,
+            status: 'unauthorized_origin',
+            error: `Redirect (${res.status || 'opaqueredirect'}) blocked for authenticated request to ${url}`,
+            modelId: modelMeta.id,
+            provider: modelMeta.provider,
+          };
+        }
+
+        if (res.ok) {
+          const data = await res.json();
+          if (
+            !data ||
+            typeof data !== 'object' ||
+            !Array.isArray(data.choices) ||
+            data.choices.length === 0
+          ) {
+            if (isStrict) {
+              return {
+                ok: false,
+                status: 'failed',
+                error: 'Malformed response payload from DeepSeek API (missing choices)',
+                modelId: modelMeta.id,
+                provider: modelMeta.provider,
+              };
+            }
+          } else {
+            const msg = data.choices[0]?.message || {};
+            const peerDelegationResult = await runCoordinatorPeerDelegation();
+            return {
+              ok: true,
+              status: 'succeeded',
+              mode: 'live-deepseek-api',
+              modelId: modelMeta.id,
+              modelVersion: modelMeta.modelVersion || apiModelName,
+              modelName: modelMeta.name,
+              provider: modelMeta.provider,
+              endpoint: url,
+              reasoningDepth,
+              reasoningEffort,
+              thinkingBudgetTokens: depthProfile.thinkingBudgetTokens,
+              reasoningContent: msg.reasoning_content || '',
+              reasoning_content: msg.reasoning_content || '',
+              content: msg.content || '',
+              peerDelegationResult,
+              peerDelegation: peerDelegationResult,
+              preserveHistoryMessage: {
+                role: 'assistant',
+                content: msg.content || '',
+                ...(msg.reasoning_content ? { reasoning_content: msg.reasoning_content } : {}),
+              },
+              usage: data.usage || null,
+            };
+          }
+        } else if (isStrict) {
+          let errDetail = '';
+          try {
+            errDetail = await res.text();
+          } catch {}
+          return {
+            ok: false,
+            status: classifyHttpFailureStatus(res.status),
+            httpStatus: res.status,
+            error: redactSecrets(
+              errDetail
+                ? `DeepSeek API HTTP ${res.status}: ${errDetail.slice(0, 300)}`
+                : `DeepSeek API HTTP ${res.status}`
+            ),
+            modelId: modelMeta.id,
+            provider: modelMeta.provider,
+          };
+        }
+      } catch (err) {
+        if (isStrict) {
+          return {
+            ok: false,
+            status: classifyExceptionStatus(err),
+            error: redactSecrets(err?.message || String(err)),
+            modelId: modelMeta.id,
+            provider: modelMeta.provider,
+          };
+        }
       }
-    } catch {
-      // Fall through to local co-op synthesis if network/key fails
     }
   }
 
-  // 3. Deterministic Co-Op Synthesis (supports bidirectional cross-model calling in offline/test environments)
+  // 2. Live OpenCode Go Coding Plan API call
+  if (modelMeta.provider === 'opencode-go') {
+    const strippedModelId = modelMeta.id.replace(/^opencode-go\//, '');
+    const isAnthropicWire = modelMeta.wireFormat === 'opencode-go-anthropic';
+    const url = isAnthropicWire
+      ? cfg.providers.opencodeGo.anthropicEndpoint
+      : cfg.providers.opencodeGo.openaiEndpoint;
+
+    const baseCheck = validateCredentialOrigin(
+      'OPENCODE_API_KEY',
+      cfg.providers.opencodeGo.baseUrl || url
+    );
+    const urlCheck = validateCredentialOrigin('OPENCODE_API_KEY', url);
+    if (!baseCheck.allowed || !urlCheck.allowed) {
+      const failedCheck = !urlCheck.allowed ? urlCheck : baseCheck;
+      return {
+        ok: false,
+        status: 'unauthorized_origin',
+        error: failedCheck.reason,
+        origin: failedCheck.origin,
+        modelId: modelMeta.id,
+        provider: modelMeta.provider,
+      };
+    }
+
+    const opencodeSecret = resolveSecretCredential([
+      'OPENCODE_GO_API_KEY',
+      'OPENCODE_API_KEY',
+      'OPENCODE_ZEN_API_KEY',
+    ]);
+    if (!opencodeSecret.hasKey) {
+      if (isStrict) {
+        return {
+          ok: false,
+          status: 'unauthorized',
+          error: 'Missing required OPENCODE_API_KEY credential for opencode-go provider',
+          modelId: modelMeta.id,
+          provider: modelMeta.provider,
+        };
+      }
+    } else {
+      try {
+        const headers = {
+          'Content-Type': 'application/json',
+          'x-opencode-session': cfg.providers.opencodeGo.sessionHeader,
+        };
+        let body;
+        if (isAnthropicWire) {
+          headers['x-api-key'] = opencodeSecret.value;
+          headers['anthropic-version'] = '2023-06-01';
+          body = {
+            model: strippedModelId,
+            system: systemPrompt,
+            max_tokens: Math.min(8192, Math.max(512, depthProfile.thinkingBudgetTokens * 2)),
+            messages: [{ role: 'user', content: prompt }],
+          };
+        } else {
+          headers.Authorization = `Bearer ${opencodeSecret.value}`;
+          body = {
+            model: strippedModelId,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              ...(Array.isArray(options.history) ? options.history : []),
+              { role: 'user', content: prompt },
+            ],
+            max_tokens: Math.min(8192, Math.max(512, depthProfile.thinkingBudgetTokens * 2)),
+          };
+        }
+
+        const res = await fetch(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+          redirect: 'manual',
+          signal: AbortSignal.timeout(Number(options.timeoutMs || 15_000)),
+        });
+
+        if (
+          (res.status >= 300 && res.status < 400) ||
+          res.type === 'opaqueredirect'
+        ) {
+          return {
+            ok: false,
+            status: 'unauthorized_origin',
+            error: `Redirect (${res.status || 'opaqueredirect'}) blocked for authenticated request to ${url}`,
+            modelId: modelMeta.id,
+            provider: modelMeta.provider,
+          };
+        }
+
+        if (res.ok) {
+          const data = await res.json();
+          const validPayload = isAnthropicWire
+            ? Array.isArray(data?.content) && data.content.length > 0
+            : Array.isArray(data?.choices) && data.choices.length > 0;
+          if (!validPayload) {
+            if (isStrict) {
+              return {
+                ok: false,
+                status: 'failed',
+                error: 'Malformed response payload from OpenCode Go API',
+                modelId: modelMeta.id,
+                provider: modelMeta.provider,
+              };
+            }
+          } else {
+            const contentText = isAnthropicWire
+              ? (data.content || []).map((c) => c.text || '').join('\n')
+              : data.choices?.[0]?.message?.content || '';
+            const reasoningText = isAnthropicWire
+              ? (data.content || []).find((c) => c.type === 'thinking')?.thinking || ''
+              : data.choices?.[0]?.message?.reasoning_content || '';
+            const peerDelegationResult = await runCoordinatorPeerDelegation();
+            return {
+              ok: true,
+              status: 'succeeded',
+              mode: 'live-opencode-go-api',
+              modelId: modelMeta.id,
+              modelName: modelMeta.name,
+              provider: modelMeta.provider,
+              endpoint: url,
+              sessionHeader: cfg.providers.opencodeGo.sessionHeader,
+              reasoningDepth,
+              reasoningEffort,
+              thinkingBudgetTokens: depthProfile.thinkingBudgetTokens,
+              reasoningContent: reasoningText,
+              reasoning_content: reasoningText,
+              content: contentText,
+              peerDelegationResult,
+              peerDelegation: peerDelegationResult,
+              usage: data.usage || null,
+            };
+          }
+        } else if (isStrict) {
+          let errDetail = '';
+          try {
+            errDetail = await res.text();
+          } catch {}
+          return {
+            ok: false,
+            status: classifyHttpFailureStatus(res.status),
+            httpStatus: res.status,
+            error: redactSecrets(
+              errDetail
+                ? `OpenCode Go API HTTP ${res.status}: ${errDetail.slice(0, 300)}`
+                : `OpenCode Go API HTTP ${res.status}`
+            ),
+            modelId: modelMeta.id,
+            provider: modelMeta.provider,
+          };
+        }
+      } catch (err) {
+        if (isStrict) {
+          return {
+            ok: false,
+            status: classifyExceptionStatus(err),
+            error: redactSecrets(err?.message || String(err)),
+            modelId: modelMeta.id,
+            provider: modelMeta.provider,
+          };
+        }
+      }
+    }
+  }
+
+  // 3. Deterministic Co-Op Synthesis (supports bidirectional cross-model calling in offline/test environments when simulation is permitted)
   const reasoningTrace = modelMeta.supportsThinking
     ? `[${modelMeta.name} · depth=${reasoningDepth.toUpperCase()} · effort=${reasoningEffort} · cap=${depthProfile.thinkingBudgetTokens} tok] 1. Parsed task constraint & consulted .harness/library/INDEX.md cues. 2. Verified wire protocol (${modelMeta.wireFormat} -> ${modelMeta.endpoint}). 3. Synthesized token-efficient response.`
     : '';
 
-  let peerDelegationResult = null;
-  if (options.delegateToPeerModel) {
-    peerDelegationResult = await invokeUnifiedModel(workspaceRoot, {
-      modelId: options.delegateToPeerModel,
-      reasoningDepth: 'eco',
-      prompt: `[Sub-task delegated by ${modelMeta.id}]: ${prompt}`,
-      delegateToPeerModel: null,
-    });
-  }
+  const peerDelegationResult = await runCoordinatorPeerDelegation();
 
   const synthesizedContent = peerDelegationResult
     ? `[${modelMeta.name} (${modelMeta.providerLabel}) · ${reasoningDepth.toUpperCase()} / effort=${reasoningEffort}] Completed primary analysis for "${prompt.slice(0, 90)}" and delegated sub-verification to peer model ${peerDelegationResult.modelName} -> ${peerDelegationResult.content}`
@@ -1833,6 +2373,8 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
 
   return {
     ok: true,
+    status: 'simulated',
+    synthetic: true,
     mode: 'coop-bridge-ready',
     modelId: modelMeta.id,
     modelVersion: modelMeta.modelVersion || modelMeta.id,
@@ -1859,7 +2401,8 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
 /**
  * Multi-Engine Web Search Hub:
  * Queries DeepSeek Official Search API (`/v1/tools/search`), Parallel AI Search, Tavily AI Search,
- * DuckDuckGo Instant Answer, Wikipedia Action API, and HackerNews Algolia, fusing results with RRF.
+ * Jina AI Search, DuckDuckGo Instant Answer, Wikipedia Action API, and HackerNews Algolia, fusing results with RRF.
+ * Enforces `validateCredentialOrigin` + `redirect: 'manual'` before attaching any secret credential (F05).
  */
 export async function searchWebMultiEngine(workspaceRoot, options = {}) {
   const cfg = loadHubConfig(workspaceRoot);
@@ -1868,24 +2411,48 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
     throw new Error('query is required for searchWebMultiEngine');
   }
 
+  const isStrict =
+    options.strictExecution === true ||
+    options.strict_execution === true ||
+    options.allowSimulation === false ||
+    options.allow_simulation === false;
+
   const requestedEngine = options.engine || cfg.search.defaultEngine || 'multi-fusion';
-  const limit = Math.max(1, Math.min(15, Number(options.limit || 6)));
+  const limit = Math.max(1, Math.min(15, Number(options.limit || options.maxResults || 6)));
   const enginesToRun =
     requestedEngine === 'multi-fusion' || requestedEngine === 'auto'
       ? cfg.search.enabledEngines
       : [requestedEngine];
 
   const perEngineResults = {};
+  const engineErrors = {};
+  let unauthorizedOriginFailure = null;
   const tasks = [];
 
   // 1. DeepSeek Official Search API (`POST https://api.deepseek.com/v1/tools/search`)
   if (enginesToRun.includes('deepseek-search')) {
     tasks.push(
       (async () => {
+        if (cfg.providers?.deepseek?.enabled === false) {
+          perEngineResults['deepseek-search'] = [];
+          return;
+        }
+        const searchUrl =
+          options.deepseekSearchUrl ||
+          (requestedEngine === 'deepseek-search' && options.endpoint) ||
+          cfg.providers?.deepseek?.searchUrl ||
+          'https://api.deepseek.com/v1/tools/search';
+        const originCheck = validateCredentialOrigin('DEEPSEEK_API_KEY', searchUrl);
+        if (!originCheck.allowed) {
+          unauthorizedOriginFailure = originCheck;
+          engineErrors['deepseek-search'] = originCheck.reason;
+          perEngineResults['deepseek-search'] = [];
+          return;
+        }
         const dsSec = resolveSecretCredential('DEEPSEEK_API_KEY');
         if (dsSec.hasKey) {
           try {
-            const res = await fetch('https://api.deepseek.com/v1/tools/search', {
+            const res = await fetch(searchUrl, {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
@@ -1896,6 +2463,7 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
                 count: Math.min(10, limit),
                 need_content: true,
               }),
+              redirect: 'manual',
               signal: AbortSignal.timeout(6_000),
             });
             if (res.ok) {
@@ -1920,10 +2488,22 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
   if (enginesToRun.includes('parallel')) {
     tasks.push(
       (async () => {
+        const parallelUrl =
+          options.parallelSearchUrl ||
+          (requestedEngine === 'parallel' && options.endpoint) ||
+          cfg.search?.parallelEndpoint ||
+          'https://api.parallel.ai/v1beta/search';
+        const originCheck = validateCredentialOrigin('PARALLEL_API_KEY', parallelUrl);
+        if (!originCheck.allowed) {
+          unauthorizedOriginFailure = originCheck;
+          engineErrors.parallel = originCheck.reason;
+          perEngineResults.parallel = [];
+          return;
+        }
         const plSec = resolveSecretCredential('PARALLEL_API_KEY');
         if (plSec.hasKey) {
           try {
-            const res = await fetch('https://api.parallel.ai/v1beta/search', {
+            const res = await fetch(parallelUrl, {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
@@ -1934,6 +2514,7 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
                 search_queries: [query],
                 max_results: limit,
               }),
+              redirect: 'manual',
               signal: AbortSignal.timeout(6_000),
             });
             if (res.ok) {
@@ -1957,18 +2538,34 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
   if (enginesToRun.includes('tavily')) {
     tasks.push(
       (async () => {
+        const tavilyUrl =
+          options.tavilySearchUrl ||
+          (requestedEngine === 'tavily' && options.endpoint) ||
+          cfg.search?.tavilyEndpoint ||
+          'https://api.tavily.com/search';
+        const originCheck = validateCredentialOrigin('TAVILY_API_KEY', tavilyUrl);
+        if (!originCheck.allowed) {
+          unauthorizedOriginFailure = originCheck;
+          engineErrors.tavily = originCheck.reason;
+          perEngineResults.tavily = [];
+          return;
+        }
         const tvSec = resolveSecretCredential('TAVILY_API_KEY');
         if (tvSec.hasKey) {
           try {
-            const res = await fetch('https://api.tavily.com/search', {
+            const res = await fetch(tavilyUrl, {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${tvSec.value}`,
+              },
               body: JSON.stringify({
                 api_key: tvSec.value,
                 query,
                 search_depth: 'basic',
                 max_results: limit,
               }),
+              redirect: 'manual',
               signal: AbortSignal.timeout(6_000),
             });
             if (res.ok) {
@@ -1988,7 +2585,54 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
     );
   }
 
-  // 4. Free Engine: Wikipedia Action API (100% Free, Zero-Key)
+  // 4. Jina AI Search (`https://s.jina.ai/`)
+  if (enginesToRun.includes('jina')) {
+    tasks.push(
+      (async () => {
+        const jinaBase =
+          options.jinaSearchUrl ||
+          (requestedEngine === 'jina' && options.endpoint) ||
+          cfg.search?.jinaEndpoint ||
+          'https://s.jina.ai/';
+        const originCheck = validateCredentialOrigin('JINA_API_KEY', jinaBase);
+        if (!originCheck.allowed) {
+          unauthorizedOriginFailure = originCheck;
+          engineErrors.jina = originCheck.reason;
+          perEngineResults.jina = [];
+          return;
+        }
+        const jinaSec = resolveSecretCredential('JINA_API_KEY');
+        if (jinaSec.hasKey) {
+          try {
+            const jinaUrl = `${String(jinaBase).replace(/\/+$/, '')}/${encodeURIComponent(query)}`;
+            const res = await fetch(jinaUrl, {
+              method: 'GET',
+              headers: {
+                Accept: 'application/json',
+                Authorization: `Bearer ${jinaSec.value}`,
+              },
+              redirect: 'manual',
+              signal: AbortSignal.timeout(5_000),
+            });
+            if (res.ok) {
+              const data = await res.json();
+              const list = Array.isArray(data?.data) ? data.data : [];
+              perEngineResults.jina = list.slice(0, limit).map((r) => ({
+                title: r.title || r.url || query,
+                url: r.url || 'https://s.jina.ai/',
+                snippet: r.description || r.content?.slice(0, 320) || '',
+                engine: 'jina',
+              }));
+              return;
+            }
+          } catch {}
+        }
+        perEngineResults.jina = [];
+      })()
+    );
+  }
+
+  // 5. Free Engine: Wikipedia Action API (100% Free, Zero-Key)
   if (enginesToRun.includes('wikipedia')) {
     tasks.push(
       (async () => {
@@ -2019,7 +2663,7 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
     );
   }
 
-  // 5. Free Engine: DuckDuckGo Instant Answer API (100% Free, Zero-Key)
+  // 6. Free Engine: DuckDuckGo Instant Answer API (100% Free, Zero-Key)
   if (enginesToRun.includes('duckduckgo')) {
     tasks.push(
       (async () => {
@@ -2061,7 +2705,7 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
     );
   }
 
-  // 6. Free Engine: HackerNews Algolia Tech Search (100% Free, Zero-Key)
+  // 7. Free Engine: HackerNews Algolia Tech Search (100% Free, Zero-Key)
   if (enginesToRun.includes('hn-algolia')) {
     tasks.push(
       (async () => {
@@ -2094,6 +2738,21 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
 
   await Promise.all(tasks);
 
+  if (unauthorizedOriginFailure) {
+    return {
+      ok: false,
+      status: 'unauthorized_origin',
+      error: unauthorizedOriginFailure.reason,
+      origin: unauthorizedOriginFailure.origin,
+      query,
+      requestedEngine,
+      enginesQueried: Object.keys(perEngineResults),
+      errors: engineErrors,
+      totalResults: 0,
+      results: [],
+    };
+  }
+
   // Reciprocal Rank Fusion (RRF) across all active search engines
   const rrfMap = new Map();
   const k = 60;
@@ -2119,7 +2778,7 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
 
   let fused = Array.from(rrfMap.values()).sort((a, b) => b.rrfScore - a.rrfScore);
 
-  if (fused.length === 0) {
+  if (fused.length === 0 && !isStrict) {
     fused = [
       {
         title: `Multi-Engine Search Reference (DeepSeek / Parallel / Tavily / Free): ${query}`,
@@ -2128,12 +2787,14 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
         engine: requestedEngine === 'multi-fusion' ? 'parallel+free-fallback' : requestedEngine,
         engines: [requestedEngine],
         rrfScore: 0.032,
+        synthetic: true,
       },
     ];
   }
 
   return {
     ok: true,
+    status: fused.length === 0 ? 'empty' : 'succeeded',
     query,
     requestedEngine,
     enginesQueried: Object.keys(perEngineResults),

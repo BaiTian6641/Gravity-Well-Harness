@@ -93,9 +93,10 @@ export function stemToken(word) {
 
 export function tokenize(text, includeStopwords = false) {
   if (!text) return [];
-  const raw = String(text)
+  const normalized = String(text)
     .toLowerCase()
-    .replace(/harness²/g, 'harness2')
+    .replace(/harness²/g, 'harness2');
+  const raw = normalized
     .split(/[^a-z0-9_-]+/)
     .filter((t) => t.length >= 2);
   const tokens = [];
@@ -107,8 +108,22 @@ export function tokenize(text, includeStopwords = false) {
       tokens.push(stemmed);
     }
   }
+  const cjkMatches = normalized.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]+/gu);
+  if (cjkMatches) {
+    for (const seq of cjkMatches) {
+      const chars = Array.from(seq);
+      for (let i = 0; i < chars.length; i++) {
+        tokens.push(chars[i]);
+        if (i + 1 < chars.length) {
+          tokens.push(chars[i] + chars[i + 1]);
+        }
+      }
+    }
+  }
   return tokens;
 }
+
+const SNAPSHOT_ID_REGEX = /^snap-[a-zA-Z0-9_-]{4,80}$/i;
 
 const VECTOR_DIM = 256;
 
@@ -236,6 +251,7 @@ export class HarnessKnowledgeEngine {
     this.indexDir = path.join(this.harnessDir, 'index');
     this.indexFilePath = path.join(this.indexDir, 'local-rag-index.json');
     this.snapshotsDir = path.join(this.harnessDir, 'snapshots');
+    this.snapshotBlobsDir = path.join(this.snapshotsDir, 'blobs');
     this.activeLockPath = path.join(this.snapshotsDir, 'active.lock.json');
     this.runtimeDir = path.join(this.harnessDir, 'runtime');
     this.telemetryPath = path.join(this.runtimeDir, 'telemetry.json');
@@ -247,6 +263,7 @@ export class HarnessKnowledgeEngine {
       this.harnessDir,
       this.indexDir,
       this.snapshotsDir,
+      this.snapshotBlobsDir,
       this.runtimeDir,
       path.join(this.harnessDir, 'knowledge', 'project'),
       path.join(this.harnessDir, 'knowledge', 'experiments'),
@@ -255,6 +272,28 @@ export class HarnessKnowledgeEngine {
     ];
     for (const d of dirs) {
       fs.mkdirSync(d, { recursive: true });
+    }
+  }
+
+  _isPathInsideWorkspace(targetPath) {
+    try {
+      const rootResolved = path.resolve(this.workspaceRoot);
+      const targetResolved = path.resolve(targetPath);
+      const rel = path.relative(rootResolved, targetResolved);
+      if (rel.startsWith('..') || path.isAbsolute(rel)) {
+        return false;
+      }
+      if (fs.existsSync(rootResolved) && fs.existsSync(targetResolved)) {
+        const rootReal = fs.realpathSync(rootResolved);
+        const targetReal = fs.realpathSync(targetResolved);
+        const realRel = path.relative(rootReal, targetReal);
+        if (realRel.startsWith('..') || path.isAbsolute(realRel)) {
+          return false;
+        }
+      }
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -531,10 +570,11 @@ export class HarnessKnowledgeEngine {
 
   _walkMarkdownFiles(dirPath) {
     const results = [];
-    if (!fs.existsSync(dirPath)) return results;
+    if (!this._isPathInsideWorkspace(dirPath) || !fs.existsSync(dirPath)) return results;
     const entries = fs.readdirSync(dirPath, { withFileTypes: true });
     for (const entry of entries) {
       const fullPath = path.join(dirPath, entry.name);
+      if (!this._isPathInsideWorkspace(fullPath)) continue;
       if (entry.isDirectory()) {
         if (entry.name === 'node_modules' || entry.name === '.git' || entry.name === 'index') continue;
         results.push(...this._walkMarkdownFiles(fullPath));
@@ -559,11 +599,14 @@ export class HarnessKnowledgeEngine {
       const relPaths = [colSpec.path, ...(colSpec.extraPaths || [])].filter(Boolean);
       for (const rel of relPaths) {
         const absDir = path.resolve(this.workspaceRoot, rel);
+        if (!this._isPathInsideWorkspace(absDir)) continue;
         const files = this._walkMarkdownFiles(absDir);
         for (const filePath of files) {
+          if (!this._isPathInsideWorkspace(filePath)) continue;
           const relFile = path.relative(this.workspaceRoot, filePath).replace(/\\/g, '/');
           const rawContent = fs.readFileSync(filePath, 'utf8');
           const stat = fs.statSync(filePath);
+          const blobHash = crypto.createHash('sha256').update(rawContent, 'utf8').digest('hex');
 
           let metadata = {};
           let body = rawContent;
@@ -585,12 +628,13 @@ export class HarnessKnowledgeEngine {
                 task_id: jsonObj.task_id || '',
                 git_revision: jsonObj.git_revision || 'HEAD',
                 created_at: jsonObj.adopted_at || stat.mtime.toISOString(),
-                status: 'active',
+                status: jsonObj.status || 'candidate',
+                synthetic: Boolean(jsonObj.synthetic),
                 tags: ['harness-manifest', 'adopted-harness']
               };
               title = metadata.title;
             } catch {
-              // Keep raw
+              metadata = { status: 'candidate' };
             }
           }
 
@@ -599,6 +643,7 @@ export class HarnessKnowledgeEngine {
             crypto.createHash('sha1').update(relFile).digest('hex').slice(0, 10).toUpperCase();
           const createdAt = metadata.created_at || stat.mtime.toISOString();
           const status = metadata.status || 'active';
+          const synthetic = metadata.synthetic === true || metadata.synthetic === 'true';
           const domain = metadata.domain || 'general';
           const tags = Array.isArray(metadata.tags) ? metadata.tags : [];
           const cue = metadata.cue || '';
@@ -638,6 +683,7 @@ export class HarnessKnowledgeEngine {
             domain,
             task_id: metadata.task_id || '',
             status,
+            synthetic,
             repo: metadata.repo || 'Harness2-RAG-antigravity',
             git_revision: metadata.git_revision || 'HEAD',
             created_at: createdAt,
@@ -648,8 +694,12 @@ export class HarnessKnowledgeEngine {
             sections,
             excerpt: body.replace(/^#+\s+.+$/gm, '').trim().slice(0, 360),
             tokenCount: tokens.length,
+            length: tokens.length,
+            tokens: Object.keys(tf),
             tf,
-            vector
+            termFreqs: tf,
+            vector,
+            blobHash
           });
         }
       }
@@ -745,9 +795,30 @@ export class HarnessKnowledgeEngine {
     k = 2,
     mode = 'parallel',
     description = 'Harness2 candidate probe comparison lock',
-    cutoffTimestamp = null
+    cutoffTimestamp = null,
+    ownerRunId = null,
+    owner_run_id = null,
+    force = false
   } = {}) {
     this.ensureDirectories();
+    const effectiveOwner = ownerRunId || owner_run_id || null;
+    const currentLock = this.getActiveSnapshotLock();
+    if (currentLock && !force) {
+      if (
+        (currentLock.ownerRunId && effectiveOwner && currentLock.ownerRunId !== effectiveOwner) ||
+        (currentLock.ownerRunId && !effectiveOwner)
+      ) {
+        return {
+          ok: false,
+          active: false,
+          locked: false,
+          error: 'SNAPSHOT_LOCK_ACTIVE_BY_ANOTHER_RUN',
+          snapshotId: currentLock.snapshotId,
+          ownerRunId: currentLock.ownerRunId
+        };
+      }
+    }
+
     const index = this.buildIndex();
     const cutoff = cutoffTimestamp || new Date().toISOString();
     const snapshotId = `SNAP-${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto
@@ -755,17 +826,62 @@ export class HarnessKnowledgeEngine {
       .toString('hex')
       .toUpperCase()}`;
 
-    const eligibleDocIds = index.documents
-      .filter((d) => {
-        if (d.status === 'candidate') return false;
-        if (cutoffTimestamp && d.created_at > cutoffTimestamp) return false;
-        return true;
-      })
-      .map((d) => d.docid);
+    const eligibleDocs = index.documents.filter((d) => {
+      if (
+        d.status === 'candidate' ||
+        d.status === 'draft' ||
+        d.status === 'retracted' ||
+        d.status === 'superseded' ||
+        d.synthetic === true
+      ) {
+        return false;
+      }
+      if (cutoffTimestamp && d.created_at > cutoffTimestamp) return false;
+      return true;
+    });
+
+    const frozenDocuments = [];
+    const frozenDfMap = {};
+    for (const d of eligibleDocs) {
+      const absPath = path.resolve(this.workspaceRoot, d.path);
+      const rawContent =
+        this._isPathInsideWorkspace(absPath) && fs.existsSync(absPath)
+          ? fs.readFileSync(absPath, 'utf8')
+          : d.content || d.excerpt || '';
+      const blobHash = crypto.createHash('sha256').update(rawContent, 'utf8').digest('hex');
+      const blobPath = path.join(this.snapshotBlobsDir, `${blobHash}.md`);
+      if (!fs.existsSync(blobPath)) {
+        fs.writeFileSync(blobPath, rawContent, 'utf8');
+      }
+      const tf = d.tf || d.termFreqs || {};
+      for (const tok of Object.keys(tf)) {
+        frozenDfMap[tok] = (frozenDfMap[tok] || 0) + 1;
+      }
+      frozenDocuments.push({
+        ...d,
+        content: rawContent,
+        sections: d.sections || this._extractSections(rawContent, d.title),
+        tokens: d.tokens || Object.keys(tf),
+        termFreqs: tf,
+        tf,
+        length: d.tokenCount || d.length || 0,
+        tokenCount: d.tokenCount || d.length || 0,
+        vector: d.vector,
+        blobHash
+      });
+    }
+
+    const frozenAvgDocLen =
+      frozenDocuments.length > 0
+        ? frozenDocuments.reduce((acc, doc) => acc + (doc.tokenCount || 0), 0) / frozenDocuments.length
+        : 1;
+    const eligibleDocIds = frozenDocuments.map((d) => d.docid);
 
     const lockPayload = {
+      ok: true,
       active: true,
       snapshotId,
+      ownerRunId: effectiveOwner,
       createdAt: new Date().toISOString(),
       cutoffTimestamp: cutoff,
       gitRevision: this.getGitRevision(),
@@ -774,7 +890,10 @@ export class HarnessKnowledgeEngine {
       mode,
       description,
       eligibleDocCount: eligibleDocIds.length,
-      eligibleDocIds
+      eligibleDocIds,
+      avgDocLen: frozenAvgDocLen,
+      dfMap: frozenDfMap,
+      frozenDocuments
     };
 
     fs.writeFileSync(
@@ -786,8 +905,40 @@ export class HarnessKnowledgeEngine {
     return lockPayload;
   }
 
-  releaseSnapshotLock() {
+  releaseSnapshotLock({
+    snapshotId = null,
+    snapshot_id = null,
+    ownerRunId = null,
+    owner_run_id = null,
+    force = false
+  } = {}) {
     const current = this.getActiveSnapshotLock();
+    if (!current) {
+      return {
+        released: false,
+        previousLock: null
+      };
+    }
+    const effectiveOwner = ownerRunId || owner_run_id || null;
+    const targetSnapId = snapshotId || snapshot_id || null;
+    if (!force) {
+      if (current.ownerRunId && effectiveOwner !== current.ownerRunId) {
+        return {
+          released: false,
+          error: 'SNAPSHOT_LOCK_OWNED_BY_ANOTHER_RUN',
+          ownerRunId: current.ownerRunId,
+          snapshotId: current.snapshotId
+        };
+      }
+      if (targetSnapId && current.snapshotId !== targetSnapId) {
+        return {
+          released: false,
+          error: 'SNAPSHOT_LOCK_OWNED_BY_ANOTHER_RUN',
+          ownerRunId: current.ownerRunId,
+          snapshotId: current.snapshotId
+        };
+      }
+    }
     if (fs.existsSync(this.activeLockPath)) {
       fs.unlinkSync(this.activeLockPath);
     }
@@ -802,7 +953,7 @@ export class HarnessKnowledgeEngine {
     const active = this.getActiveSnapshotLock();
     const files = fs
       .readdirSync(this.snapshotsDir)
-      .filter((f) => f.startsWith('SNAP-') && f.endsWith('.json'));
+      .filter((f) => SNAPSHOT_ID_REGEX.test(f.replace(/\.json$/i, '')) && f.endsWith('.json'));
     const snapshots = [];
     for (const f of files) {
       try {
@@ -818,16 +969,45 @@ export class HarnessKnowledgeEngine {
     return snapshots.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
   }
 
-  _resolveSnapshotFilter(snapshotIdParam) {
+  resolveSnapshotLock(snapshotIdParam = null) {
     const config = this.loadConfig();
-    if (snapshotIdParam) {
-      const snapFile = path.join(this.snapshotsDir, `${snapshotIdParam}.json`);
-      if (fs.existsSync(snapFile)) {
-        try {
-          return JSON.parse(fs.readFileSync(snapFile, 'utf8'));
-        } catch {
-          // fallback
+    if (snapshotIdParam !== null && snapshotIdParam !== undefined && snapshotIdParam !== '') {
+      const rawId = String(snapshotIdParam);
+      if (typeof snapshotIdParam !== 'string' || !SNAPSHOT_ID_REGEX.test(rawId)) {
+        return {
+          invalidSnapshot: true,
+          snapshotId: snapshotIdParam,
+          error: 'INVALID_OR_MISSING_SNAPSHOT'
+        };
+      }
+      const snapFile = path.resolve(this.snapshotsDir, `${rawId}.json`);
+      if (
+        !this._isPathInsideWorkspace(snapFile) ||
+        path.dirname(snapFile) !== path.resolve(this.snapshotsDir) ||
+        !fs.existsSync(snapFile)
+      ) {
+        return {
+          invalidSnapshot: true,
+          snapshotId: snapshotIdParam,
+          error: 'INVALID_OR_MISSING_SNAPSHOT'
+        };
+      }
+      try {
+        const parsed = JSON.parse(fs.readFileSync(snapFile, 'utf8'));
+        if (!parsed || typeof parsed !== 'object') {
+          return {
+            invalidSnapshot: true,
+            snapshotId: snapshotIdParam,
+            error: 'INVALID_OR_MISSING_SNAPSHOT'
+          };
         }
+        return parsed;
+      } catch {
+        return {
+          invalidSnapshot: true,
+          snapshotId: snapshotIdParam,
+          error: 'INVALID_OR_MISSING_SNAPSHOT'
+        };
       }
     }
     if (config.harness2?.strictSnapshotIsolation !== false) {
@@ -836,12 +1016,33 @@ export class HarnessKnowledgeEngine {
     return null;
   }
 
+  _resolveSnapshotFilter(snapshotIdParam) {
+    return this.resolveSnapshotLock(snapshotIdParam);
+  }
+
   _isDocEligibleForSnapshot(doc, snapLock, includeCandidates = false) {
     if (!snapLock) {
-      if (!includeCandidates && doc.status === 'candidate') return false;
+      if (
+        !includeCandidates &&
+        (doc.status === 'candidate' ||
+          doc.status === 'draft' ||
+          doc.status === 'retracted' ||
+          doc.status === 'superseded' ||
+          doc.synthetic === true)
+      ) {
+        return false;
+      }
       return true;
     }
-    if (doc.status === 'candidate') return false;
+    if (
+      doc.status === 'candidate' ||
+      doc.status === 'draft' ||
+      doc.status === 'retracted' ||
+      doc.status === 'superseded' ||
+      doc.synthetic === true
+    ) {
+      return false;
+    }
     if (Array.isArray(snapLock.eligibleDocIds)) {
       return snapLock.eligibleDocIds.includes(doc.docid);
     }
@@ -859,16 +1060,45 @@ export class HarnessKnowledgeEngine {
     status = 'active',
     topK = 8,
     snapshot_id = null,
+    snapshotId = null,
     include_candidates = false,
     snippetMaxChars = null
   } = {}) {
+    const effectiveSnapshotId = snapshot_id ?? snapshotId ?? null;
+    const snapLock = this.resolveSnapshotLock(effectiveSnapshotId);
+    if (snapLock && snapLock.invalidSnapshot) {
+      return {
+        ok: false,
+        error: 'INVALID_OR_MISSING_SNAPSHOT',
+        query: queryText,
+        mode,
+        totalEligible: 0,
+        results: [],
+        snapshotIsolation: {
+          active: false,
+          invalidSnapshot: true,
+          error: 'INVALID_OR_MISSING_SNAPSHOT',
+          snapshotId: effectiveSnapshotId
+        }
+      };
+    }
+
     const index = this.loadOrBuildIndex();
-    const snapLock = this._resolveSnapshotFilter(snapshot_id);
+    const useFrozenDocs = Boolean(snapLock && Array.isArray(snapLock.frozenDocuments));
+    const sourceDocs = useFrozenDocs ? snapLock.frozenDocuments : index.documents;
     let filteredBySnapshotCount = 0;
 
-    const candidates = index.documents.filter((doc) => {
+    if (snapLock) {
+      for (const liveDoc of index.documents) {
+        if (!this._isDocEligibleForSnapshot(liveDoc, snapLock, include_candidates)) {
+          filteredBySnapshotCount++;
+        }
+      }
+    }
+
+    const candidates = sourceDocs.filter((doc) => {
       if (!this._isDocEligibleForSnapshot(doc, snapLock, include_candidates)) {
-        filteredBySnapshotCount++;
+        if (!snapLock) filteredBySnapshotCount++;
         return false;
       }
       if (collection && collection !== 'all' && doc.collection !== collection) return false;
@@ -879,6 +1109,7 @@ export class HarnessKnowledgeEngine {
 
     if (!queryText || !queryText.trim()) {
       return {
+        ok: true,
         query: queryText,
         mode,
         totalEligible: candidates.length,
@@ -896,20 +1127,29 @@ export class HarnessKnowledgeEngine {
 
     const qTokens = tokenize(queryText, false);
     const qVec = computeDenseVector(queryText, qTokens);
-    const N = Math.max(1, index.totalDocuments || candidates.length);
-    const avgLen = Math.max(1, index.avgDocLen || 100);
+    const activeDfMap = (useFrozenDocs && snapLock.dfMap) || index.dfMap || {};
+    const N = Math.max(
+      1,
+      useFrozenDocs ? snapLock.frozenDocuments.length : index.totalDocuments || candidates.length
+    );
+    const avgLen = Math.max(
+      1,
+      (useFrozenDocs && snapLock.avgDocLen) || index.avgDocLen || 100
+    );
     const k1 = 1.5;
     const b = 0.75;
 
     const scored = candidates.map((doc) => {
       // 1. BM25 score
       let bm25 = 0;
+      const docTf = doc.tf || doc.termFreqs || {};
+      const docLen = doc.tokenCount || doc.length || 1;
       for (const qt of qTokens) {
-        const tf = doc.tf?.[qt] || 0;
+        const tf = docTf[qt] || 0;
         if (tf > 0) {
-          const df = index.dfMap?.[qt] || 1;
+          const df = activeDfMap[qt] || 1;
           const idf = Math.log(1 + (N - df + 0.5) / (df + 0.5));
-          const denom = tf + k1 * (1 - b + b * ((doc.tokenCount || 1) / avgLen));
+          const denom = tf + k1 * (1 - b + b * (docLen / avgLen));
           bm25 += idf * ((tf * (k1 + 1)) / denom);
         }
       }
@@ -980,6 +1220,7 @@ export class HarnessKnowledgeEngine {
       );
 
     return {
+      ok: true,
       query: queryText,
       mode,
       collection,
@@ -1024,12 +1265,29 @@ export class HarnessKnowledgeEngine {
     };
   }
 
-  getDocument(identifier, { snapshot_id = null, include_candidates = false } = {}) {
+  getDocument(identifier, optionsOrSnapshotId = {}) {
+    const opts =
+      typeof optionsOrSnapshotId === 'string'
+        ? { snapshot_id: optionsOrSnapshotId }
+        : optionsOrSnapshotId || {};
+    const effectiveSnapshotId = opts.snapshot_id ?? opts.snapshotId ?? null;
+    const include_candidates = Boolean(opts.include_candidates ?? opts.includeCandidates);
+    const snapLock = this.resolveSnapshotLock(effectiveSnapshotId);
+    if (snapLock && snapLock.invalidSnapshot) {
+      return {
+        found: false,
+        invalidSnapshot: true,
+        snapshotId: effectiveSnapshotId,
+        error: 'INVALID_OR_MISSING_SNAPSHOT'
+      };
+    }
+
     const index = this.loadOrBuildIndex();
-    const snapLock = this._resolveSnapshotFilter(snapshot_id);
+    const useFrozenDocs = Boolean(snapLock && Array.isArray(snapLock.frozenDocuments));
+    const sourceDocs = useFrozenDocs ? snapLock.frozenDocuments : index.documents;
     const normId = String(identifier || '').trim().replace(/\\/g, '/');
 
-    const eligibleDocs = index.documents.filter((d) =>
+    const eligibleDocs = sourceDocs.filter((d) =>
       this._isDocEligibleForSnapshot(d, snapLock, include_candidates)
     );
 
@@ -1038,14 +1296,15 @@ export class HarnessKnowledgeEngine {
         d.docid.toLowerCase() === normId.toLowerCase() ||
         d.path.toLowerCase() === normId.toLowerCase() ||
         d.path.toLowerCase().endsWith(normId.toLowerCase()) ||
-        d.task_id.toLowerCase() === normId.toLowerCase()
+        (d.task_id && d.task_id.toLowerCase() === normId.toLowerCase())
     );
 
     if (!match) {
       const blockedMatch = index.documents.find(
         (d) =>
           d.docid.toLowerCase() === normId.toLowerCase() ||
-          d.path.toLowerCase().endsWith(normId.toLowerCase())
+          d.path.toLowerCase().endsWith(normId.toLowerCase()) ||
+          (d.task_id && d.task_id.toLowerCase() === normId.toLowerCase())
       );
       if (blockedMatch && snapLock) {
         return {
@@ -1066,8 +1325,25 @@ export class HarnessKnowledgeEngine {
       };
     }
 
-    const absPath = path.resolve(this.workspaceRoot, match.path);
-    const content = fs.existsSync(absPath) ? fs.readFileSync(absPath, 'utf8') : match.excerpt;
+    let content = match.excerpt || '';
+    if (useFrozenDocs) {
+      if (match.blobHash) {
+        const blobPath = path.join(this.snapshotBlobsDir, `${match.blobHash}.md`);
+        if (this._isPathInsideWorkspace(blobPath) && fs.existsSync(blobPath)) {
+          content = fs.readFileSync(blobPath, 'utf8');
+        } else if (typeof match.content === 'string') {
+          content = match.content;
+        }
+      } else if (typeof match.content === 'string') {
+        content = match.content;
+      }
+    } else {
+      const absPath = path.resolve(this.workspaceRoot, match.path);
+      content =
+        this._isPathInsideWorkspace(absPath) && fs.existsSync(absPath)
+          ? fs.readFileSync(absPath, 'utf8')
+          : match.content || match.excerpt || '';
+    }
 
     return {
       found: true,
@@ -1078,20 +1354,36 @@ export class HarnessKnowledgeEngine {
       domain: match.domain,
       task_id: match.task_id,
       status: match.status,
+      synthetic: Boolean(match.synthetic),
       repo: match.repo,
       git_revision: match.git_revision,
       created_at: match.created_at,
       cue: match.cue,
       tags: match.tags,
       evidence_links: match.evidence_links,
+      blobHash: match.blobHash,
+      fromImmutableSnapshot: useFrozenDocs,
       content
     };
   }
 
   multiGet(identifiersOrPattern, options = {}) {
+    const snapLock = this.resolveSnapshotLock(options.snapshot_id);
+    if (snapLock && snapLock.invalidSnapshot) {
+      return {
+        ok: false,
+        error: 'INVALID_OR_MISSING_SNAPSHOT',
+        invalidSnapshot: true,
+        snapshotId: options.snapshot_id,
+        count: 0,
+        documents: []
+      };
+    }
+
     const index = this.loadOrBuildIndex();
-    const snapLock = this._resolveSnapshotFilter(options.snapshot_id);
-    const eligibleDocs = index.documents.filter((d) =>
+    const useFrozenDocs = Boolean(snapLock && Array.isArray(snapLock.frozenDocuments));
+    const sourceDocs = useFrozenDocs ? snapLock.frozenDocuments : index.documents;
+    const eligibleDocs = sourceDocs.filter((d) =>
       this._isDocEligibleForSnapshot(d, snapLock, options.include_candidates)
     );
 
@@ -1123,6 +1415,7 @@ export class HarnessKnowledgeEngine {
     }
 
     return {
+      ok: true,
       count: matchedDocs.size,
       documents: Array.from(matchedDocs.values())
     };
@@ -1205,6 +1498,7 @@ export class HarnessKnowledgeEngine {
     observed_behavior,
     supporting_evidence = [],
     status = 'active',
+    synthetic = false,
     tags = ['harness2', 'experience'],
     adopted_harness = null
   }) {
@@ -1216,21 +1510,31 @@ export class HarnessKnowledgeEngine {
     const safeTaskId = task_id.toLowerCase().replace(/[^a-z0-9_-]/g, '-');
     const gitRev = this.getGitRevision();
     const nowIso = new Date().toISOString();
-    const docid = `EXP-${safeDomain.slice(0, 4).toUpperCase()}-${safeTaskId.slice(0, 16).toUpperCase()}`;
+    const domPrefix = safeDomain.slice(0, 4).toUpperCase();
+    const slug = safeTaskId.slice(0, 16).toUpperCase();
+    const hash6 = crypto.createHash('sha1').update(String(task_id)).digest('hex').slice(0, 6).toUpperCase();
+    const docid = `EXP-${domPrefix}-${slug}-${hash6}`;
 
     const taskDir = path.join(this.harnessDir, 'library', safeDomain, 'harnesses', safeTaskId);
     const harnessSubdir = path.join(taskDir, 'harness');
     fs.mkdirSync(harnessSubdir, { recursive: true });
 
     const manifestPath = path.join(harnessSubdir, 'manifest.json');
-    const manifestPayload = adopted_harness || {
-      harness_id: `harness-${safeDomain}-${safeTaskId}`,
-      task_id: safeTaskId,
-      domain: safeDomain,
-      adopted_at: nowIso,
-      git_revision: gitRev,
-      status
-    };
+    const manifestPayload = adopted_harness
+      ? {
+          ...adopted_harness,
+          status: adopted_harness.status || status,
+          synthetic: Boolean(adopted_harness.synthetic ?? synthetic)
+        }
+      : {
+          harness_id: `harness-${safeDomain}-${safeTaskId}`,
+          task_id: safeTaskId,
+          domain: safeDomain,
+          adopted_at: nowIso,
+          git_revision: gitRev,
+          status,
+          synthetic: Boolean(synthetic)
+        };
     fs.writeFileSync(manifestPath, JSON.stringify(manifestPayload, null, 2) + '\n', 'utf8');
 
     const relManifestPath = path.relative(this.workspaceRoot, manifestPath).replace(/\\/g, '/');
@@ -1254,6 +1558,7 @@ export class HarnessKnowledgeEngine {
       `domain: ${safeDomain}`,
       `task_id: ${safeTaskId}`,
       `status: ${status}`,
+      `synthetic: ${Boolean(synthetic)}`,
       'repo: Harness2-RAG-antigravity',
       `git_revision: ${gitRev}`,
       `created_at: "${nowIso}"`,
@@ -1289,8 +1594,8 @@ export class HarnessKnowledgeEngine {
     const expFilePath = path.join(taskDir, 'EXPERIENCE.md');
     fs.writeFileSync(expFilePath, expMd, 'utf8');
 
-    // Update domain INDEX.md and root INDEX.md when status === 'active'
-    if (status === 'active') {
+    // Update domain INDEX.md and root INDEX.md only when status === 'active' and not synthetic
+    if (status === 'active' && !synthetic) {
       const domainIndexPath = path.join(this.harnessDir, 'library', safeDomain, 'INDEX.md');
       if (!fs.existsSync(domainIndexPath)) {
         fs.writeFileSync(
@@ -1330,6 +1635,7 @@ export class HarnessKnowledgeEngine {
       }
     }
 
+    const relExpPath = path.relative(this.workspaceRoot, expFilePath).replace(/\\/g, '/');
     const updatedIndex = this.buildIndex();
     return {
       recorded: true,
@@ -1337,17 +1643,55 @@ export class HarnessKnowledgeEngine {
       task_id: safeTaskId,
       domain: safeDomain,
       status,
-      experiencePath: path.relative(this.workspaceRoot, expFilePath).replace(/\\/g, '/'),
+      synthetic: Boolean(synthetic),
+      experiencePath: relExpPath,
+      relativePath: relExpPath,
       manifestPath: relManifestPath,
       totalIndexedDocuments: updatedIndex.totalDocuments
     };
   }
 
-  promoteExperienceToProjectKnowledge({ task_id_or_docid, adr_id, title, summary }) {
-    const expDoc = this.getDocument(task_id_or_docid, { include_candidates: true });
+  promoteExperienceToProjectKnowledge({
+    task_id_or_docid,
+    experienceDocId,
+    adr_id,
+    title,
+    summary,
+    evaluationReceipt = null,
+    evaluation_receipt = null,
+    verified = undefined
+  } = {}) {
+    const targetId = task_id_or_docid || experienceDocId;
+    const expDoc = this.getDocument(targetId, { include_candidates: true });
     if (!expDoc.found) {
-      throw new Error(`Cannot promote: Experience '${task_id_or_docid}' not found.`);
+      throw new Error(`Cannot promote: Experience '${targetId}' not found.`);
     }
+    const receipt = evaluationReceipt ?? evaluation_receipt ?? null;
+    const hasValidReceipt = Boolean(
+      receipt && (typeof receipt !== 'object' || receipt.passed !== false)
+    );
+    const isUnverifiedOrCandidate =
+      expDoc.status === 'candidate' ||
+      expDoc.status === 'draft' ||
+      expDoc.status === 'retracted' ||
+      expDoc.status === 'superseded' ||
+      expDoc.synthetic === true;
+
+    if (
+      verified === false ||
+      (receipt && typeof receipt === 'object' && receipt.passed === false) ||
+      (isUnverifiedOrCandidate && !hasValidReceipt && verified !== true)
+    ) {
+      return {
+        ok: false,
+        promoted: false,
+        error: 'PROMOTION_REQUIRES_EVALUATION_RECEIPT',
+        docid: expDoc.docid,
+        status: expDoc.status,
+        synthetic: Boolean(expDoc.synthetic)
+      };
+    }
+
     const slug = (adr_id || `ADR-PROMOTED-${expDoc.task_id || expDoc.docid}`)
       .replace(/[^a-zA-Z0-9_-]/g, '-');
     const nowIso = new Date().toISOString();
@@ -1386,10 +1730,12 @@ export class HarnessKnowledgeEngine {
     this.buildIndex();
 
     return {
+      ok: true,
       promoted: true,
       adrDocId: slug.toUpperCase(),
       adrPath: path.relative(this.workspaceRoot, adrPath).replace(/\\/g, '/'),
-      sourceExperience: expDoc.path
+      sourceExperience: expDoc.path,
+      evaluationReceipt: receipt || undefined
     };
   }
 
@@ -1499,6 +1845,19 @@ export class HarnessKnowledgeEngine {
             ? Boolean(options.adoptWinner)
             : true;
 
+    const explicitArtifacts = Array.isArray(options.requiredArtifacts || options.required_artifacts)
+      ? options.requiredArtifacts || options.required_artifacts
+      : [];
+    const inferredArtifactMatch = problem.match(
+      /\b([A-Za-z0-9_./-]*REQUIRED_ARTIFACT[A-Za-z0-9_./-]*\.[a-z0-9]+)\b/i
+    );
+    const requiredArtifacts = [...explicitArtifacts];
+    if (inferredArtifactMatch && !requiredArtifacts.includes(inferredArtifactMatch[1])) {
+      requiredArtifacts.push(inferredArtifactMatch[1]);
+    }
+    const evaluator = typeof options.evaluator === 'function' ? options.evaluator : null;
+    const allowSimulation = options.allowSimulation ?? options.allow_simulation ?? true;
+
     // 1. Freeze Snapshot Isolation Lock
     const lock = this.createSnapshotLock({
       domain,
@@ -1581,6 +1940,192 @@ export class HarnessKnowledgeEngine {
         });
       }
 
+      // Enforce requiredArtifacts verification if specified
+      if (requiredArtifacts.length > 0) {
+        const missingArtifacts = [];
+        for (const reqFile of requiredArtifacts) {
+          const absFile = path.resolve(this.workspaceRoot, String(reqFile));
+          const existsAndNonEmpty =
+            this._isPathInsideWorkspace(absFile) &&
+            fs.existsSync(absFile) &&
+            fs.statSync(absFile).isFile() &&
+            fs.statSync(absFile).size > 0;
+          if (!existsAndNonEmpty) {
+            missingArtifacts.push(String(reqFile));
+          }
+        }
+        if (missingArtifacts.length > 0) {
+          const failedTrajectories = candidates.map((cand) => ({
+            candidateId: cand.candidateId,
+            front: cand.front,
+            frontLabel: cand.frontLabel,
+            modelTier: cand.modelTier,
+            workspaceMode: cand.workspaceMode,
+            passedVerification: false,
+            verificationScore: 0,
+            stepsExecuted: 0,
+            toolErrors: 1,
+            promptTokens: 0,
+            thoughtsTokens: 0,
+            outputTokens: 0,
+            totalTokens: 0,
+            tokensSaved: 0,
+            tokensSavedPct: 0,
+            earlyStopped: false,
+            observedSummary: `Verification failed: required artifact(s) missing: ${missingArtifacts.join(', ')}`,
+            evidencePaths: [],
+          }));
+          return {
+            ok: false,
+            status: 'failed',
+            error: 'REQUIRED_ARTIFACT_MISSING',
+            missingArtifacts,
+            passedVerification: false,
+            verificationScore: 0,
+            synthetic: false,
+            executionMode: 'artifact-verification',
+            runId: `h2-run-${Date.now()}`,
+            completedAt: new Date().toISOString(),
+            taskId,
+            domain,
+            problem,
+            k,
+            mode,
+            snapshotId,
+            reasoningProfile: profile,
+            candidates,
+            proposals: candidates,
+            probeTrajectories: failedTrajectories,
+            trajectories: failedTrajectories,
+            winnerCandidateId: null,
+            winnerScore: 0,
+            winner: {
+              candidateId: null,
+              score: 0,
+              verificationScore: 0,
+              passedVerification: false,
+              totalTokens: 0,
+            },
+            tokenEfficiency: {
+              totalActualTokens: 0,
+              totalUnoptimizedTokens: null,
+              totalTokensSaved: 0,
+              totalTokensSavedPct: 0,
+              earlyStopped: false,
+            },
+            composedHarness: null,
+            recordedExperience: null,
+          };
+        }
+      }
+
+      // Enforce allowSimulation === false guard when no evaluator or verified artifacts exist
+      if (allowSimulation === false && !evaluator && requiredArtifacts.length === 0) {
+        return {
+          ok: false,
+          status: 'failed',
+          error: 'NO_VERIFIED_EXECUTION_OR_EVALUATOR',
+          passedVerification: false,
+          verificationScore: null,
+          synthetic: false,
+          executionMode: 'verified-required',
+          runId: `h2-run-${Date.now()}`,
+          completedAt: new Date().toISOString(),
+          taskId,
+          domain,
+          problem,
+          k,
+          mode,
+          snapshotId,
+          reasoningProfile: profile,
+          candidates,
+          proposals: candidates,
+          probeTrajectories: [],
+          trajectories: [],
+          winnerCandidateId: null,
+          winnerScore: 0,
+          winner: {
+            candidateId: null,
+            score: 0,
+            verificationScore: 0,
+            passedVerification: false,
+            totalTokens: 0,
+          },
+          tokenEfficiency: {
+            totalActualTokens: 0,
+            totalUnoptimizedTokens: null,
+            totalTokensSaved: 0,
+            totalTokensSavedPct: 0,
+            earlyStopped: false,
+          },
+          composedHarness: null,
+          recordedExperience: null,
+        };
+      }
+
+      // Run explicit evaluator if provided
+      let evaluatorReceipt = null;
+      if (evaluator) {
+        const evalRes = evaluator({
+          workspaceRoot: this.workspaceRoot,
+          taskId,
+          domain,
+          problem,
+          candidates,
+          snapshotId,
+        });
+        const evalPassed =
+          evalRes === true ||
+          (evalRes && typeof evalRes === 'object' && evalRes.passed !== false && evalRes.ok !== false);
+        if (!evalPassed) {
+          const evalScore = Number(evalRes?.score ?? 0);
+          return {
+            ok: false,
+            status: 'failed',
+            error: (evalRes && evalRes.error) || 'EVALUATOR_VERIFICATION_FAILED',
+            passedVerification: false,
+            verificationScore: evalScore,
+            synthetic: false,
+            executionMode: 'evaluated',
+            runId: `h2-run-${Date.now()}`,
+            completedAt: new Date().toISOString(),
+            taskId,
+            domain,
+            problem,
+            k,
+            mode,
+            snapshotId,
+            reasoningProfile: profile,
+            candidates,
+            proposals: candidates,
+            probeTrajectories: [],
+            trajectories: [],
+            winnerCandidateId: null,
+            winnerScore: evalScore,
+            winner: {
+              candidateId: null,
+              score: evalScore,
+              verificationScore: evalScore,
+              passedVerification: false,
+              totalTokens: 0,
+            },
+            tokenEfficiency: {
+              totalActualTokens: 0,
+              totalUnoptimizedTokens: null,
+              totalTokensSaved: 0,
+              totalTokensSavedPct: 0,
+              earlyStopped: false,
+            },
+            composedHarness: null,
+            recordedExperience: null,
+          };
+        }
+        evaluatorReceipt =
+          typeof evalRes === 'object' ? evalRes : { passed: true, verifiedAt: new Date().toISOString() };
+      }
+
+      const isSimulation = !evaluator && requiredArtifacts.length === 0;
+
       // Reference unoptimized baseline (what an unbounded deep run without Cue-First pruning costs)
       const unoptimizedPerCandidateTokens = 8_200 + 6_400 + 2_100; // 16,700 tokens/candidate
       const baselineTrajectory = {
@@ -1628,6 +2173,7 @@ export class HarnessKnowledgeEngine {
             tokensSaved: unoptimizedPerCandidateTokens,
             tokensSavedPct: 100.0,
             earlyStopped: true,
+            synthetic: isSimulation,
             observedSummary: `Skipped via Early-Stop Token Guardrail because an earlier candidate already passed 100% of verification checks with 0 tool errors.`,
           });
           continue;
@@ -1687,10 +2233,12 @@ export class HarnessKnowledgeEngine {
           tokensSaved: savedTok,
           tokensSavedPct: savedPct,
           earlyStopped: false,
+          synthetic: isSimulation,
           observedSummary:
             `[${cand.frontLabel}] Probed in Workspace:${cand.workspaceMode} (model=${cand.modelTier}, thinkingCap=${cand.thinkingBudgetTokens}) under snapshot '${snapshotId}'. ` +
             `Retrieved ${expHits.results.length} experience cues & ${projHits.results.length} ADRs; passed verification (score=${score}) in ${stepsUsed} steps using ${totalTok.toLocaleString()} tokens (${savedPct}% saved vs unbounded baseline).`,
           evidencePaths: [
+            ...requiredArtifacts.map((a) => String(a)),
             ...(expHits.results || []).slice(0, 2).map((r) => r.path),
             ...(projHits.results || []).slice(0, 1).map((r) => r.path),
           ],
@@ -1711,6 +2259,7 @@ export class HarnessKnowledgeEngine {
         ((totalTokensSaved / Math.max(1, totalUnoptimizedTokens)) * 100).toFixed(1)
       );
 
+      const effectiveRecordStatus = isSimulation ? 'candidate' : 'active';
       const composedHarness = {
         harness_id: `harness-${domain}-${taskId}`,
         task_id: taskId,
@@ -1757,7 +2306,8 @@ export class HarnessKnowledgeEngine {
         },
         adopted_at: new Date().toISOString(),
         git_revision: this.getGitRevision(),
-        status: 'active',
+        status: effectiveRecordStatus,
+        synthetic: isSimulation,
       };
 
       let recordedExperience = null;
@@ -1776,7 +2326,8 @@ export class HarnessKnowledgeEngine {
             ...(winner.evidencePaths || []),
             'adapters/harness2_antigravity_executor.py',
           ],
-          status: 'active',
+          status: effectiveRecordStatus,
+          synthetic: isSimulation,
           tags: ['harness2', 'propose-probe-compose', `depth-${profile.reasoningDepth}`, 'token-efficient', domain],
           adopted_harness: composedHarness,
         });
@@ -1784,6 +2335,12 @@ export class HarnessKnowledgeEngine {
 
       const runReport = {
         ok: true,
+        status: isSimulation ? 'simulated' : 'succeeded',
+        synthetic: isSimulation,
+        executionMode: isSimulation ? 'simulation' : 'verified',
+        passedVerification: winner.passedVerification,
+        verificationScore: winner.verificationScore,
+        evaluatorReceipt: evaluatorReceipt || undefined,
         runId: `h2-run-${Date.now()}`,
         completedAt: new Date().toISOString(),
         taskId,
@@ -1812,6 +2369,7 @@ export class HarnessKnowledgeEngine {
           verificationScore: winner.verificationScore,
           passedVerification: winner.passedVerification,
           totalTokens: winner.totalTokens,
+          synthetic: isSimulation,
         },
         tokenEfficiency: {
           totalActualTokens,
@@ -1819,6 +2377,7 @@ export class HarnessKnowledgeEngine {
           totalTokensSaved,
           totalTokensSavedPct,
           earlyStopped: probeTrajectories.some((p) => p.earlyStopped === true),
+          synthetic: isSimulation,
         },
         composedHarness,
         recordedExperience,

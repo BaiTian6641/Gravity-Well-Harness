@@ -59,7 +59,21 @@ function copyDirRecursive(src, dest) {
 }
 
 async function enablePluginLive(pluginDirName, enabled = true) {
-  // 1. Try Language Server RPC (JetboxWriteState) per plugin skill guidelines
+  // 1. Primary Public Path: atomic BOM-safe ~/.gemini/config/config.json update (F07)
+  let configOk = false;
+  let configError = null;
+  try {
+    const cfg = readJsonSafe(CONFIG_JSON_PATH, {});
+    cfg.plugins = cfg.plugins || {};
+    cfg.plugins[pluginDirName] = { ...(cfg.plugins[pluginDirName] || {}), enabled };
+    writeJsonNoBom(CONFIG_JSON_PATH, cfg);
+    configOk = true;
+  } catch (err) {
+    configError = err?.message;
+  }
+
+  // 2. Optional Best-Effort Sidecar Adapter Notification (never required for correctness)
+  let rpcOk = false;
   try {
     await callLsRpc('JetboxWriteState', {
       userConfig: {
@@ -68,19 +82,27 @@ async function enablePluginLive(pluginDirName, enabled = true) {
         },
       },
     });
-    return { method: 'LanguageServerRPC (JetboxWriteState)', ok: true };
+    rpcOk = true;
   } catch {
-    // 2. Fallback to atomic BOM-safe config.json update
-    try {
-      const cfg = readJsonSafe(CONFIG_JSON_PATH, {});
-      cfg.plugins = cfg.plugins || {};
-      cfg.plugins[pluginDirName] = { ...(cfg.plugins[pluginDirName] || {}), enabled };
-      writeJsonNoBom(CONFIG_JSON_PATH, cfg);
-      return { method: 'config.json (atomic)', ok: true };
-    } catch (err) {
-      return { method: 'none', ok: false, error: err?.message };
-    }
+    // Non-fatal: public config.json registration is authoritative
   }
+
+  return {
+    method: configOk
+      ? rpcOk
+        ? 'config.json (public) + optional LS notification'
+        : 'config.json (public atomic)'
+      : rpcOk
+        ? 'LS notification fallback'
+        : 'none',
+    ok: configOk || rpcOk,
+    stages: {
+      registered: configOk,
+      enabled: configOk || rpcOk,
+      liveRpcNotified: rpcOk,
+    },
+    error: configError,
+  };
 }
 
 async function uninstallAll() {
@@ -114,7 +136,7 @@ async function main() {
   console.log('  Harness² + Local RAG Antigravity IDE Installer (harness-ide)');
   console.log('================================================================');
 
-  // 1. Sync latest secret-vault.mjs, rag-engine.mjs and model-hub.mjs into plugin and sidecar
+  // 1. Sync latest secret-vault.mjs, rag-engine.mjs, model-hub.mjs, and context-resilience.mjs into plugin and sidecar
   const masterVaultPath = path.join(REPO_ROOT, 'src', 'secret-vault.mjs');
   fs.copyFileSync(masterVaultPath, path.join(SOURCE_PLUGIN_DIR, 'scripts', 'secret-vault.mjs'));
   fs.copyFileSync(masterVaultPath, path.join(SOURCE_SIDECAR_DIR, 'secret-vault.mjs'));
@@ -126,6 +148,12 @@ async function main() {
   const masterHubPath = path.join(REPO_ROOT, 'src', 'model-hub.mjs');
   fs.copyFileSync(masterHubPath, path.join(SOURCE_PLUGIN_DIR, 'scripts', 'model-hub.mjs'));
   fs.copyFileSync(masterHubPath, path.join(SOURCE_SIDECAR_DIR, 'model-hub.mjs'));
+
+  const masterResiliencePath = path.join(REPO_ROOT, 'src', 'context-resilience.mjs');
+  if (fs.existsSync(masterResiliencePath)) {
+    fs.copyFileSync(masterResiliencePath, path.join(SOURCE_PLUGIN_DIR, 'scripts', 'context-resilience.mjs'));
+    fs.copyFileSync(masterResiliencePath, path.join(SOURCE_SIDECAR_DIR, 'context-resilience.mjs'));
+  }
 
   // 2. Build/verify local RAG index in workspace
   const engine = new HarnessKnowledgeEngine(REPO_ROOT);
@@ -166,11 +194,14 @@ async function main() {
         : '';
 
       if (livePort > 0) {
-        // 1. Try clean zero-exit reload endpoint if supported
+        // 1. Try clean zero-exit reload endpoint if supported (POST per F09)
         try {
           const r = await fetch(`http://127.0.0.1:${livePort}/api/reload`, {
-            method: 'GET',
-            headers: token ? { 'X-Sidecar-Token': token } : {},
+            method: 'POST',
+            headers: {
+              Origin: `http://127.0.0.1:${livePort}`,
+              ...(token ? { 'X-Sidecar-Token': token } : {}),
+            },
           });
           if (r.ok) {
             hotReloaded = true;

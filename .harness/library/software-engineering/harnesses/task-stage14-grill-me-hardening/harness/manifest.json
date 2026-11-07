@@ -1,0 +1,9 @@
+{
+  "harness_id": "harness-software-engineering-task-stage14-grill-me-hardening",
+  "task_id": "task-stage14-grill-me-hardening",
+  "domain": "software-engineering",
+  "adopted_at": "2026-11-07T21:41:07.545Z",
+  "git_revision": "c619f9d",
+  "status": "active",
+  "synthetic": false
+}

@@ -76,28 +76,7 @@ function loadSubagentLifecycle(workspaceRoot) {
     } catch {}
   }
 
-  // Auto-complete any recalled subagent whose active recall window has expired
-  const nowMs = Date.now();
-  let mutated = false;
-  for (const [nodeKey, entry] of Object.entries(state.nodes || {})) {
-    if (
-      entry &&
-      entry.status === 'RUNNING' &&
-      entry.autoCompleteAtMs &&
-      nowMs >= entry.autoCompleteAtMs
-    ) {
-      entry.status = 'COMPLETED';
-      entry.completedAt = new Date(nowMs).toISOString();
-      delete entry.autoCompleteAtMs;
-      mutated = true;
-    }
-  }
-  if (mutated) {
-    state.revision = (state.revision || 1) + 1;
-    saveSubagentLifecycle(workspaceRoot, state);
-  } else {
-    SUBAGENT_LIFECYCLE_MEM.set(key, state);
-  }
+  SUBAGENT_LIFECYCLE_MEM.set(key, state);
   return state;
 }
 
@@ -120,8 +99,6 @@ function mutateSubagentLifecycle(workspaceRoot, payload = {}) {
   const nodeId = payload.nodeId || '';
   const action = String(payload.action || 'recall').toLowerCase();
   const nowIso = new Date().toISOString();
-  const nowMs = Date.now();
-  const activeWindowMs = Math.max(15_000, Number(payload.durationSec || 180) * 1000);
 
   const setNodeEntry = (fId, nId, status, isRecall = false) => {
     const k = `${fId}:${nId}`;
@@ -132,7 +109,6 @@ function mutateSubagentLifecycle(workspaceRoot, payload = {}) {
       recallCount: isRecall ? (Number(prev.recallCount || 0) + 1) : Number(prev.recallCount || 0),
       recalledAt: isRecall ? nowIso : prev.recalledAt || null,
       completedAt: status === 'COMPLETED' ? nowIso : null,
-      autoCompleteAtMs: status === 'RUNNING' ? nowMs + activeWindowMs : null,
     };
   };
 
@@ -158,19 +134,30 @@ function mutateSubagentLifecycle(workspaceRoot, payload = {}) {
     }
   }
 
-  // Also synchronize telemetry.json when completing or resetting subagents
+  // Synchronize telemetry.json (both top-level subagents and per-session subagents) when completing or resetting
   if (action === 'reset' || action === 'complete' || action === 'complete_all') {
     const telFile = path.join(workspaceRoot, '.harness', 'runtime', 'telemetry.json');
     if (fs.existsSync(telFile)) {
       try {
         const tel = JSON.parse(fs.readFileSync(telFile, 'utf8'));
-        if (Array.isArray(tel.subagents)) {
-          for (const s of tel.subagents) {
+        let changed = false;
+        const markList = (list) => {
+          if (!Array.isArray(list)) return;
+          for (const s of list) {
             if (action === 'reset' || action === 'complete_all' || !nodeId || s.id === nodeId) {
-              s.status = 'COMPLETED';
-              s.completedAt = nowIso;
+              if (s.status !== 'COMPLETED') {
+                s.status = 'COMPLETED';
+                s.completedAt = nowIso;
+                changed = true;
+              }
             }
           }
+        };
+        markList(tel.subagents);
+        for (const sess of Object.values(tel.sessions || {})) {
+          markList(sess?.subagents);
+        }
+        if (changed) {
           fs.writeFileSync(telFile, JSON.stringify(tel, null, 2), 'utf8');
         }
       } catch {
@@ -182,6 +169,10 @@ function mutateSubagentLifecycle(workspaceRoot, payload = {}) {
   state.revision = (state.revision || 1) + 1;
   return saveSubagentLifecycle(workspaceRoot, state);
 }
+
+const ALLOWED_ORIGIN_RE =
+  /^(http:\/\/127\.0\.0\.1(:\d+)?(\/.*)?|http:\/\/localhost(:\d+)?(\/.*)?|vscode-webview:\/\/.*)/i;
+const MAX_POST_BODY_BYTES = 1_048_576; // 1MB
 
 // Dynamically resolve sidecar_sdk or provide a clean loopback HTTP fallback for standalone/test runs
 let SidecarAppClass = null;
@@ -195,14 +186,24 @@ try {
     constructor() {
       this.pages = new Map();
       this.apis = new Map();
+      this.apiMethods = new Map();
       this.server = null;
       this.port = 0;
     }
     page(route, handler) {
       this.pages.set(route, handler);
     }
-    api(route, handler) {
+    api(route, handler, method) {
       this.apis.set(route, handler);
+      if (!this.apiMethods.has(route)) {
+        this.apiMethods.set(route, new Set());
+      }
+      if (method) {
+        this.apiMethods.get(route).add(String(method).toUpperCase());
+      } else {
+        this.apiMethods.get(route).add('GET');
+        this.apiMethods.get(route).add('POST');
+      }
     }
     async run(portOverride) {
       const targetPort = Number(
@@ -212,12 +213,55 @@ try {
         try {
           const urlObj = new URL(req.url || '/', 'http://127.0.0.1');
           const pathname = urlObj.pathname;
+          const reqMethod = String(req.method || 'GET').toUpperCase();
 
           if (this.apis.has(pathname)) {
-            let rawBody = '';
-            for await (const chunk of req) {
-              rawBody += chunk.toString();
+            const allowedMethods = this.apiMethods.get(pathname);
+            if (allowedMethods && allowedMethods.size > 0 && !allowedMethods.has(reqMethod)) {
+              res.writeHead(405, {
+                'Content-Type': 'application/json; charset=utf-8',
+                Allow: Array.from(allowedMethods).join(', '),
+              });
+              res.end(JSON.stringify({ ok: false, error: 'Method Not Allowed' }));
+              return;
             }
+
+            if (reqMethod === 'POST') {
+              const originHeader = req.headers?.origin;
+              if (originHeader && !ALLOWED_ORIGIN_RE.test(String(originHeader).trim())) {
+                res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+                res.end(JSON.stringify({ ok: false, error: 'Forbidden Origin' }));
+                return;
+              }
+            }
+
+            let rawBody = '';
+            if (reqMethod === 'POST' || reqMethod === 'PUT' || reqMethod === 'PATCH') {
+              let totalBytes = 0;
+              const chunks = [];
+              let bodyTooLarge = false;
+              for await (const chunk of req) {
+                const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                totalBytes += buf.length;
+                if (totalBytes > MAX_POST_BODY_BYTES) {
+                  bodyTooLarge = true;
+                  break;
+                }
+                chunks.push(buf);
+              }
+              if (bodyTooLarge) {
+                res.writeHead(413, { 'Content-Type': 'application/json; charset=utf-8' });
+                res.end(
+                  JSON.stringify({
+                    ok: false,
+                    error: `Payload Too Large: exceeds ${MAX_POST_BODY_BYTES} bytes`,
+                  })
+                );
+                return;
+              }
+              rawBody = Buffer.concat(chunks).toString('utf8');
+            }
+
             let parsedBody = {};
             if (rawBody.trim()) {
               try {
@@ -269,7 +313,8 @@ try {
           res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: false, error: `Not Found: ${pathname}` }));
         } catch (err) {
-          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          const status = Number(err?.statusCode) || 500;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: false, error: err?.message || String(err) }));
         }
       });
@@ -374,6 +419,47 @@ function saveActiveWorkspaceState(workspaceRoot, conversationId = '', source = '
   } catch {}
 }
 
+export function validateAndResolveWorkspacePath(rawWorkspaceRoot) {
+  const rawStr = String(rawWorkspaceRoot || '').trim();
+  if (!rawStr) {
+    const err = new Error('Workspace path cannot be empty');
+    err.statusCode = 400;
+    throw err;
+  }
+  if (/(^|[\\/])\.\.([\\/]|$)/.test(rawStr)) {
+    const err = new Error(`Workspace path traversal denied: ${rawStr}`);
+    err.statusCode = 400;
+    throw err;
+  }
+  if (!fs.existsSync(rawStr)) {
+    const err = new Error(`Workspace path does not exist: ${rawStr}`);
+    err.statusCode = 400;
+    throw err;
+  }
+  let realPath;
+  try {
+    realPath = fs.realpathSync(rawStr);
+  } catch (e) {
+    const err = new Error(`Invalid workspace path: ${e?.message || rawStr}`);
+    err.statusCode = 400;
+    throw err;
+  }
+  let stat;
+  try {
+    stat = fs.statSync(realPath);
+  } catch {
+    const err = new Error(`Unable to stat workspace path: ${realPath}`);
+    err.statusCode = 400;
+    throw err;
+  }
+  if (!stat.isDirectory()) {
+    const err = new Error(`Workspace path is not a directory: ${realPath}`);
+    err.statusCode = 400;
+    throw err;
+  }
+  return realPath;
+}
+
 /**
  * Resolves the currently active workspace smoothly across:
  * 1. Explicit pinned/selected workspace in UI (`reqPayload.workspaceRoot`)
@@ -381,7 +467,7 @@ function saveActiveWorkspaceState(workspaceRoot, conversationId = '', source = '
  * 3. Hook-recorded active workspace (`active-workspace.json`)
  * 4. Environment / Repo fallback
  */
-async function resolveWorkspaceContext(reqPayload = {}) {
+export async function resolveWorkspaceContext(reqPayload = {}) {
   const payload = reqPayload?.body || reqPayload || {};
   let trajectoriesResponse = null;
   let lsConnected = false;
@@ -413,19 +499,20 @@ async function resolveWorkspaceContext(reqPayload = {}) {
   let chosenRoot = '';
   let resolutionSource = 'default';
 
-  // 1. If user explicitly pinned a workspace in UI (or test passed workspaceRoot)
-  if (payload.workspaceRoot && fs.existsSync(payload.workspaceRoot)) {
-    chosenRoot = path.resolve(payload.workspaceRoot);
+  const explicitRoot = payload.workspaceRoot ?? reqPayload?.query?.workspaceRoot;
+  // 1. If user explicitly pinned a workspace in UI (or test passed workspaceRoot), validate with realpathSync
+  if (explicitRoot !== undefined && explicitRoot !== null && String(explicitRoot).trim() !== '') {
+    chosenRoot = validateAndResolveWorkspacePath(explicitRoot);
     resolutionSource = payload.pinnedWorkspace ? 'user_pinned' : 'explicit_request';
   }
   // 2. If host pushed workspace or LS resolved an active trajectory workspace
   else if (lsResolved.workspacePath && fs.existsSync(lsResolved.workspacePath)) {
-    chosenRoot = path.resolve(lsResolved.workspacePath);
+    chosenRoot = fs.realpathSync(path.resolve(lsResolved.workspacePath));
     resolutionSource = `ide_${lsResolved.source || 'trajectory'}`;
   }
   // 3. If SessionStart / PostToolUse hook recently recorded an active workspace
   else if (savedState.workspaceRoot && fs.existsSync(savedState.workspaceRoot)) {
-    chosenRoot = path.resolve(savedState.workspaceRoot);
+    chosenRoot = fs.realpathSync(path.resolve(savedState.workspaceRoot));
     resolutionSource = `hook_${savedState.source || 'telemetry'}`;
   }
   // 4. Environment override
@@ -433,15 +520,15 @@ async function resolveWorkspaceContext(reqPayload = {}) {
     process.env.HARNESS_WORKSPACE_ROOT &&
     fs.existsSync(process.env.HARNESS_WORKSPACE_ROOT)
   ) {
-    chosenRoot = path.resolve(process.env.HARNESS_WORKSPACE_ROOT);
+    chosenRoot = fs.realpathSync(path.resolve(process.env.HARNESS_WORKSPACE_ROOT));
     resolutionSource = 'env';
   }
   // 5. Repo root if it exists
   else if (fs.existsSync(path.join(REPO_ROOT, '.harness'))) {
-    chosenRoot = REPO_ROOT;
+    chosenRoot = fs.realpathSync(REPO_ROOT);
     resolutionSource = 'repo_root';
   } else {
-    chosenRoot = process.cwd();
+    chosenRoot = fs.realpathSync(process.cwd());
     resolutionSource = 'cwd';
   }
 
@@ -453,8 +540,10 @@ async function resolveWorkspaceContext(reqPayload = {}) {
     if (!norm) return;
     let abs = norm;
     try {
-      abs = path.resolve(norm);
-    } catch {}
+      abs = fs.realpathSync(path.resolve(norm));
+    } catch {
+      return;
+    }
     if (!fs.existsSync(abs)) return;
     const key = abs.toLowerCase();
     if (!workspaceMap.has(key)) {
@@ -502,19 +591,29 @@ async function resolveWorkspaceContext(reqPayload = {}) {
     addCandidateWorkspace(REPO_ROOT, 'gravity_well_repo');
   }
 
-  saveActiveWorkspaceState(chosenRoot, lsResolved.conversationId || requestedConversationId, resolutionSource);
+  // Only bind activeConversationId if it belongs to chosenRoot
+  const savedMatchesRoot =
+    savedState.workspaceRoot &&
+    path.resolve(savedState.workspaceRoot).toLowerCase() === chosenRoot.toLowerCase();
+  const lsMatchesRoot =
+    lsResolved.workspacePath &&
+    path.resolve(lsResolved.workspacePath).toLowerCase() === chosenRoot.toLowerCase();
+
+  const resolvedConversationId =
+    requestedConversationId ||
+    (lsMatchesRoot ? lsResolved.conversationId : '') ||
+    (savedMatchesRoot ? savedState.conversationId : '') ||
+    process.env.ANTIGRAVITY_CONVERSATION_ID ||
+    '';
+
+  saveActiveWorkspaceState(chosenRoot, resolvedConversationId, resolutionSource);
 
   return {
     workspaceRoot: chosenRoot,
     workspaceName: extractWorkspaceName(normalizeWorkspacePath(chosenRoot)),
     hasHarness: fs.existsSync(path.join(chosenRoot, '.harness')),
     resolutionSource,
-    activeConversationId:
-      lsResolved.conversationId ||
-      requestedConversationId ||
-      savedState.conversationId ||
-      process.env.ANTIGRAVITY_CONVERSATION_ID ||
-      '',
+    activeConversationId: resolvedConversationId,
     lsConnected,
     trajectoriesResponse,
     availableWorkspaces: Array.from(workspaceMap.values()),
@@ -522,286 +621,279 @@ async function resolveWorkspaceContext(reqPayload = {}) {
 }
 
 /**
- * Scans recent Antigravity brain transcripts and computes rich step, tool, subagent,
- * and token DNA metrics for the active session.
+ * Parses a single verified transcript file for a known workspace session without enumerating
+ * or guessing unrelated global brain directories.
  */
-function scanRecentBrainTranscripts() {
-  const brainDir = path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
-  const discoveredConversations = [];
-  if (!fs.existsSync(brainDir)) return discoveredConversations;
-
+function parseTranscriptFile(convId, transcriptFile) {
+  if (!transcriptFile || !fs.existsSync(transcriptFile)) return null;
   try {
-    const entries = fs
-      .readdirSync(brainDir, { withFileTypes: true })
-      .filter((e) => e.isDirectory())
-      .map((e) => {
-        const transcriptFile = path.join(
-          brainDir,
-          e.name,
-          '.system_generated',
-          'logs',
-          'transcript.jsonl'
-        );
-        let mtimeMs = 0;
-        if (fs.existsSync(transcriptFile)) {
-          try {
-            mtimeMs = fs.statSync(transcriptFile).mtimeMs;
-          } catch {}
+    const mtimeMs = fs.statSync(transcriptFile).mtimeMs;
+    const rawLines = fs
+      .readFileSync(transcriptFile, 'utf8')
+      .split('\n')
+      .filter(Boolean);
+
+    const subagents = [];
+    const interAgentMessages = [];
+    const recentTools = [];
+    const toolCounts = {};
+    let totalSteps = rawLines.length;
+    let userTurns = 0;
+    let modelReplies = 0;
+    let readOps = 0;
+    let writeOps = 0;
+    let searchOps = 0;
+    let ragInjections = 0;
+    let skillInjections = 0;
+    let userChars = 0;
+    let assistantChars = 0;
+    let thinkingChars = 0;
+    let toolArgsChars = 0;
+    let toolResultsChars = 0;
+    let ragChars = 0;
+    let firstTimestampMs = 0;
+    let lastTimestampMs = mtimeMs;
+    let lastUserPrompt = '';
+    const stepHistory = [];
+
+    for (let idx = 0; idx < rawLines.length; idx++) {
+      try {
+        const step = JSON.parse(rawLines[idx]);
+        const stepTimeMs = step.created_at ? Date.parse(step.created_at) : 0;
+        if (stepTimeMs > 0 && (!firstTimestampMs || stepTimeMs < firstTimestampMs)) {
+          firstTimestampMs = stepTimeMs;
         }
-        return { convId: e.name, transcriptFile, mtimeMs };
-      })
-      .filter((item) => item.mtimeMs > 0)
-      .sort((a, b) => b.mtimeMs - a.mtimeMs)
-      .slice(0, 6);
+        if (stepTimeMs > lastTimestampMs) {
+          lastTimestampMs = stepTimeMs;
+        }
 
-    for (const item of entries) {
-      const rawLines = fs
-        .readFileSync(item.transcriptFile, 'utf8')
-        .split('\n')
-        .filter(Boolean);
+        const contentStr = String(step.content || '');
+        const thinkingStr = String(step.thinking || '');
 
-      const subagents = [];
-      const interAgentMessages = [];
-      const recentTools = [];
-      const toolCounts = {};
-      let totalSteps = rawLines.length;
-      let userTurns = 0;
-      let modelReplies = 0;
-      let readOps = 0;
-      let writeOps = 0;
-      let searchOps = 0;
-      let ragInjections = 0;
-      let skillInjections = 0;
-      let userChars = 0;
-      let assistantChars = 0;
-      let thinkingChars = 0;
-      let toolArgsChars = 0;
-      let toolResultsChars = 0;
-      let ragChars = 0;
-      let firstTimestampMs = 0;
-      let lastTimestampMs = item.mtimeMs;
-      let lastUserPrompt = '';
-      const stepHistory = [];
-
-      for (let idx = 0; idx < rawLines.length; idx++) {
-        try {
-          const step = JSON.parse(rawLines[idx]);
-          const stepTimeMs = step.created_at ? Date.parse(step.created_at) : 0;
-          if (stepTimeMs > 0 && (!firstTimestampMs || stepTimeMs < firstTimestampMs)) {
-            firstTimestampMs = stepTimeMs;
-          }
-          if (stepTimeMs > lastTimestampMs) {
-            lastTimestampMs = stepTimeMs;
-          }
-
-          const contentStr = String(step.content || '');
-          const thinkingStr = String(step.thinking || '');
-
-          // If server restarted or subagents were stopped by system notice, mark all prior subagents COMPLETED
-          if (/subagents and background tasks have been stopped/i.test(contentStr)) {
-            for (const s of subagents) {
-              if (s.status === 'RUNNING') {
-                s.status = 'COMPLETED';
-                s.completedAt = step.created_at || new Date(item.mtimeMs).toISOString();
-              }
+        if (/subagents and background tasks have been stopped/i.test(contentStr)) {
+          for (const s of subagents) {
+            if (s.status === 'RUNNING') {
+              s.status = 'COMPLETED';
+              s.completedAt = step.created_at || new Date(mtimeMs).toISOString();
             }
           }
+        }
 
-          if (step.type === 'USER_INPUT') {
-            userTurns += 1;
-            userChars += contentStr.length;
-            const cleaned = contentStr
-              .replace(/<CONTEXT_SUMMARY>[\s\S]*?<\/CONTEXT_SUMMARY>/g, '')
-              .replace(/<[^>]+>/g, '')
-              .trim();
-            if (cleaned) {
-              lastUserPrompt = cleaned.slice(0, 180);
-            }
-            // Any subagent from an earlier user turn that has no pending step is completed
-            for (const s of subagents) {
-              if (s.status === 'RUNNING' && idx - (s.rawLineIdx ?? 0) >= 2) {
-                s.status = 'COMPLETED';
-                s.completedAt = step.created_at || new Date(item.mtimeMs).toISOString();
-              }
-            }
-          } else if (step.type === 'PLANNER_RESPONSE') {
-            modelReplies += 1;
-            assistantChars += contentStr.length;
-            thinkingChars += thinkingStr.length;
-          } else {
-            toolResultsChars += contentStr.length;
+        if (step.type === 'USER_INPUT') {
+          userTurns += 1;
+          userChars += contentStr.length;
+          const cleaned = contentStr
+            .replace(/<CONTEXT_SUMMARY>[\s\S]*?<\/CONTEXT_SUMMARY>/g, '')
+            .replace(/<[^>]+>/g, '')
+            .trim();
+          if (cleaned) {
+            lastUserPrompt = cleaned.slice(0, 180);
           }
+        } else if (step.type === 'PLANNER_RESPONSE') {
+          modelReplies += 1;
+          assistantChars += contentStr.length;
+          thinkingChars += thinkingStr.length;
+        } else {
+          toolResultsChars += contentStr.length;
+        }
 
-          let stepToolChars = 0;
-          let stepRagChars = 0;
-          if (Array.isArray(step.tool_calls)) {
-            for (const tc of step.tool_calls) {
-              const tName = tc.name || tc.tool_name || 'tool';
-              const tArgs = tc.arguments || tc.args || {};
-              const serializedArgs = JSON.stringify(tArgs);
-              toolArgsChars += serializedArgs.length;
-              stepToolChars += serializedArgs.length + 600;
+        let stepToolChars = 0;
+        let stepRagChars = 0;
+        if (Array.isArray(step.tool_calls)) {
+          for (const tc of step.tool_calls) {
+            const tName = tc.name || tc.tool_name || 'tool';
+            const tArgs = tc.arguments || tc.args || {};
+            const serializedArgs = JSON.stringify(tArgs);
+            toolArgsChars += serializedArgs.length;
+            stepToolChars += serializedArgs.length + 600;
 
-              toolCounts[tName] = (toolCounts[tName] || 0) + 1;
+            toolCounts[tName] = (toolCounts[tName] || 0) + 1;
 
-              if (/read_file|view_file|list_dir|read_resource/i.test(tName)) {
-                readOps += 1;
-                if (String(tArgs.Path || '').includes('SKILL.md')) {
-                  skillInjections += 1;
-                }
-              } else if (/write_file|edit_file/i.test(tName)) {
-                writeOps += 1;
-              } else if (/search|grep|find|query|harness_query|harness_get|call_mcp_tool/i.test(tName)) {
-                searchOps += 1;
-                if (/harness_|qmd_|call_mcp_tool/i.test(tName)) {
-                  ragInjections += 1;
-                  ragChars += 3200;
-                  stepRagChars += 800;
-                }
+            if (/read_file|view_file|list_dir|read_resource/i.test(tName)) {
+              readOps += 1;
+              if (String(tArgs.Path || '').includes('SKILL.md')) {
+                skillInjections += 1;
               }
+            } else if (/write_file|edit_file/i.test(tName)) {
+              writeOps += 1;
+            } else if (/search|grep|find|query|harness_query|harness_get|call_mcp_tool/i.test(tName)) {
+              searchOps += 1;
+              if (/harness_|qmd_|call_mcp_tool/i.test(tName)) {
+                ragInjections += 1;
+                ragChars += 3200;
+                stepRagChars += 800;
+              }
+            }
 
-              const summaryText =
-                tArgs.toolSummary ||
-                tArgs.Role ||
-                tArgs.ToolName ||
-                tArgs.query ||
-                (tArgs.Path ? path.basename(String(tArgs.Path)) : '') ||
-                tArgs.CommandLine?.slice(0, 60) ||
-                tName;
+            const summaryText =
+              tArgs.toolSummary ||
+              tArgs.Role ||
+              tArgs.ToolName ||
+              tArgs.query ||
+              (tArgs.Path ? path.basename(String(tArgs.Path)) : '') ||
+              tArgs.CommandLine?.slice(0, 60) ||
+              tName;
 
-              recentTools.unshift({
-                stepIndex: step.step_index ?? idx,
-                toolName: tName === 'call_mcp_tool' && tArgs.ToolName ? `mcp:${tArgs.ToolName}` : tName,
-                rawToolName: tName,
-                summary: summaryText,
-                createdAt: step.created_at || new Date(item.mtimeMs).toISOString(),
-              });
+            recentTools.unshift({
+              stepIndex: step.step_index ?? idx,
+              toolName: tName === 'call_mcp_tool' && tArgs.ToolName ? `mcp:${tArgs.ToolName}` : tName,
+              rawToolName: tName,
+              summary: summaryText,
+              createdAt: step.created_at || new Date(mtimeMs).toISOString(),
+            });
 
-              const isTailStep = idx >= rawLines.length - 2;
-              const isRecentStep = stepTimeMs > 0 ? Date.now() - stepTimeMs <= 25_000 : false;
-              const isActuallyRunningNow =
-                (step.status === 'RUNNING' || isTailStep) && isRecentStep;
-
-              if (tName === 'invoke_subagent') {
-                const subRole = tArgs.Role || tArgs.TypeName || 'Subagent';
-                const existingSub = subagents.find((s) => s.role === subRole);
-                if (existingSub) {
-                  existingSub.recalled = true;
-                  existingSub.recallCount = (existingSub.recallCount || 0) + 1;
-                  existingSub.recalledAt = step.created_at || new Date(item.mtimeMs).toISOString();
-                  existingSub.stepIdx = step.step_index ?? idx;
-                  existingSub.rawLineIdx = idx;
-                  existingSub.promptPreview = String(tArgs.Prompt || existingSub.promptPreview || '').slice(0, 240);
-                  existingSub.status = isActuallyRunningNow ? 'RUNNING' : 'COMPLETED';
-                } else {
-                  subagents.push({
-                    id: `live-sub-${idx}`,
-                    role: subRole,
-                    typeName: tArgs.TypeName || 'self',
-                    workspace: tArgs.Workspace || 'inherit',
-                    model: tArgs.Model || 'inherit',
-                    promptPreview: String(tArgs.Prompt || '').slice(0, 240),
-                    invokedAt: step.created_at || new Date(item.mtimeMs).toISOString(),
-                    stepIdx: step.step_index ?? idx,
-                    rawLineIdx: idx,
-                    recalled: false,
-                    recallCount: 0,
-                    status: isActuallyRunningNow ? 'RUNNING' : 'COMPLETED',
-                  });
-                }
+            if (tName === 'invoke_subagent') {
+              const batch = Array.isArray(tArgs.Subagents)
+                ? tArgs.Subagents
+                : Array.isArray(tArgs.subagents)
+                  ? tArgs.subagents
+                  : [tArgs];
+              for (let bIdx = 0; bIdx < batch.length; bIdx++) {
+                const spec = batch[bIdx] || {};
+                const subRole = spec.Role || spec.role || spec.TypeName || spec.typeName || 'Subagent';
+                const subId = `sub-${convId}-${step.step_index ?? idx}-${bIdx}`;
+                subagents.push({
+                  id: subId,
+                  role: subRole,
+                  typeName: spec.TypeName || spec.typeName || 'self',
+                  workspace: spec.Workspace || spec.workspace || 'inherit',
+                  model: spec.Model || spec.model || 'inherit',
+                  promptPreview: String(spec.Prompt || spec.prompt || '').slice(0, 240),
+                  invokedAt: step.created_at || new Date(mtimeMs).toISOString(),
+                  stepIdx: step.step_index ?? idx,
+                  rawLineIdx: idx,
+                  recalled: false,
+                  recallCount: 0,
+                  status: 'RUNNING',
+                });
                 interAgentMessages.unshift({
-                  id: `msg-invoke-${idx}`,
+                  id: `msg-invoke-${idx}-${bIdx}`,
                   from: 'Main Orchestrator Agent',
                   to: subRole,
                   direction: 'DELEGATE',
                   stepIdx: step.step_index ?? idx,
-                  timestamp: step.created_at || new Date(item.mtimeMs).toISOString(),
-                  preview: String(tArgs.Prompt || '').slice(0, 180),
+                  timestamp: step.created_at || new Date(mtimeMs).toISOString(),
+                  preview: String(spec.Prompt || spec.prompt || '').slice(0, 180),
                 });
-              } else if (tName === 'send_message') {
-                const recipient = String(tArgs.Recipient || 'Subagent').trim();
-                const targetSub =
-                  subagents.find(
-                    (s) =>
-                      s.id === recipient ||
-                      s.role.toLowerCase().includes(recipient.toLowerCase())
-                  ) || subagents[subagents.length - 1];
-                if (targetSub) {
-                  targetSub.recalled = true;
-                  targetSub.recallCount = (targetSub.recallCount || 0) + 1;
-                  targetSub.recalledAt = step.created_at || new Date(item.mtimeMs).toISOString();
-                  targetSub.rawLineIdx = idx;
-                  targetSub.status = isActuallyRunningNow ? 'RUNNING' : 'COMPLETED';
-                }
-                interAgentMessages.unshift({
-                  id: `msg-send-${idx}`,
-                  from: 'Main Orchestrator Agent',
-                  to: targetSub ? targetSub.role : recipient,
-                  direction: 'RECALL',
-                  stepIdx: step.step_index ?? idx,
-                  timestamp: step.created_at || new Date(item.mtimeMs).toISOString(),
-                  preview: String(tArgs.Message || '').slice(0, 180),
-                });
-              } else if (tName === 'manage_subagents') {
-                const act = String(tArgs.Action || '').toLowerCase();
-                if (act === 'kill' || act === 'kill_all') {
-                  for (const s of subagents) {
-                    s.status = 'COMPLETED';
-                    s.completedAt = step.created_at || new Date(item.mtimeMs).toISOString();
-                  }
+              }
+            } else if (tName === 'send_message') {
+              const recipient = String(tArgs.Recipient || 'Subagent').trim();
+              const targetSub = subagents.find(
+                (s) =>
+                  s.id === recipient ||
+                  s.conversationId === recipient ||
+                  s.role.toLowerCase() === recipient.toLowerCase()
+              );
+              if (targetSub) {
+                targetSub.recalled = true;
+                targetSub.recallCount = (targetSub.recallCount || 0) + 1;
+                targetSub.recalledAt = step.created_at || new Date(mtimeMs).toISOString();
+                targetSub.rawLineIdx = idx;
+                targetSub.status = 'RUNNING';
+              }
+              interAgentMessages.unshift({
+                id: `msg-send-${idx}`,
+                from: 'Main Orchestrator Agent',
+                to: targetSub ? targetSub.role : recipient,
+                direction: 'RECALL',
+                stepIdx: step.step_index ?? idx,
+                timestamp: step.created_at || new Date(mtimeMs).toISOString(),
+                preview: String(tArgs.Message || '').slice(0, 180),
+              });
+            } else if (tName === 'manage_subagents') {
+              const act = String(tArgs.Action || '').toLowerCase();
+              if (act === 'kill' || act === 'kill_all') {
+                for (const s of subagents) {
+                  s.status = 'COMPLETED';
+                  s.completedAt = step.created_at || new Date(mtimeMs).toISOString();
                 }
               }
             }
           }
+        }
 
-          stepHistory.push({
-            stepIndex: step.step_index ?? idx + 1,
-            userChars: step.type === 'USER_INPUT' ? contentStr.length : 0,
-            assistantChars: step.type === 'PLANNER_RESPONSE' ? contentStr.length + thinkingStr.length : 0,
-            toolChars: stepToolChars,
-            ragChars: stepRagChars,
-          });
-        } catch {
-          // ignore malformed line
+        stepHistory.push({
+          stepIndex: step.step_index ?? idx + 1,
+          userChars: step.type === 'USER_INPUT' ? contentStr.length : 0,
+          assistantChars: step.type === 'PLANNER_RESPONSE' ? contentStr.length + thinkingStr.length : 0,
+          toolChars: stepToolChars,
+          ragChars: stepRagChars,
+        });
+      } catch {
+        // ignore malformed line
+      }
+    }
+
+    const activeDurationSec =
+      firstTimestampMs > 0 && lastTimestampMs > firstTimestampMs
+        ? Math.max(12, Math.round((lastTimestampMs - firstTimestampMs) / 1000))
+        : Math.max(30, totalSteps * 8);
+
+    return {
+      conversationId: convId,
+      lastActiveIso: new Date(mtimeMs).toISOString(),
+      totalSteps,
+      userTurns: Math.max(1, userTurns),
+      modelReplies: Math.max(1, modelReplies),
+      readOps,
+      writeOps,
+      searchOps,
+      ragInjections: Math.max(2, ragInjections),
+      skillInjections: Math.max(1, skillInjections),
+      userChars,
+      assistantChars,
+      thinkingChars,
+      toolArgsChars,
+      toolResultsChars,
+      ragChars,
+      activeDurationSec,
+      lastUserPrompt,
+      subagents,
+      interAgentMessages: interAgentMessages.slice(0, 20),
+      recentTools: recentTools.slice(0, 30),
+      toolCounts,
+      stepHistory,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolves the active session transcript strictly for the bound workspace & conversationId,
+ * never guessing or falling back to unrelated global brain transcripts.
+ */
+function resolveWorkspaceBrainTranscript(workspaceContext) {
+  const wsRoot = workspaceContext?.workspaceRoot;
+  if (!wsRoot) return null;
+
+  // Check workspace-local telemetry.json for an explicitly recorded transcriptPath or conversationId
+  const localTelPath = path.join(wsRoot, '.harness', 'runtime', 'telemetry.json');
+  if (fs.existsSync(localTelPath)) {
+    try {
+      const tel = JSON.parse(fs.readFileSync(localTelPath, 'utf8'));
+      const sessions = Object.values(tel.sessions || {}).filter(
+        (s) =>
+          !s.workspaceRoot ||
+          path.resolve(s.workspaceRoot).toLowerCase() === path.resolve(wsRoot).toLowerCase()
+      );
+      if (workspaceContext.activeConversationId) {
+        const matchedSess = sessions.find(
+          (s) => s.conversationId === workspaceContext.activeConversationId
+        );
+        if (matchedSess?.transcriptPath && fs.existsSync(matchedSess.transcriptPath)) {
+          return parseTranscriptFile(matchedSess.conversationId, matchedSess.transcriptPath);
         }
       }
-
-      const activeDurationSec =
-        firstTimestampMs > 0 && lastTimestampMs > firstTimestampMs
-          ? Math.max(12, Math.round((lastTimestampMs - firstTimestampMs) / 1000))
-          : Math.max(30, totalSteps * 8);
-
-      discoveredConversations.push({
-        conversationId: item.convId,
-        lastActiveIso: new Date(item.mtimeMs).toISOString(),
-        totalSteps,
-        userTurns: Math.max(1, userTurns),
-        modelReplies: Math.max(1, modelReplies),
-        readOps,
-        writeOps,
-        searchOps,
-        ragInjections: Math.max(2, ragInjections),
-        skillInjections: Math.max(1, skillInjections),
-        userChars,
-        assistantChars,
-        thinkingChars,
-        toolArgsChars,
-        toolResultsChars,
-        ragChars,
-        activeDurationSec,
-        lastUserPrompt,
-        subagents,
-        interAgentMessages: interAgentMessages.slice(0, 20),
-        recentTools: recentTools.slice(0, 30),
-        toolCounts,
-        stepHistory,
-      });
-    }
-  } catch {
-    // ignore scan errors
+      for (const sess of sessions) {
+        if (sess?.transcriptPath && fs.existsSync(sess.transcriptPath)) {
+          return parseTranscriptFile(sess.conversationId || 'session', sess.transcriptPath);
+        }
+      }
+    } catch {}
   }
 
-  return discoveredConversations;
+  return null;
 }
 
 /**
@@ -1184,22 +1276,16 @@ function buildSwarmFormations(
   ];
 
   // Append any extra dynamically invoked subagents from the current session onto Tier 1/2
-  const nowMs = Date.now();
+  // F08 / F11: Never auto-complete RUNNING subagents by timer, and keep each sub.id as a distinct node
+  // so multiple subagents with the same role are never merged.
   for (let i = 0; i < liveSubagents.length; i++) {
     const sub = liveSubagents[i];
-    const lastTs = Date.parse(sub.lastActiveAt || sub.recalledAt || sub.invokedAt || '') || 0;
-    const isSyntheticTestConv = String(sub.conversationId || '').startsWith('test-conv-');
-    const isFreshRunning =
-      !isSyntheticTestConv && sub.status === 'RUNNING' && lastTs > 0 && nowMs - lastTs <= 20_000;
-    const resolvedSubStatus = isFreshRunning ? 'RUNNING' : 'COMPLETED';
+    const resolvedSubStatus = sub.status === 'RUNNING' ? 'RUNNING' : (sub.status || 'COMPLETED');
+    const subNodeId = sub.id || `session-sub-${i + 1}`;
 
-    const matchedBuiltIn = liveNodes.find(
-      (n) =>
-        n.tier > 0 &&
-        (n.id === sub.id || n.role.toLowerCase() === String(sub.role || '').toLowerCase())
-    );
+    const matchedBuiltIn = liveNodes.find((n) => n.tier > 0 && n.id === subNodeId);
     if (matchedBuiltIn) {
-      if (isFreshRunning) {
+      if (resolvedSubStatus === 'RUNNING') {
         matchedBuiltIn.status = 'RUNNING';
       }
       if (sub.recalled) {
@@ -1207,15 +1293,18 @@ function buildSwarmFormations(
         matchedBuiltIn.recallCount = Math.max(matchedBuiltIn.recallCount || 0, sub.recallCount || 1);
         matchedBuiltIn.recalledAt = sub.recalledAt || matchedBuiltIn.recalledAt;
       }
-    } else if (!liveNodes.some((n) => n.role === sub.role)) {
+    } else {
+      const uniqueNodeId = liveNodes.some((n) => n.id === subNodeId)
+        ? `${subNodeId}-${i + 1}`
+        : subNodeId;
       liveNodes.push({
-        id: `session-sub-${i + 1}`,
+        id: uniqueNodeId,
         parentIds: ['main-orchestrator'],
         tier: 1,
         teamId: 'team-propose',
         teamName: 'Tier 1 · Propose & Retrieval Team',
-        role: sub.role,
-        title: sub.promptPreview?.slice(0, 42) || sub.typeName,
+        role: sub.role || 'Subagent',
+        title: sub.promptPreview?.slice(0, 42) || sub.typeName || sub.role,
         typeName: sub.typeName || 'self',
         model: sub.model || 'inherit',
         workspace: sub.workspace || 'inherit',
@@ -2309,8 +2398,19 @@ function gatherContextAnalytics(workspaceContext, activeBrain, ragDocuments = []
   const subTokens = subCount * 385_000 + liveSec * 420;
   const liveOutputSpeed = 228 + Math.round(Math.sin(liveSec * 0.85) * 16 + Math.cos(liveSec * 0.35) * 6);
   const liveCacheHitPct = Number((94.2 + Math.sin(liveSec * 0.4) * 0.38).toFixed(2));
+  const localTelPath = path.join(workspaceContext.workspaceRoot, '.harness', 'runtime', 'telemetry.json');
+  let hasHookEvents = false;
+  if (fs.existsSync(localTelPath)) {
+    try {
+      const tel = JSON.parse(fs.readFileSync(localTelPath, 'utf8'));
+      hasHookEvents = Array.isArray(tel.recentEvents) && tel.recentEvents.length > 0;
+    } catch {}
+  }
+  const hasRealTranscriptOrEvents = Boolean((activeBrain && activeBrain.totalSteps > 0) || hasHookEvents);
+  const telemetryQuality = hasRealTranscriptOrEvents ? 'observed' : 'estimated';
 
   return {
+    telemetryQuality,
     flowSummary: {
       io: {
         total: ioTotal,
@@ -2346,18 +2446,21 @@ function gatherContextAnalytics(workspaceContext, activeBrain, ragDocuments = []
       },
     },
     tokenStats: {
+      quality: telemetryQuality,
       totalTokens: totalSessionTokens,
       totalFormatted: formatCompactNumber(totalSessionTokens),
       cacheHitPct: liveCacheHitPct,
       categories: tokenCategories,
     },
     latencyStats: {
+      quality: telemetryQuality,
       activeDurationFormatted: formatDurationSec(totalSec),
       totalSec,
       outputSpeedTokPerSec: liveOutputSpeed,
       categories: latencyCategories,
     },
     currentWindow: {
+      quality: telemetryQuality,
       modelName: 'Gemini 4 Argon (High) · Gravity Well Harness',
       usedTokens: usedWindowTokens,
       usedFormatted: formatCompactNumber(usedWindowTokens),
@@ -2400,21 +2503,30 @@ async function gatherSwarmState(
   }
 
   if (!activeBrain) {
-    const brainConversations = scanRecentBrainTranscripts();
-    activeBrain =
-      brainConversations.find((c) => c.conversationId === workspaceContext.activeConversationId) ||
-      brainConversations[0] ||
-      null;
+    activeBrain = resolveWorkspaceBrainTranscript(workspaceContext);
   }
 
   const liveSubagents = [];
   if (activeBrain && Array.isArray(activeBrain.subagents)) {
     liveSubagents.push(...activeBrain.subagents);
   }
+  if (Array.isArray(hookTelemetry.subagents)) {
+    for (const sub of hookTelemetry.subagents) {
+      if (!liveSubagents.some((x) => x.id && x.id === sub.id)) {
+        liveSubagents.push(sub);
+      }
+    }
+  }
   for (const sess of Object.values(hookTelemetry.sessions || {})) {
-    if (Array.isArray(sess.subagents)) {
+    if (
+      sess?.workspaceRoot &&
+      path.resolve(sess.workspaceRoot).toLowerCase() !== path.resolve(workspaceRoot).toLowerCase()
+    ) {
+      continue;
+    }
+    if (Array.isArray(sess?.subagents)) {
       for (const sub of sess.subagents) {
-        if (!liveSubagents.some((x) => x.role === sub.role && x.stepIdx === sub.stepIdx)) {
+        if (!liveSubagents.some((x) => x.id && x.id === sub.id)) {
           liveSubagents.push(sub);
         }
       }
@@ -2489,7 +2601,15 @@ async function gatherSwarmState(
           }))
       : [];
 
+  const hasRealTranscriptOrEvents = Boolean(
+    (activeBrain && activeBrain.totalSteps > 0) ||
+      recentEvents.length > 0 ||
+      liveSubagents.length > 0
+  );
+  const telemetryQuality = hasRealTranscriptOrEvents ? 'observed' : 'estimated';
+
   return {
+    telemetryQuality,
     lsConnected,
     activeConversationId:
       activeBrain?.conversationId ||
@@ -2609,11 +2729,7 @@ export function createHarnessMonitorApp() {
     const lifecycleState = loadSubagentLifecycle(wsCtx.workspaceRoot);
     const hubCfg = loadHubConfig(wsCtx.workspaceRoot);
     const messageBus = loadMessageBus(wsCtx.workspaceRoot);
-    const brainConversations = scanRecentBrainTranscripts();
-    const activeBrain =
-      brainConversations.find((c) => c.conversationId === wsCtx.activeConversationId) ||
-      brainConversations[0] ||
-      null;
+    const activeBrain = resolveWorkspaceBrainTranscript(wsCtx);
     const lastToolObj = activeBrain?.recentTools?.[0] || null;
     const liveSec = getLiveWallSec();
     const liveRevision = [
@@ -2657,11 +2773,7 @@ export function createHarnessMonitorApp() {
     const settings = engine.loadConfig();
     const snapshots = wsCtx.hasHarness ? engine.listSnapshots() : [];
     const lifecycleState = loadSubagentLifecycle(workspaceRoot);
-    const brainConversations = scanRecentBrainTranscripts();
-    const activeBrain =
-      brainConversations.find((c) => c.conversationId === wsCtx.activeConversationId) ||
-      brainConversations[0] ||
-      null;
+    const activeBrain = resolveWorkspaceBrainTranscript(wsCtx);
     const contextAnalytics = gatherContextAnalytics(wsCtx, activeBrain, index.documents);
     const swarm = await gatherSwarmState(
       wsCtx,
@@ -2758,15 +2870,23 @@ export function createHarnessMonitorApp() {
     return { ok: true, reloading: true };
   };
   app.api('/api/reload', handleReload, 'POST');
-  app.api('/api/reload', handleReload, 'GET');
 
   app.api(
     '/api/workspace/switch',
     async (reqData = {}) => {
       const payload = reqData?.body || reqData || {};
-      const target = payload.workspaceRoot ? path.resolve(payload.workspaceRoot) : '';
-      if (!target || !fs.existsSync(target)) {
-        return { ok: false, error: `Workspace path does not exist: ${target}` };
+      let target;
+      try {
+        target = validateAndResolveWorkspacePath(payload.workspaceRoot);
+      } catch (err) {
+        return new ResponseClass({
+          status: 400,
+          contentType: 'application/json; charset=utf-8',
+          body: JSON.stringify({
+            ok: false,
+            error: err?.message || `Workspace path does not exist: ${payload.workspaceRoot}`,
+          }),
+        });
       }
       saveActiveWorkspaceState(target, payload.conversationId || '', 'ui_switch');
       const wsCtx = await resolveWorkspaceContext({
@@ -2869,7 +2989,24 @@ export function createHarnessMonitorApp() {
         const colSpec = engine.loadConfig().rag?.collections?.[col] || {
           path: '.harness/knowledge/project',
         };
-        const targetDir = path.resolve(workspaceRoot, colSpec.path);
+        if (/(^|[\\/])\.\.([\\/]|$)/.test(String(colSpec.path || ''))) {
+          return new ResponseClass({
+            status: 400,
+            contentType: 'application/json; charset=utf-8',
+            body: JSON.stringify({ ok: false, error: 'Collection path traversal denied' }),
+          });
+        }
+        const realWsRoot = fs.realpathSync(workspaceRoot);
+        const targetDir = path.resolve(realWsRoot, colSpec.path);
+        const normRoot = process.platform === 'win32' ? realWsRoot.toLowerCase() : realWsRoot;
+        const normTarget = process.platform === 'win32' ? targetDir.toLowerCase() : targetDir;
+        if (normTarget !== normRoot && !normTarget.startsWith(normRoot + path.sep)) {
+          return new ResponseClass({
+            status: 400,
+            contentType: 'application/json; charset=utf-8',
+            body: JSON.stringify({ ok: false, error: 'Collection directory escapes workspaceRoot' }),
+          });
+        }
         fs.mkdirSync(targetDir, { recursive: true });
         const safeName = String(payload.filename || `NOTE-${Date.now()}.md`)
           .replace(/[^a-zA-Z0-9._-]/g, '-')
@@ -3034,7 +3171,6 @@ export function createHarnessMonitorApp() {
     };
   };
   app.api('/api/swarm/recall', handleSwarmRecall, 'POST');
-  app.api('/api/swarm/recall', handleSwarmRecall, 'GET');
 
   const handleHarness2Run = async (reqData = {}) => {
     const payload = reqData?.body || reqData || {};
@@ -3056,7 +3192,6 @@ export function createHarnessMonitorApp() {
     return { ok: true, ...report };
   };
   app.api('/api/harness2/run', handleHarness2Run, 'POST');
-  app.api('/api/harness2/run', handleHarness2Run, 'GET');
 
   const handleModelsConfig = async (reqData = {}) => {
     const payload = reqData?.body || reqData || {};
@@ -3071,7 +3206,6 @@ export function createHarnessMonitorApp() {
     };
   };
   app.api('/api/models/config', handleModelsConfig, 'POST');
-  app.api('/api/models/config', handleModelsConfig, 'GET');
 
   const handleModelsInvoke = async (reqData = {}) => {
     const payload = reqData?.body || reqData || {};
@@ -3091,7 +3225,6 @@ export function createHarnessMonitorApp() {
     };
   };
   app.api('/api/models/invoke', handleModelsInvoke, 'POST');
-  app.api('/api/models/invoke', handleModelsInvoke, 'GET');
 
   const handleSearchMulti = async (reqData = {}) => {
     const payload = reqData?.body || reqData || {};
@@ -3108,7 +3241,6 @@ export function createHarnessMonitorApp() {
     };
   };
   app.api('/api/search/multi', handleSearchMulti, 'POST');
-  app.api('/api/search/multi', handleSearchMulti, 'GET');
 
   const handleSwarmMessageInject = async (reqData = {}) => {
     const payload = reqData?.body || reqData || {};
@@ -3140,7 +3272,6 @@ export function createHarnessMonitorApp() {
     };
   };
   app.api('/api/swarm/message-inject', handleSwarmMessageInject, 'POST');
-  app.api('/api/swarm/message-inject', handleSwarmMessageInject, 'GET');
 
   const handleSelfImprove = async (reqData = {}) => {
     const payload = reqData?.body || reqData || {};
@@ -3164,7 +3295,6 @@ export function createHarnessMonitorApp() {
     };
   };
   app.api('/api/harness2/self-improve', handleSelfImprove, 'POST');
-  app.api('/api/harness2/self-improve', handleSelfImprove, 'GET');
 
   app.api(
     '/api/settings/save',
