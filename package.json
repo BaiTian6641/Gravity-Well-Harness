@@ -1,9 +1,14 @@
 {
-  "name": "harness2-rag-antigravity",
-  "version": "1.0.0",
-  "description": "Comprehensive Google Antigravity plugin and Auxiliary Pane UI Sidecar turning Antigravity into a Recursive Agent Harnessing IDE (Google Research Harness² + QMD Local Hybrid RAG + Context7 + Subagent Swarm Monitor).",
+  "name": "gravity-well-harness",
+  "version": "1.1.0",
+  "description": "Gravity Well Harness — Comprehensive Google Antigravity plugin and Auxiliary Pane UI Sidecar turning Antigravity into a Recursive Agent Harnessing IDE (Google Research Harness² + QMD Local Hybrid RAG + Context7 + Dynamic Hierarchical Subagent Swarm & Context DNA Monitor).",
   "type": "module",
   "private": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BaiTian6641/Gravity-Well-Harness.git"
+  },
+  "homepage": "https://github.com/BaiTian6641/Gravity-Well-Harness#readme",
   "engines": {
     "node": ">=20.0.0"
   },

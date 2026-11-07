@@ -13,10 +13,59 @@ function readStdinJson() {
   }
 }
 
+function recordActiveWorkspace(workspaceRoot, conversationId = '', source = 'PostToolUse') {
+  try {
+    const dataDir = path.join(
+      os.homedir(),
+      '.gemini',
+      'antigravity',
+      'sidecar_data',
+      'harness-ide-monitor'
+    );
+    fs.mkdirSync(dataDir, { recursive: true });
+    const activeFile = path.join(dataDir, 'active-workspace.json');
+    let existing = { recentWorkspaces: [] };
+    if (fs.existsSync(activeFile)) {
+      try {
+        existing = JSON.parse(fs.readFileSync(activeFile, 'utf8'));
+      } catch {}
+    }
+    const cleanRoot = path.resolve(workspaceRoot);
+    const recents = Array.isArray(existing.recentWorkspaces) ? existing.recentWorkspaces : [];
+    const updatedRecents = [
+      cleanRoot,
+      ...recents.filter((w) => path.resolve(w).toLowerCase() !== cleanRoot.toLowerCase())
+    ].slice(0, 12);
+
+    fs.writeFileSync(
+      activeFile,
+      JSON.stringify(
+        {
+          workspaceRoot: cleanRoot,
+          conversationId,
+          source,
+          updatedAt: new Date().toISOString(),
+          recentWorkspaces: updatedRecents
+        },
+        null,
+        2
+      ),
+      'utf8'
+    );
+  } catch {
+    // ignore
+  }
+}
+
 function main() {
   const input = readStdinJson();
   const workspaceRoot =
-    (Array.isArray(input.workspacePaths) && input.workspacePaths[0]) || process.cwd();
+    (Array.isArray(input.workspacePaths) && input.workspacePaths[0]) ||
+    input.cwd ||
+    process.cwd();
+
+  const convId = input.conversationId || 'default-session';
+  recordActiveWorkspace(workspaceRoot, convId, 'PostToolUse');
 
   const harnessDir = path.join(workspaceRoot, '.harness');
   if (!fs.existsSync(harnessDir)) {
@@ -29,7 +78,6 @@ function main() {
     const config = engine.loadConfig();
     const toolName = input.toolCall?.name || 'unknown_tool';
     const toolArgs = input.toolCall?.args || {};
-    const convId = input.conversationId || 'default-session';
     const nowIso = new Date().toISOString();
 
     if (config.uiMonitor?.enablePostToolTelemetryHook !== false) {

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Harness² Swarm &amp; RAG Monitor</title>
+  <title>Gravity Well Harness — Swarm &amp; RAG Monitor</title>
   <script src="/preload.js"></script>
   <link rel="stylesheet" href="/compiled_tailwind.css" />
   <link rel="stylesheet" href="/shell.css" />
@@ -13,124 +13,391 @@
   <script defer src="/ui.js"></script>
 </head>
 <body>
-  <div class="app-container">
-    <!-- Top Header -->
+  <div class="app-container" id="app-root">
+    <!-- Top Header with Smooth Workspace Switcher -->
     <header class="top-bar">
       <div class="brand-row">
-        <div class="brand-badge">H²</div>
+        <div class="brand-badge" title="Gravity Well Harness (Antigravity + Harness²)">GW</div>
         <div>
-          <h1 class="brand-title">Harness² Swarm &amp; Local RAG IDE</h1>
-          <p class="brand-subtitle" id="workspace-label">Connecting to workspace…</p>
+          <div class="brand-title-row">
+            <h1 class="brand-title">Gravity Well Harness</h1>
+            <span class="version-pill">v1.1 · Harness² + QMD</span>
+          </div>
+          <p class="brand-subtitle" id="workspace-label">Connecting to active workspace…</p>
         </div>
       </div>
+
+      <!-- Smooth Workspace Switcher & Status Badges -->
       <div class="header-badges">
+        <div class="workspace-switcher-box" title="Switch or Auto-Follow the currently opened Antigravity Workspace">
+          <span class="ws-icon">📁</span>
+          <select id="workspace-switcher-select" class="ws-select" aria-label="Active Workspace"></select>
+          <button class="ws-auto-btn active" id="btn-auto-follow-ws" title="Automatically follow the currently opened workspace in Antigravity IDE">
+            ⚡ Auto-Follow IDE
+          </button>
+        </div>
         <span class="pill-badge" id="snapshot-header-badge">Snapshot: Unlocked</span>
         <span class="pill-badge pill-ok" id="rag-header-badge">RAG: 0 docs</span>
         <button class="icon-btn" id="btn-manual-refresh" title="Refresh Dashboard State">↻ Refresh</button>
       </div>
     </header>
 
-    <!-- Navigation Tabs -->
-    <nav class="tab-nav" role="tablist">
-      <button class="tab-btn active" data-tab="swarm" role="tab">
-        <span>1. Swarm Monitor</span>
-      </button>
-      <button class="tab-btn" data-tab="harness2" role="tab">
-        <span>2. Harness² Studio</span>
-      </button>
-      <button class="tab-btn" data-tab="rag" role="tab">
-        <span>3. Local RAG Explorer</span>
-      </button>
-      <button class="tab-btn" data-tab="settings" role="tab">
-        <span>4. Settings</span>
-      </button>
-    </nav>
+    <!-- Uninitialized Workspace Banner (shown smoothly if user switches to a workspace without .harness/) -->
+    <div id="uninitialized-workspace-banner" class="ws-init-banner hidden">
+      <div>
+        <strong>New Workspace Detected:</strong> <code id="uninit-ws-name">workspace</code> does not have a <code>.harness/</code> knowledge base yet.
+      </div>
+      <button class="btn btn-primary" id="btn-init-workspace">✨ Initialize Gravity Well .harness/ Here</button>
+    </div>
 
     <!-- Toast Banner -->
     <div id="toast-banner" class="toast-banner hidden"></div>
 
-    <!-- TAB 1: SWARM & MAIN AGENT MONITOR -->
+    <!-- 5-Tab Navigation Bar -->
+    <nav class="tab-nav" role="tablist">
+      <button class="tab-btn active" data-tab="swarm" role="tab">
+        <span>1. Swarm Formation (编队)</span>
+      </button>
+      <button class="tab-btn" data-tab="context" role="tab">
+        <span>2. Context &amp; Token DNA (上下文)</span>
+      </button>
+      <button class="tab-btn" data-tab="harness2" role="tab">
+        <span>3. Harness² Studio</span>
+      </button>
+      <button class="tab-btn" data-tab="rag" role="tab">
+        <span>4. Local RAG (QMD)</span>
+      </button>
+      <button class="tab-btn" data-tab="settings" role="tab">
+        <span>5. Settings</span>
+      </button>
+    </nav>
+
+    <!-- =================================================================== -->
+    <!-- TAB 1: DYNAMIC MULTI-TIER SUBAGENT SWARM HIERARCHY & TEAM FORMATION -->
+    <!-- =================================================================== -->
     <section id="tab-swarm" class="tab-panel active">
-      <!-- Main Agent Card -->
-      <div class="card card-highlight">
-        <div class="card-header">
-          <div>
-            <span class="eyebrow">ROOT ORCHESTRATOR</span>
-            <h2 class="card-title" id="main-agent-role">Main Orchestrator Agent (Antigravity)</h2>
-          </div>
-          <span class="status-chip status-active" id="main-agent-status">ACTIVE</span>
+      <!-- Top Formation Summary Strip (Matches Screenshots 3 & 4) -->
+      <div class="swarm-summary-strip">
+        <div class="swarm-summary-pills">
+          <span class="summary-pill" id="swarm-sum-total">6 Agents</span>
+          <span class="summary-pill summary-pill-running" id="swarm-sum-running">● 3 Running</span>
+          <span class="summary-pill summary-pill-done" id="swarm-sum-completed">✓ 3 Completed</span>
+          <span class="summary-pill" id="swarm-sum-context">Total Context: 674.1k</span>
+          <span class="summary-pill" id="swarm-sum-cost">Est. Total: $4.12</span>
         </div>
-        <div class="metrics-row">
-          <div class="metric-box">
-            <span class="metric-label">Model</span>
-            <span class="metric-val" id="main-agent-model">Gemini 4 Argon</span>
+
+        <div class="swarm-summary-right">
+          <div class="formation-selector-wrap">
+            <label for="formation-select" class="muted-text">Formation:</label>
+            <select id="formation-select" class="input-field select-compact">
+              <option value="live-harness2">Gravity Well Harness² Swarm (Live Workspace)</option>
+              <option value="compact-verification">4-Agent Verification Diamond (Core Audit)</option>
+              <option value="multi-stage-team">13-Agent Multi-Stage Pipeline Swarm (Stages A–D)</option>
+            </select>
           </div>
-          <div class="metric-box">
-            <span class="metric-label">Trajectory Steps</span>
-            <span class="metric-val" id="main-agent-steps">0</span>
-          </div>
-          <div class="metric-box">
-            <span class="metric-label">Spawned Subagents</span>
-            <span class="metric-val" id="main-agent-subcount">0</span>
-          </div>
-          <div class="metric-box">
-            <span class="metric-label">LS Bridge</span>
-            <span class="metric-val" id="main-agent-ls">Local + RPC</span>
+          <div class="subagent-progress-wrap">
+            <span class="muted-text">Subagent Progress</span>
+            <div class="subagent-progress-track">
+              <div class="subagent-progress-fill" id="swarm-progress-fill" style="width: 60%;"></div>
+            </div>
+            <span class="subagent-progress-text" id="swarm-progress-label">3/5</span>
           </div>
         </div>
-        <div class="prompt-preview" id="main-agent-prompt">Waiting for active conversation telemetry…</div>
       </div>
 
-      <!-- Subagent Swarm Topology -->
-      <div class="card">
-        <div class="card-header">
-          <div>
-            <span class="eyebrow">HARNESS² SUBAGENT SWARM TOPOLOGY</span>
-            <h3 class="card-title">Propose → Probe (Branched Workspaces) → Compose</h3>
+      <!-- Main Split View: Left Hierarchy Map + Right Team Members & Tasks -->
+      <div class="swarm-split-layout">
+        <!-- LEFT: Interactive Hierarchical Agent Network & Flow Map -->
+        <div class="card hierarchy-map-card">
+          <div class="card-header">
+            <div>
+              <span class="eyebrow">AGENT NETWORK · HIERARCHY &amp; DIRECTIONAL FLOW</span>
+              <h2 class="card-title" id="formation-title">Real-Time Main Agent &amp; Subagent Swarm Hierarchy</h2>
+            </div>
+            <button class="icon-btn" id="btn-clear-node-filter" title="Reset node selection">Show All Nodes</button>
           </div>
-          <span class="muted-text" id="swarm-isolation-note">Workspace: branch + Snapshot Lock</span>
+
+          <!-- Context DNA Legend Row -->
+          <div class="dna-legend-bar">
+            <span class="dna-legend-item"><i style="background:#6366f1"></i>System Prompt</span>
+            <span class="dna-legend-item"><i style="background:#f59e0b"></i>Tool Defs</span>
+            <span class="dna-legend-item"><i style="background:#10b981"></i>User Msg</span>
+            <span class="dna-legend-item"><i style="background:#a855f7"></i>Injected RAG</span>
+            <span class="dna-legend-item"><i style="background:#f97316"></i>Skills</span>
+            <span class="dna-legend-item"><i style="background:#3b82f6"></i>Assistant</span>
+            <span class="dna-legend-item"><i style="background:#14b8a6"></i>Tool Results</span>
+            <span class="dna-legend-item"><i style="background:#334155"></i>Free Window</span>
+            <span class="dna-legend-item"><span class="running-dash-icon"></span>Running Flow</span>
+          </div>
+
+          <!-- Zoomable / Pannable Hierarchy Tree Viewport -->
+          <div class="hierarchy-viewport" id="hierarchy-viewport">
+            <div class="hierarchy-stage" id="hierarchy-stage">
+              <svg class="hierarchy-edges-svg" id="hierarchy-edges-svg"></svg>
+              <div class="hierarchy-tiers-container" id="hierarchy-tiers-container"></div>
+            </div>
+
+            <!-- Floating Bottom-Right Tree Controls (Matches Screenshot 2) -->
+            <div class="hierarchy-toolbar">
+              <span class="toolbar-label">∟ Tree DAG</span>
+              <button class="toolbar-btn" id="btn-zoom-out" title="Zoom Out">−</button>
+              <span class="toolbar-zoom-val" id="zoom-level-label">100%</span>
+              <button class="toolbar-btn" id="btn-zoom-in" title="Zoom In">+</button>
+              <button class="toolbar-btn" id="btn-zoom-fit" title="Reset Zoom &amp; Pan">⤢ Fit</button>
+            </div>
+          </div>
         </div>
-        <div id="swarm-roles-grid" class="swarm-grid"></div>
+
+        <!-- RIGHT: Swarm Team Members + Delegated Tasks -->
+        <div class="swarm-right-col">
+          <!-- Top Right: Swarm Teams & Members (编队成员) -->
+          <div class="card">
+            <div class="card-header">
+              <div class="inline-pair">
+                <h3 class="card-title">Swarm Teams &amp; Members (编队成员)</h3>
+                <span class="pill-badge" id="team-members-count-badge">6 Agents</span>
+              </div>
+              <div class="filter-pills" id="member-filter-pills">
+                <button class="filter-pill active" data-filter="ALL">All</button>
+                <button class="filter-pill" data-filter="RUNNING">Running</button>
+                <button class="filter-pill" data-filter="COMPLETED">Completed</button>
+              </div>
+            </div>
+
+            <div class="member-controls-row">
+              <input type="text" id="member-search-input" class="input-field" placeholder="Search agent role, team, or model…" />
+              <select id="member-sort-select" class="input-field select-compact">
+                <option value="tier">Hierarchy Tier Order</option>
+                <option value="tokens">Token Usage (High → Low)</option>
+                <option value="steps">Step Count (High → Low)</option>
+              </select>
+            </div>
+
+            <div id="swarm-teams-container" class="swarm-teams-scroll"></div>
+          </div>
+
+          <!-- Middle Right: Team Tasks & Subagent Delegations (任务) -->
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h3 class="card-title">Delegated Tasks (团队任务与子 Agent 委派)</h3>
+              </div>
+              <div class="filter-pills" id="task-filter-pills">
+                <button class="filter-pill active" data-task-filter="ALL">All</button>
+                <button class="filter-pill" data-task-filter="RUNNING">Running</button>
+                <button class="filter-pill" data-task-filter="COMPLETED">Completed</button>
+              </div>
+            </div>
+            <div id="swarm-tasks-list" class="stack-list scroll-box"></div>
+          </div>
+        </div>
       </div>
 
-      <!-- Live Invoked Subagents (if any in session) -->
-      <div class="card">
-        <div class="card-header">
-          <div>
-            <span class="eyebrow">SESSION SUBAGENT INVOCATIONS</span>
-            <h3 class="card-title">Live Dispatched Subagents</h3>
-          </div>
-        </div>
-        <div id="live-subagents-list" class="stack-list"></div>
-      </div>
-
-      <!-- Connected MCP Servers & Tool Feed -->
+      <!-- Bottom Row: Inter-Agent Communication Bus (通讯记录) + MCP & Recent Tool Trace -->
       <div class="two-col">
         <div class="card">
           <div class="card-header">
             <div>
-              <span class="eyebrow">TOOL PROVIDERS</span>
-              <h3 class="card-title">Active MCP Servers</h3>
+              <span class="eyebrow">INTER-AGENT MESSAGE BUS</span>
+              <h3 class="card-title">Communication Log (通讯记录 — 跨 Agent 消息流)</h3>
             </div>
+            <span class="muted-text" id="comm-log-count">0 messages</span>
           </div>
-          <div id="mcp-servers-list" class="stack-list"></div>
+          <div id="inter-agent-messages-list" class="stack-list scroll-box"></div>
         </div>
 
         <div class="card">
           <div class="card-header">
             <div>
-              <span class="eyebrow">LIVE EXECUTION TRACE</span>
-              <h3 class="card-title">Recent Agent &amp; Swarm Tool Calls</h3>
+              <span class="eyebrow">ACTIVE MCP SERVERS &amp; LIVE TOOL STREAM</span>
+              <h3 class="card-title">Connected Tool Providers &amp; Recent Calls</h3>
             </div>
           </div>
+          <div id="mcp-servers-list" class="inline-pair" style="flex-wrap:wrap; margin-bottom:8px;"></div>
           <div id="recent-events-list" class="stack-list scroll-box"></div>
         </div>
       </div>
     </section>
 
-    <!-- TAB 2: HARNESS² PROPOSE-PROBE-COMPOSE STUDIO -->
+    <!-- =================================================================== -->
+    <!-- TAB 2: CONTEXT WINDOW & TOKEN DNA ANALYTICS (Matches Screenshot 1)  -->
+    <!-- =================================================================== -->
+    <section id="tab-context" class="tab-panel">
+      <!-- Top Row: Context Flow Overview (上下文统计) -->
+      <div class="card card-highlight">
+        <div class="card-header">
+          <div>
+            <span class="eyebrow">SESSION TELEMETRY &amp; I/O PIPELINE</span>
+            <h2 class="card-title">Context Statistics &amp; Token Flow (上下文统计)</h2>
+          </div>
+          <span class="pill-badge pill-ok" id="ctx-workspace-pill">Workspace: Active</span>
+        </div>
+
+        <div class="ctx-flow-grid">
+          <!-- Left Box: I/O & Context Events -->
+          <div class="ctx-flow-col">
+            <div class="ctx-stat-box">
+              <div class="ctx-stat-header">
+                <span>I/O Operations (输入输出)</span>
+                <strong id="ctx-io-total">31</strong>
+              </div>
+              <div class="ctx-mini-pills" id="ctx-io-pills"></div>
+            </div>
+
+            <div class="ctx-stat-box">
+              <div class="ctx-stat-header">
+                <span>Context Events (上下文事件)</span>
+                <strong id="ctx-events-total">5</strong>
+              </div>
+              <div class="ctx-mini-pills" id="ctx-events-pills"></div>
+            </div>
+          </div>
+
+          <!-- Left Flow Connector SVG -->
+          <div class="ctx-connector-col">
+            <svg viewBox="0 0 60 140" class="ctx-connector-svg">
+              <path d="M 2 35 C 30 35, 30 70, 58 70" fill="none" stroke="#10b981" stroke-width="2" stroke-dasharray="4 3" />
+              <path d="M 2 105 C 30 105, 30 70, 58 70" fill="none" stroke="#a855f7" stroke-width="2" />
+            </svg>
+          </div>
+
+          <!-- Center Hub: Current Session -->
+          <div class="ctx-session-hub">
+            <div class="ctx-hub-title">Current Session (当前会话)</div>
+            <div class="ctx-hub-metrics">
+              <div>
+                <strong id="ctx-session-turns">2</strong>
+                <span>Turns (轮次)</span>
+              </div>
+              <div>
+                <strong id="ctx-session-steps">24</strong>
+                <span>Steps (步数)</span>
+              </div>
+              <div>
+                <strong id="ctx-session-skills">3</strong>
+                <span>Skills (技能加载)</span>
+              </div>
+              <div>
+                <strong id="ctx-session-replies">11</strong>
+                <span>Replies (模型回复)</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Right Flow Connector SVG -->
+          <div class="ctx-connector-col">
+            <svg viewBox="0 0 60 140" class="ctx-connector-svg">
+              <path d="M 2 70 C 30 70, 30 35, 58 35" fill="none" stroke="#f59e0b" stroke-width="2" />
+              <path d="M 2 70 C 30 70, 30 105, 58 105" fill="none" stroke="#38bdf8" stroke-width="2" stroke-dasharray="4 3" />
+            </svg>
+          </div>
+
+          <!-- Right Box: Tool Calls & Agent Network Split -->
+          <div class="ctx-flow-col">
+            <div class="ctx-stat-box">
+              <div class="ctx-stat-header">
+                <span>Tool Calls (工具调用)</span>
+                <strong id="ctx-tools-total">25</strong>
+              </div>
+              <div class="ctx-mini-pills" id="ctx-tools-pills"></div>
+            </div>
+
+            <div class="ctx-stat-box">
+              <div class="ctx-stat-header">
+                <span>Agent Network (Agent 网络)</span>
+                <strong id="ctx-net-total">2.4M</strong>
+              </div>
+              <div class="ctx-net-rows" id="ctx-net-rows"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Middle Row: Token Statistics Donut + Latency Breakdown Donut -->
+      <div class="two-col">
+        <!-- Token Statistics (Token 统计) -->
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">Token Statistics (Token 统计)</h3>
+            <span class="muted-text" id="ctx-cache-hit">Cache Hit 94.2%</span>
+          </div>
+          <div class="donut-panel">
+            <div class="donut-wrap" id="token-donut-wrap"></div>
+            <div class="donut-legend-grid" id="token-legend-grid"></div>
+          </div>
+        </div>
+
+        <!-- Latency Statistics (耗时统计) -->
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">Latency &amp; Time Breakdown (耗时统计)</h3>
+            <span class="muted-text" id="ctx-output-speed">Output Speed 228 tok/s</span>
+          </div>
+          <div class="donut-panel">
+            <div class="donut-wrap" id="latency-donut-wrap"></div>
+            <div class="donut-legend-grid" id="latency-legend-grid"></div>
+          </div>
+          <!-- Horizontal Multi-Segment Timeline Bar -->
+          <div class="latency-timeline-bar" id="latency-timeline-bar"></div>
+          <div class="latency-timeline-ticks" id="latency-timeline-ticks"></div>
+        </div>
+      </div>
+
+      <!-- Bottom Row: Current Context Window + Trend Chart (Left) & Context DNA Browser (Right) -->
+      <div class="two-col">
+        <div class="stack-list" style="gap:12px;">
+          <!-- Current Context Window (当前上下文) -->
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">Current Context Window (当前上下文)</h3>
+              <span class="muted-text" id="ctx-window-model">Gemini 4 Argon · Gravity Well</span>
+            </div>
+            <div class="ctx-window-hero">
+              <div>
+                <span class="ctx-window-used" id="ctx-window-used">110.2k</span>
+                <span class="muted-text" id="ctx-window-max">/ 512.0k tokens</span>
+              </div>
+              <div>
+                <span class="ctx-window-pct" id="ctx-window-pct">21.5%</span>
+                <span class="muted-text">Context Used</span>
+              </div>
+            </div>
+            <div class="ctx-dna-bar-track" id="ctx-window-dna-bar"></div>
+            <div class="donut-legend-grid" id="ctx-window-legend" style="margin-top:10px;"></div>
+          </div>
+
+          <!-- Context Trend Step Chart (上下文趋势) -->
+          <div class="card">
+            <div class="card-header">
+              <div class="inline-pair">
+                <h3 class="card-title">Context Trend (上下文趋势)</h3>
+                <span class="pill-badge">DNA Mode + Latency</span>
+              </div>
+              <span class="muted-text" id="ctx-trend-footer">Steps 1 → N</span>
+            </div>
+            <div id="ctx-trend-chart-box" class="ctx-trend-chart-box"></div>
+          </div>
+        </div>
+
+        <!-- Context DNA Browser (上下文浏览器 — DNA 模式) -->
+        <div class="card">
+          <div class="card-header">
+            <div class="inline-pair">
+              <h3 class="card-title">Context DNA Browser (上下文浏览器)</h3>
+              <span class="pill-badge pill-ok">DNA Mode</span>
+            </div>
+            <span class="muted-text" id="ctx-browser-summary">Current · Next Request</span>
+          </div>
+          <div class="ctx-dna-bar-track" id="ctx-browser-dna-bar" style="margin-bottom:10px;"></div>
+          <div id="ctx-dna-browser-list" class="stack-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- =================================================================== -->
+    <!-- TAB 3: HARNESS² PROPOSE-PROBE-COMPOSE STUDIO                        -->
+    <!-- =================================================================== -->
     <section id="tab-harness2" class="tab-panel">
-      <!-- Snapshot Isolation Lock Controller -->
       <div class="card card-highlight">
         <div class="card-header">
           <div>
@@ -144,7 +411,7 @@
         </p>
         <div id="active-lock-details" class="lock-details-box"></div>
         <div class="controls-row">
-          <input type="text" id="snap-domain-input" class="input-field" value="software-engineering" placeholder="Domain (e.g. software-engineering)" />
+          <input type="text" id="snap-domain-input" class="input-field select-medium" value="software-engineering" placeholder="Domain (e.g. software-engineering)" />
           <select id="snap-mode-select" class="input-field select-compact">
             <option value="parallel">Parallel Swarm</option>
             <option value="sequential">Sequential</option>
@@ -155,7 +422,6 @@
         </div>
       </div>
 
-      <!-- Per-Domain Experience Library (INDEX.md & EXPERIENCE.md) -->
       <div class="card">
         <div class="card-header">
           <div>
@@ -166,7 +432,6 @@
         <div id="experiences-list" class="stack-list"></div>
       </div>
 
-      <!-- Record New Harness² Experience Lesson -->
       <div class="card">
         <div class="card-header">
           <div>
@@ -218,12 +483,12 @@
       </div>
     </section>
 
-    <!-- TAB 3: LOCAL RAG & KNOWLEDGE EXPLORER -->
+    <!-- =================================================================== -->
+    <!-- TAB 4: LOCAL RAG & KNOWLEDGE EXPLORER                               -->
+    <!-- =================================================================== -->
     <section id="tab-rag" class="tab-panel">
-      <!-- Collection Health Summary -->
       <div class="three-col" id="rag-collections-cards"></div>
 
-      <!-- Search Card -->
       <div class="card card-highlight">
         <div class="card-header">
           <div>
@@ -248,7 +513,6 @@
           <button class="btn btn-primary" id="btn-run-search">Search</button>
         </div>
 
-        <!-- Preset Benchmark Query Chips -->
         <div class="preset-chips">
           <span class="muted-text">Benchmark Queries:</span>
           <button class="chip-btn" data-preset="What evidence supported our previous choice of memory architecture?">Memory Architecture Evidence</button>
@@ -261,7 +525,6 @@
         <div id="rag-results-list" class="stack-list" style="margin-top: 10px;"></div>
       </div>
 
-      <!-- Document Reader Drawer -->
       <div id="doc-viewer-card" class="card hidden">
         <div class="card-header">
           <div>
@@ -273,7 +536,6 @@
         <pre id="viewer-doc-content" class="code-viewer"></pre>
       </div>
 
-      <!-- Quick Add Markdown Knowledge Note -->
       <div class="card">
         <div class="card-header">
           <div>
@@ -317,13 +579,15 @@
       </div>
     </section>
 
-    <!-- TAB 4: EASY-TO-UNDERSTAND VISUAL SETTINGS MANAGER -->
+    <!-- =================================================================== -->
+    <!-- TAB 5: EASY-TO-UNDERSTAND VISUAL SETTINGS MANAGER                   -->
+    <!-- =================================================================== -->
     <section id="tab-settings" class="tab-panel">
       <div class="card card-highlight">
         <div class="card-header">
           <div>
             <span class="eyebrow">LOCAL-FIRST CONFIGURATION (.harness/config.json)</span>
-            <h2 class="card-title">Easy-to-Understand Harness² &amp; RAG Settings</h2>
+            <h2 class="card-title">Gravity Well Harness &amp; Local RAG Settings</h2>
           </div>
           <button class="btn btn-primary" id="btn-save-settings">💾 Save All Settings</button>
         </div>
@@ -332,7 +596,6 @@
         </p>
       </div>
 
-      <!-- 1. Local RAG Backend Settings -->
       <div class="card">
         <div class="card-header">
           <div>
@@ -382,7 +645,6 @@
         </div>
       </div>
 
-      <!-- 2. External Documentation MCP Settings -->
       <div class="card">
         <div class="card-header">
           <div>
@@ -417,7 +679,6 @@
         </div>
       </div>
 
-      <!-- 3. Harness² Engine & Snapshot Isolation Settings -->
       <div class="card">
         <div class="card-header">
           <div>
@@ -462,7 +723,6 @@
         </div>
       </div>
 
-      <!-- 4. Lifecycle Hooks & Monitor Settings -->
       <div class="card">
         <div class="card-header">
           <div>

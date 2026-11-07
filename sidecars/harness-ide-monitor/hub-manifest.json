@@ -1,19 +1,19 @@
 {
   "id": "harness-ide-monitor",
-  "name": "Harness² Swarm & RAG Monitor",
-  "tagline": "Main Agent + Subagent Swarm Monitor, Harness² Studio, Local Hybrid RAG Explorer & Settings UI",
-  "description": "Turns Google Antigravity into an effective Recursive Agent Harnessing IDE with real-time Subagent Swarm topology visualization, Harness² Propose-Probe-Compose snapshot isolation controls, QMD local hybrid RAG search, and easy-to-understand settings.",
-  "version": "1.0.0",
+  "name": "Gravity Well Harness — Swarm & RAG Monitor",
+  "tagline": "Dynamic Subagent Swarm Hierarchy, Context DNA Analytics, Harness² Studio & Local Hybrid RAG",
+  "description": "Gravity Well Harness turns Google Antigravity into an effective Recursive Agent Harnessing IDE with a dynamic multi-tier Subagent Swarm hierarchy map, team formations, Context Window & Token DNA analytics, Harness² Propose-Probe-Compose snapshot isolation controls, QMD local hybrid RAG search, and smooth workspace switching.",
+  "version": "1.1.0",
   "author": {
-    "name": "Harness2-RAG-Antigravity",
-    "github": "https://github.com/google-research/harness2"
+    "name": "BaiTian6641",
+    "github": "https://github.com/BaiTian6641/Gravity-Well-Harness"
   },
   "license": "Apache-2.0",
   "pricing": "free",
   "categories": ["agents", "rag", "monitoring", "utilities"],
   "capabilityTier": "TIER_1_TELEMETRY",
   "workspaceTriggers": {
-    "files": [".harness/config.json", "package.json", "PLAN.md"]
+    "files": ["*"]
   },
   "minAntigravityVersion": "2.0.0"
 }

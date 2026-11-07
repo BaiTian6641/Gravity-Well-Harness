@@ -1,10 +1,35 @@
 (function () {
+  // Workspace & Host Tracking State
+  const urlParams = new URLSearchParams(window.location?.search || '');
+  let autoFollowWorkspace = true;
+  let pinnedWorkspaceRoot = '';
+  let currentWorkspaceRoot = '';
+  let hostClientWorkspaceUris = [];
+  let hostConversationId =
+    urlParams.get('conversationId') || window.sidecar?.conversationId || '';
+
+  if (urlParams.get('workspace')) {
+    hostClientWorkspaceUris = [urlParams.get('workspace')];
+  } else if (window.sidecar?.workspace) {
+    hostClientWorkspaceUris = [window.sidecar.workspace];
+  }
+
   const apiFetch = async (endpoint, payload = {}) => {
     const fn = window.sidecar?.fetch || window.fetch.bind(window);
+    const bodyPayload = {
+      ...payload,
+      ...( !autoFollowWorkspace && pinnedWorkspaceRoot
+        ? { workspaceRoot: pinnedWorkspaceRoot, pinnedWorkspace: true }
+        : {} ),
+      ...( hostClientWorkspaceUris.length > 0
+        ? { clientWorkspaceUris: hostClientWorkspaceUris }
+        : {} ),
+      ...( hostConversationId ? { conversationId: hostConversationId } : {} ),
+    };
     const res = await fn(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(bodyPayload),
     });
     return res.json();
   };
@@ -24,6 +49,50 @@
     window.__toastTimer = setTimeout(() => el.classList.add('hidden'), 4200);
   };
 
+  function animateWorkspaceTransition(newWsName, newWsPath) {
+    const rootEl = document.getElementById('app-root');
+    if (rootEl) {
+      rootEl.classList.add('workspace-switching');
+      setTimeout(() => rootEl.classList.remove('workspace-switching'), 260);
+    }
+    showToast(`⚡ Active Workspace: ${newWsName} (${newWsPath})`);
+  }
+
+  // Listen for live workspace changes pushed by Antigravity host
+  if (typeof window.sidecar?.onWorkspaceChange === 'function') {
+    try {
+      window.sidecar.onWorkspaceChange((uris) => {
+        const list = Array.isArray(uris) ? uris : uris ? [String(uris)] : [];
+        if (list.length > 0) {
+          hostClientWorkspaceUris = list;
+          if (autoFollowWorkspace) {
+            pinnedWorkspaceRoot = '';
+            refreshDashboard(true);
+          }
+        }
+      });
+    } catch {}
+  }
+
+  window.addEventListener('message', (ev) => {
+    const d = ev?.data;
+    if (!d || typeof d !== 'object') return;
+    if (d.type === 'workspace-change' || d.type === 'sidecar-workspace') {
+      const uris = d.payload?.workspaceUris || d.workspaceUris || (d.workspace ? [d.workspace] : []);
+      if (Array.isArray(uris) && uris.length > 0) {
+        hostClientWorkspaceUris = uris;
+        if (autoFollowWorkspace) {
+          pinnedWorkspaceRoot = '';
+          refreshDashboard(true);
+        }
+      }
+    }
+    if (d.conversationId && d.conversationId !== hostConversationId) {
+      hostConversationId = d.conversationId;
+      if (autoFollowWorkspace) refreshDashboard(true);
+    }
+  });
+
   // Tab navigation
   document.querySelectorAll('.tab-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
@@ -33,100 +102,432 @@
       btn.classList.add('active');
       const panel = document.getElementById(`tab-${target}`);
       if (panel) panel.classList.add('active');
+      if (target === 'swarm') {
+        requestAnimationFrame(() => drawHierarchyEdges());
+      }
     });
   });
 
+  // UI State for Swarm Formation & Context DNA
   let latestDashboard = null;
-  let settingsInitialized = false;
+  let settingsInitializedForWs = '';
+  let activeFormationId = 'live-harness2';
+  let selectedNodeId = null;
+  let memberStatusFilter = 'ALL';
+  let taskStatusFilter = 'ALL';
+  let memberSearchQuery = '';
+  let memberSortMode = 'tier';
+  let zoomScale = 1.0;
+  const expandedDnaKeys = new Set(['injectedRag', 'toolResults']);
+
+  const DNA_COLORS = {
+    systemPrompt: '#6366f1',
+    toolDefinitions: '#f59e0b',
+    userMessages: '#10b981',
+    injectedRag: '#a855f7',
+    skillInjection: '#f97316',
+    assistantMessages: '#3b82f6',
+    toolResults: '#14b8a6',
+    freeWindow: '#334155',
+  };
+
+  function renderWorkspaceHeader(data) {
+    const wsRoot = data.workspaceRoot || '';
+    const wsName = data.workspaceName || 'Workspace';
+    const hasHarness = data.hasHarness !== false;
+
+    if (currentWorkspaceRoot && currentWorkspaceRoot.toLowerCase() !== wsRoot.toLowerCase()) {
+      animateWorkspaceTransition(wsName, wsRoot);
+      settingsInitializedForWs = '';
+    }
+    currentWorkspaceRoot = wsRoot;
+
+    const labelEl = document.getElementById('workspace-label');
+    if (labelEl) {
+      labelEl.textContent = `${wsName} — ${wsRoot}`;
+    }
+
+    const uninitBanner = document.getElementById('uninitialized-workspace-banner');
+    const uninitName = document.getElementById('uninit-ws-name');
+    if (uninitBanner) {
+      if (!hasHarness) {
+        if (uninitName) uninitName.textContent = wsName;
+        uninitBanner.classList.remove('hidden');
+      } else {
+        uninitBanner.classList.add('hidden');
+      }
+    }
+
+    const wsSelect = document.getElementById('workspace-switcher-select');
+    const workspaces = data.availableWorkspaces || [];
+    if (wsSelect && workspaces.length > 0) {
+      wsSelect.innerHTML = workspaces
+        .map((w) => {
+          const isSel = w.path.toLowerCase() === wsRoot.toLowerCase();
+          const badge = w.hasHarness ? '✓ .harness' : 'new';
+          return `<option value="${escapeHtml(w.path)}" ${isSel ? 'selected' : ''}>${escapeHtml(w.name)} (${badge})</option>`;
+        })
+        .join('');
+    }
+
+    const autoBtn = document.getElementById('btn-auto-follow-ws');
+    if (autoBtn) {
+      autoBtn.classList.toggle('active', autoFollowWorkspace);
+      autoBtn.textContent = autoFollowWorkspace ? '⚡ Auto-Follow IDE' : '📌 Pinned';
+    }
+  }
+
+  // =========================================================================
+  // TAB 1: DYNAMIC MULTI-TIER SUBAGENT SWARM HIERARCHY & TEAM FORMATION
+  // =========================================================================
+  function getActiveFormation(data) {
+    const formations = data?.swarm?.formations || {};
+    return (
+      formations[activeFormationId] ||
+      formations['live-harness2'] ||
+      Object.values(formations)[0] ||
+      null
+    );
+  }
+
+  function getLineageSet(formation, targetNodeId) {
+    if (!targetNodeId || !formation) return null;
+    const related = new Set([targetNodeId]);
+    const nodesById = new Map((formation.nodes || []).map((n) => [n.id, n]));
+
+    // Walk ancestors
+    const upQueue = [targetNodeId];
+    while (upQueue.length > 0) {
+      const curr = upQueue.shift();
+      const node = nodesById.get(curr);
+      for (const pid of node?.parentIds || []) {
+        if (!related.has(pid)) {
+          related.add(pid);
+          upQueue.push(pid);
+        }
+      }
+    }
+
+    // Walk descendants
+    const downQueue = [targetNodeId];
+    while (downQueue.length > 0) {
+      const curr = downQueue.shift();
+      for (const n of formation.nodes || []) {
+        if ((n.parentIds || []).includes(curr) && !related.has(n.id)) {
+          related.add(n.id);
+          downQueue.push(n.id);
+        }
+      }
+    }
+
+    return related;
+  }
+
+  function renderNodeDnaBar(dna = {}) {
+    const keys = [
+      'systemPrompt',
+      'toolDefinitions',
+      'userMessages',
+      'injectedRag',
+      'skillInjection',
+      'assistantMessages',
+      'toolResults',
+      'freeWindow',
+    ];
+    return `
+      <div class="h-node-dna-bar">
+        ${keys
+          .map((k) => {
+            const w = Math.max(0, Number(dna[k] || 0));
+            return `<span class="h-node-dna-seg" style="width:${w}%; background:${DNA_COLORS[k]}"></span>`;
+          })
+          .join('')}
+      </div>
+    `;
+  }
+
+  function drawHierarchyEdges() {
+    const formation = getActiveFormation(latestDashboard);
+    const svg = document.getElementById('hierarchy-edges-svg');
+    const stage = document.getElementById('hierarchy-stage');
+    if (!formation || !svg || !stage) return;
+
+    const stageRect = stage.getBoundingClientRect();
+    const scale = zoomScale || 1;
+    const width = Math.max(stage.scrollWidth, stageRect.width / scale);
+    const height = Math.max(stage.scrollHeight, stageRect.height / scale);
+    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    svg.style.width = `${width}px`;
+    svg.style.height = `${height}px`;
+
+    const lineage = getLineageSet(formation, selectedNodeId);
+    const pathsHtml = [];
+
+    for (const edge of formation.edges || []) {
+      const fromEl = stage.querySelector(`[data-node-id="${edge.from}"]`);
+      const toEl = stage.querySelector(`[data-node-id="${edge.to}"]`);
+      if (!fromEl || !toEl) continue;
+
+      const r1 = fromEl.getBoundingClientRect();
+      const r2 = toEl.getBoundingClientRect();
+
+      const x1 = (r1.left - stageRect.left + r1.width / 2) / scale;
+      const y1 = (r1.bottom - stageRect.top) / scale;
+      const x2 = (r2.left - stageRect.left + r2.width / 2) / scale;
+      const y2 = (r2.top - stageRect.top) / scale;
+      const midY = y1 + (y2 - y1) * 0.5;
+
+      const isHighlighted = lineage && lineage.has(edge.from) && lineage.has(edge.to);
+      const isDimmed = lineage && !isHighlighted;
+      const runningCls = edge.status === 'RUNNING' ? 'edge-running' : '';
+      const focusCls = isHighlighted ? 'edge-highlighted' : isDimmed ? 'edge-dimmed' : '';
+      const strokeColor = edge.status === 'RUNNING' ? '#10b981' : edge.color || '#38bdf8';
+
+      pathsHtml.push(
+        `<path class="edge-path ${runningCls} ${focusCls}" d="M ${x1} ${y1} C ${x1} ${midY}, ${x2} ${midY}, ${x2} ${y2}" stroke="${strokeColor}" />`
+      );
+      pathsHtml.push(
+        `<circle cx="${x2}" cy="${y2 - 2}" r="3" fill="${strokeColor}" opacity="${isDimmed ? 0.2 : 0.9}" />`
+      );
+    }
+
+    svg.innerHTML = pathsHtml.join('');
+  }
 
   function renderSwarmTab(data) {
     const swarm = data.swarm || {};
-    const main = swarm.mainAgent || {};
+    const formation = getActiveFormation(data);
+    if (!formation) return;
 
-    document.getElementById('workspace-label').textContent =
-      `Workspace: ${data.workspaceRoot || main.workspaceRoot || 'local'}`;
-    document.getElementById('main-agent-role').textContent =
-      main.role || 'Main Orchestrator Agent';
-    document.getElementById('main-agent-model').textContent =
-      main.model || 'Gemini 4 Argon';
-    document.getElementById('main-agent-steps').textContent = String(main.totalSteps ?? 0);
-    document.getElementById('main-agent-subcount').textContent = String(
-      (swarm.liveSubagents || []).length
+    const sum = formation.summary || {};
+    document.getElementById('swarm-sum-total').textContent = `${sum.totalAgents || 0} Agents`;
+    document.getElementById('swarm-sum-running').textContent = `● ${sum.runningCount || 0} Running`;
+    document.getElementById('swarm-sum-completed').textContent = `✓ ${sum.completedCount || 0} Completed`;
+    document.getElementById('swarm-sum-context').textContent = `Total Context: ${sum.totalContextFormatted || '0'}`;
+    document.getElementById('swarm-sum-cost').textContent = `Est. Cost: ${sum.estimatedCostFormatted || '$0.00'}`;
+
+    const progPct = Math.round(
+      ((sum.progressCompleted || 0) / Math.max(1, sum.progressTotal || 1)) * 100
     );
-    document.getElementById('main-agent-ls').textContent = swarm.lsConnected
-      ? 'Connected (LS RPC)'
-      : 'Local Transcript Sync';
-    document.getElementById('main-agent-prompt').textContent =
-      main.lastUserPrompt || 'Active coding & harnessing session';
+    document.getElementById('swarm-progress-fill').style.width = `${progPct}%`;
+    document.getElementById('swarm-progress-label').textContent =
+      `${sum.progressCompleted || 0}/${sum.progressTotal || 1}`;
 
-    // Render 4 Harness2 Swarm Roles
-    const rolesGrid = document.getElementById('swarm-roles-grid');
-    const roles = swarm.configuredSwarmRoles || [];
-    rolesGrid.innerHTML = roles
+    document.getElementById('formation-title').textContent = formation.name;
+
+    // Group nodes by tier (0, 1, 2, 3)
+    const tiersMap = new Map();
+    for (const node of formation.nodes || []) {
+      const t = Number(node.tier || 0);
+      if (!tiersMap.has(t)) tiersMap.set(t, []);
+      tiersMap.get(t).push(node);
+    }
+    const sortedTiers = Array.from(tiersMap.entries()).sort((a, b) => a[0] - b[0]);
+    const lineage = getLineageSet(formation, selectedNodeId);
+
+    const tiersContainer = document.getElementById('hierarchy-tiers-container');
+    tiersContainer.innerHTML = sortedTiers
       .map(
-        (r) => `
-      <div class="swarm-node">
-        <div class="swarm-node-top">
-          <span class="swarm-node-title">${escapeHtml(r.role)}</span>
-          <span class="status-chip ${r.workspace === 'branch' ? 'status-branch' : 'status-active'}">
-            ${escapeHtml(r.workspace === 'branch' ? 'branch' : r.status)}
-          </span>
+        ([tierNum, nodes]) => `
+        <div class="hierarchy-tier-row" data-tier="${tierNum}">
+          ${nodes
+            .map((n) => {
+              const isSelected = selectedNodeId === n.id;
+              const isDimmed = lineage && !lineage.has(n.id);
+              const dotClass =
+                n.status === 'RUNNING'
+                  ? 'dot-running'
+                  : n.status === 'COMPLETED'
+                    ? 'dot-completed'
+                    : 'dot-standby';
+              const badgeText = n.isCurrent
+                ? 'Current'
+                : n.workspace === 'branch'
+                  ? 'branch'
+                  : `T${n.tier}`;
+              const badgeClass = n.workspace === 'branch' ? 'badge-branch' : '';
+
+              return `
+                <div class="h-node-card ${n.status === 'RUNNING' ? 'node-running' : ''} ${n.isCurrent ? 'node-current' : ''} ${isSelected ? 'node-selected' : ''} ${isDimmed ? 'node-dimmed' : ''}" data-node-id="${escapeHtml(n.id)}">
+                  <div class="h-node-header">
+                    <div class="h-node-title-wrap">
+                      <span class="status-dot ${dotClass}"></span>
+                      <span class="h-node-title" title="${escapeHtml(n.role)}">${escapeHtml(n.role)}</span>
+                    </div>
+                    <span class="h-node-badge ${badgeClass}">${escapeHtml(badgeText)}</span>
+                  </div>
+                  <div class="h-node-tokens">${escapeHtml(n.totalTokensFormatted)} · ${escapeHtml(n.costFormatted)}</div>
+                  ${renderNodeDnaBar(n.dna)}
+                  <div class="h-node-footer">
+                    <span>${escapeHtml(n.durationFormatted)}</span>
+                    <span class="h-node-pct">${Number(n.contextUsedPct || 0)}%</span>
+                  </div>
+                </div>
+              `;
+            })
+            .join('')}
         </div>
-        <div class="muted-text">Agent: <code>${escapeHtml(r.typeName)}</code> | Workspace: <code>${escapeHtml(r.workspace)}</code></div>
-        <div class="muted-text">${escapeHtml(r.description)}</div>
-      </div>
-    `
+      `
       )
       .join('');
 
-    // Render Live Invoked Subagents
-    const liveList = document.getElementById('live-subagents-list');
-    const liveSubs = swarm.liveSubagents || [];
-    if (liveSubs.length === 0) {
-      liveList.innerHTML = `<div class="muted-text">No subagents spawned in the current turn yet. Invoke <code>harness-proposer</code>, <code>harness-prober</code> (with <code>Workspace: "branch"</code>), or <code>research</code> to see live swarm nodes here.</div>`;
-    } else {
-      liveList.innerHTML = liveSubs
-        .map(
-          (s) => `
-        <div class="list-item">
-          <div class="list-item-header">
-            <span class="list-item-title">${escapeHtml(s.role)} (<code>${escapeHtml(s.typeName)}</code>)</span>
-            <span class="status-chip ${s.workspace === 'branch' ? 'status-branch' : 'status-active'}">
-              Workspace: ${escapeHtml(s.workspace || 'inherit')} • ${escapeHtml(s.status || 'DONE')}
-            </span>
+    tiersContainer.querySelectorAll('.h-node-card').forEach((card) => {
+      card.addEventListener('click', () => {
+        const nid = card.getAttribute('data-node-id');
+        selectedNodeId = selectedNodeId === nid ? null : nid;
+        renderSwarmTab(latestDashboard);
+      });
+    });
+
+    requestAnimationFrame(() => drawHierarchyEdges());
+
+    // Render Right Top: Swarm Teams & Members (编队成员)
+    const teamsContainer = document.getElementById('swarm-teams-container');
+    document.getElementById('team-members-count-badge').textContent =
+      `${(formation.nodes || []).length} Agents`;
+
+    teamsContainer.innerHTML = (formation.teams || [])
+      .map((team) => {
+        let members = [...(team.members || [])];
+        if (memberStatusFilter !== 'ALL') {
+          members = members.filter((m) => m.status === memberStatusFilter);
+        }
+        if (memberSearchQuery) {
+          const q = memberSearchQuery.toLowerCase();
+          members = members.filter(
+            (m) =>
+              m.role.toLowerCase().includes(q) ||
+              m.model.toLowerCase().includes(q) ||
+              team.teamName.toLowerCase().includes(q)
+          );
+        }
+        if (memberSortMode === 'tokens') {
+          members.sort((a, b) => (b.totalTokens || 0) - (a.totalTokens || 0));
+        } else if (memberSortMode === 'steps') {
+          members.sort((a, b) => (b.steps || 0) - (a.steps || 0));
+        }
+
+        if (members.length === 0) return '';
+
+        return `
+          <div class="team-group-block">
+            <div class="team-group-header">
+              <span>${escapeHtml(team.teamName)}</span>
+              <span>${members.length} members</span>
+            </div>
+            <div class="team-members-grid">
+              ${members
+                .map((m) => {
+                  const isRunning = m.status === 'RUNNING';
+                  const isSel = selectedNodeId === m.id;
+                  return `
+                    <div class="member-card ${isRunning ? 'member-running' : ''} ${isSel ? 'member-selected' : ''}" data-member-id="${escapeHtml(m.id)}">
+                      <div class="member-card-top">
+                        <span class="member-role" title="${escapeHtml(m.role)}">${escapeHtml(m.role)}</span>
+                        <span class="status-dot ${isRunning ? 'dot-running' : 'dot-completed'}"></span>
+                      </div>
+                      <div class="member-meta">${escapeHtml(m.status === 'RUNNING' ? 'Running' : 'Completed')} · <code>${escapeHtml(m.model)}</code></div>
+                      <div class="member-report">${escapeHtml(m.latestReport || '')}</div>
+                      <div class="member-footer">
+                        <span>${escapeHtml(m.contextTokensFormatted)} · ${escapeHtml(m.durationFormatted)}</span>
+                        <span>→</span>
+                      </div>
+                    </div>
+                  `;
+                })
+                .join('')}
+            </div>
           </div>
-          <div class="muted-text">${escapeHtml(s.promptPreview || '')}</div>
-        </div>
-      `
+        `;
+      })
+      .join('');
+
+    teamsContainer.querySelectorAll('.member-card').forEach((card) => {
+      card.addEventListener('click', () => {
+        const mid = card.getAttribute('data-member-id');
+        selectedNodeId = selectedNodeId === mid ? null : mid;
+        renderSwarmTab(latestDashboard);
+      });
+    });
+
+    // Render Right Middle: Delegated Tasks (任务)
+    const tasksListEl = document.getElementById('swarm-tasks-list');
+    let tasks = [...(formation.tasks || [])];
+    if (selectedNodeId && selectedNodeId !== formation.nodes?.[0]?.id) {
+      tasks = tasks.filter((t) => t.agentId === selectedNodeId);
+    }
+    if (taskStatusFilter !== 'ALL') {
+      tasks = tasks.filter((t) => t.status === taskStatusFilter);
+    }
+
+    if (tasks.length === 0) {
+      tasksListEl.innerHTML = `<div class="muted-text">No matching delegated tasks for current filter.</div>`;
+    } else {
+      tasksListEl.innerHTML = tasks
+        .map(
+          (t) => `
+          <div class="list-item">
+            <div class="list-item-header">
+              <span class="list-item-title">
+                <span class="status-dot ${t.status === 'RUNNING' ? 'dot-running' : 'dot-completed'}" style="display:inline-block;margin-right:5px;"></span>
+                ${escapeHtml(t.role)}
+              </span>
+              <div class="inline-pair">
+                <span class="status-chip ${t.workspace === 'branch' ? 'status-branch' : 'status-active'}">
+                  ${escapeHtml(t.workspace === 'branch' ? 'Workspace: branch' : 'inherit')}
+                </span>
+                <span class="pill-badge">${escapeHtml(t.status === 'RUNNING' ? 'In Progress' : 'Completed')}</span>
+              </div>
+            </div>
+            <div class="muted-text">${escapeHtml(t.prompt)}</div>
+            <div class="muted-text">${escapeHtml(t.tokensFormatted)} · ${escapeHtml(t.durationFormatted)}</div>
+          </div>
+        `
         )
         .join('');
     }
 
-    // Render MCP Servers
-    const mcpList = document.getElementById('mcp-servers-list');
-    mcpList.innerHTML = (swarm.mcpServers || [])
+    // Render Bottom Left: Inter-Agent Communication Bus (通讯记录)
+    const commListEl = document.getElementById('inter-agent-messages-list');
+    let messages = [...(formation.messages || [])];
+    if (selectedNodeId) {
+      const selNode = (formation.nodes || []).find((n) => n.id === selectedNodeId);
+      if (selNode) {
+        messages = messages.filter(
+          (m) => m.from === selNode.role || m.to === selNode.role
+        );
+      }
+    }
+    document.getElementById('comm-log-count').textContent = `${messages.length} messages`;
+    commListEl.innerHTML = messages
       .map(
         (m) => `
-      <div class="list-item">
-        <div class="list-item-header">
-          <span class="list-item-title"><code>${escapeHtml(m.name)}</code></span>
-          <span class="status-chip status-active">${escapeHtml(m.status)} (${Number(m.toolCount || 0)} tools)</span>
+        <div class="list-item">
+          <div class="list-item-header">
+            <span class="list-item-title">${escapeHtml(m.from)} → ${escapeHtml(m.to)}</span>
+            <span class="pill-badge ${m.direction === 'DELEGATE' ? '' : 'pill-ok'}">${escapeHtml(m.direction)} · ${escapeHtml(m.tokensFormatted)}</span>
+          </div>
+          <div class="muted-text">${escapeHtml(m.summary)}</div>
         </div>
-      </div>
-    `
+      `
       )
       .join('');
 
-    // Render Recent Tool Calls
+    // Render Bottom Right: MCP Servers & Live Tool Calls
+    const mcpList = document.getElementById('mcp-servers-list');
+    mcpList.innerHTML = (swarm.mcpServers || [])
+      .map(
+        (m) =>
+          `<span class="pill-badge pill-ok"><code>${escapeHtml(m.name)}</code> (${Number(m.toolCount || 0)} tools)</span>`
+      )
+      .join('');
+
     const eventsList = document.getElementById('recent-events-list');
     const events = swarm.recentEvents || [];
-    if (events.length === 0) {
-      eventsList.innerHTML = `<div class="muted-text">No recent tool calls recorded yet.</div>`;
-    } else {
-      eventsList.innerHTML = events
-        .slice(0, 15)
-        .map(
-          (ev) => `
+    eventsList.innerHTML = events
+      .slice(0, 12)
+      .map(
+        (ev) => `
         <div class="list-item">
           <div class="list-item-header">
             <span class="list-item-title"><code>${escapeHtml(ev.toolName)}</code></span>
@@ -135,11 +536,299 @@
           <div class="muted-text">${escapeHtml(ev.summary || '')}</div>
         </div>
       `
-        )
-        .join('');
-    }
+      )
+      .join('');
   }
 
+  // =========================================================================
+  // TAB 2: CONTEXT WINDOW & TOKEN DNA ANALYTICS (Screenshot 1)
+  // =========================================================================
+  function buildSvgDonut(categories, centerTopText, centerSubText) {
+    const r = 44;
+    const c = 2 * Math.PI * r;
+    let offset = 0;
+    const circles = categories
+      .map((cat) => {
+        const pct = Math.max(0, Number(cat.pct || 0));
+        const len = (pct / 100) * c;
+        const svgSeg = `<circle cx="60" cy="60" r="${r}" fill="transparent" stroke="${cat.color}" stroke-width="13" stroke-dasharray="${len} ${c - len}" stroke-dashoffset="${-offset}" transform="rotate(-90 60 60)" />`;
+        offset += len;
+        return svgSeg;
+      })
+      .join('');
+
+    return `
+      <svg width="120" height="120" viewBox="0 0 120 120">
+        <circle cx="60" cy="60" r="${r}" fill="transparent" stroke="rgba(148,163,184,0.12)" stroke-width="13" />
+        ${circles}
+      </svg>
+      <div class="donut-center-label">
+        <span class="donut-center-val">${escapeHtml(centerTopText)}</span>
+        <span class="donut-center-sub">${escapeHtml(centerSubText)}</span>
+      </div>
+    `;
+  }
+
+  function renderContextTab(data) {
+    const ctx = data.contextAnalytics;
+    if (!ctx) return;
+
+    document.getElementById('ctx-workspace-pill').textContent =
+      `Workspace: ${data.workspaceName || 'Active'}`;
+
+    // 1. Flow Summary
+    const flow = ctx.flowSummary || {};
+    const io = flow.io || {};
+    document.getElementById('ctx-io-total').textContent = String(io.total || 0);
+    document.getElementById('ctx-io-pills').innerHTML = `
+      <span class="ctx-mini-pill">User Input <strong>${Number(io.userInputs || 0)}</strong></span>
+      <span class="ctx-mini-pill">Read <strong>${Number(io.reads || 0)}</strong></span>
+      <span class="ctx-mini-pill">Write <strong>${Number(io.writes || 0)}</strong></span>
+      <span class="ctx-mini-pill">Search <strong>${Number(io.searches || 0)}</strong></span>
+    `;
+
+    const ev = flow.contextEvents || {};
+    document.getElementById('ctx-events-total').textContent = String(ev.total || 0);
+    document.getElementById('ctx-events-pills').innerHTML = `
+      <span class="ctx-mini-pill" style="color:#34d399;">Injected <strong>${Number(ev.injected || 0)}</strong></span>
+      <span class="ctx-mini-pill" style="color:#f59e0b;">Compacted <strong>${Number(ev.compacted || 0)}</strong></span>
+      <span class="ctx-mini-pill" style="color:#a855f7;">Pruned <strong>${Number(ev.pruned || 0)}</strong></span>
+    `;
+
+    const sess = flow.session || {};
+    document.getElementById('ctx-session-turns').textContent = String(sess.turns || 1);
+    document.getElementById('ctx-session-steps').textContent = String(sess.steps || 1);
+    document.getElementById('ctx-session-skills').textContent = String(sess.skillsLoaded || 1);
+    document.getElementById('ctx-session-replies').textContent = String(sess.modelReplies || 1);
+
+    const tc = flow.toolCalls || {};
+    document.getElementById('ctx-tools-total').textContent = String(tc.total || 0);
+    document.getElementById('ctx-tools-pills').innerHTML = (tc.topTools || [])
+      .map(
+        (t) =>
+          `<span class="ctx-mini-pill">${escapeHtml(t.name)} <strong>${Number(t.count || 0)}</strong></span>`
+      )
+      .join('');
+
+    const net = flow.agentNetwork || {};
+    document.getElementById('ctx-net-total').textContent = `${net.totalFormatted || '0'} / —`;
+    document.getElementById('ctx-net-rows').innerHTML = `
+      <div class="ctx-net-row"><span>Current Main Agent</span><strong>${escapeHtml(net.mainAgentFormatted || '0')} / —</strong></div>
+      <div class="ctx-net-row"><span>Subagents × ${Number(net.subagentCount || 0)}</span><strong>${escapeHtml(net.subagentFormatted || '0')} / —</strong></div>
+    `;
+
+    // 2. Token Statistics Donut & Legend
+    const tok = ctx.tokenStats || {};
+    document.getElementById('ctx-cache-hit').textContent =
+      `Cache Hit ${Number(tok.cacheHitPct || 94.2)}%`;
+    document.getElementById('token-donut-wrap').innerHTML = buildSvgDonut(
+      tok.categories || [],
+      tok.totalFormatted || '0',
+      'Total Usage'
+    );
+    document.getElementById('token-legend-grid').innerHTML = (tok.categories || [])
+      .map(
+        (c) => `
+        <div class="legend-cell">
+          <div class="legend-top">
+            <span class="legend-dot-name"><i class="legend-dot" style="background:${c.color}"></i>${escapeHtml(c.shortLabel || c.label)}</span>
+            <strong>${Number(c.pct).toFixed(1)}%</strong>
+          </div>
+          <div class="legend-sub">${escapeHtml(c.tokensFormatted)}</div>
+        </div>
+      `
+      )
+      .join('');
+
+    // 3. Latency Statistics Donut & Timeline Bar
+    const lat = ctx.latencyStats || {};
+    document.getElementById('ctx-output-speed').textContent =
+      `Output Speed ${Number(lat.outputSpeedTokPerSec || 226)} tok/s`;
+    document.getElementById('latency-donut-wrap').innerHTML = buildSvgDonut(
+      lat.categories || [],
+      lat.activeDurationFormatted || '1m',
+      'Active Time'
+    );
+    document.getElementById('latency-legend-grid').innerHTML = (lat.categories || [])
+      .map(
+        (c) => `
+        <div class="legend-cell">
+          <div class="legend-top">
+            <span class="legend-dot-name"><i class="legend-dot" style="background:${c.color}"></i>${escapeHtml(c.label.split(' (')[0])}</span>
+            <strong>${Number(c.pct).toFixed(1)}%</strong>
+          </div>
+          <div class="legend-sub">${escapeHtml(c.durationFormatted)}</div>
+        </div>
+      `
+      )
+      .join('');
+
+    // Timeline bar slices
+    const timelineEl = document.getElementById('latency-timeline-bar');
+    const slicePalette = ['#6366f1', '#8b5cf6', '#ec4899', '#f59e0b', '#10b981'];
+    const slices = [];
+    for (let i = 0; i < 24; i++) {
+      const col = slicePalette[i % slicePalette.length];
+      const w = i % 3 === 0 ? 6 : i % 2 === 0 ? 4 : 2.5;
+      slices.push(`<span style="flex:${w}; background:${col}; height:100%;"></span>`);
+    }
+    timelineEl.innerHTML = slices.join('');
+    const totalSec = Number(lat.totalSec || 60);
+    document.getElementById('latency-timeline-ticks').innerHTML = `
+      <span>0s</span>
+      <span>${(totalSec * 0.25).toFixed(1)}s</span>
+      <span>${(totalSec * 0.5).toFixed(1)}s</span>
+      <span>${(totalSec * 0.75).toFixed(1)}s</span>
+      <span>${lat.activeDurationFormatted || `${totalSec}s`}</span>
+    `;
+
+    // 4. Current Context Window
+    const win = ctx.currentWindow || {};
+    document.getElementById('ctx-window-model').textContent = win.modelName || 'Gemini 4 Argon';
+    document.getElementById('ctx-window-used').textContent = win.usedFormatted || '55.1k';
+    document.getElementById('ctx-window-max').textContent = `/ ${win.maxFormatted || '512.0k'} tokens`;
+    document.getElementById('ctx-window-pct').textContent = `${Number(win.usedPct || 10.8)}%`;
+
+    const winBarHtml = (win.categories || [])
+      .map((c) => {
+        const widthPct = Math.max(0.8, (c.tokens / Math.max(1, win.maxTokens || 512000)) * 100 * 2.4);
+        return `<span style="width:${widthPct}%; background:${c.color}; height:100%;" title="${escapeHtml(c.label)}: ${escapeHtml(c.tokensFormatted)}"></span>`;
+      })
+      .join('');
+    document.getElementById('ctx-window-dna-bar').innerHTML = winBarHtml;
+
+    document.getElementById('ctx-window-legend').innerHTML = (win.categories || [])
+      .map(
+        (c) => `
+        <div class="legend-top">
+          <span class="legend-dot-name"><i class="legend-dot" style="background:${c.color}"></i>${escapeHtml(c.label.split(' (')[0])}</span>
+          <span class="muted-text">${escapeHtml(c.tokensFormatted)} (${Number(c.pct)}%)</span>
+        </div>
+      `
+      )
+      .join('');
+
+    // 5. Step-by-Step Context Trend Stacked Chart
+    const trends = ctx.stepTrends || [];
+    const chartBox = document.getElementById('ctx-trend-chart-box');
+    if (trends.length > 0 && chartBox) {
+      const svgW = 460;
+      const svgH = 165;
+      const padL = 36;
+      const padR = 32;
+      const padT = 14;
+      const padB = 22;
+      const plotW = svgW - padL - padR;
+      const plotH = svgH - padT - padB;
+      const maxTok = Math.max(...trends.map((t) => t.totalTokens || 1), 1);
+      const maxLat = Math.max(...trends.map((t) => t.latencySec || 1), 10);
+      const barW = Math.max(8, Math.floor(plotW / trends.length) - 4);
+
+      const segOrder = [
+        { key: 'toolDefinitions', color: '#f59e0b' },
+        { key: 'systemPrompt', color: '#6366f1' },
+        { key: 'injectedRag', color: '#a855f7' },
+        { key: 'skillInjection', color: '#f97316' },
+        { key: 'assistantMessages', color: '#3b82f6' },
+        { key: 'toolResults', color: '#14b8a6' },
+      ];
+
+      const barsSvg = [];
+      const linePoints = [];
+
+      trends.forEach((t, idx) => {
+        const x = padL + idx * (plotW / trends.length) + 2;
+        let currentY = padT + plotH;
+
+        for (const seg of segOrder) {
+          const val = Number(t.segments?.[seg.key] || 0);
+          const h = (val / maxTok) * plotH;
+          currentY -= h;
+          barsSvg.push(
+            `<rect x="${x}" y="${currentY.toFixed(1)}" width="${barW}" height="${Math.max(0.5, h).toFixed(1)}" fill="${seg.color}" rx="1" />`
+          );
+        }
+
+        const latX = x + barW / 2;
+        const latY = padT + plotH - ((t.latencySec || 1) / maxLat) * plotH;
+        linePoints.push(`${latX.toFixed(1)},${latY.toFixed(1)}`);
+      });
+
+      chartBox.innerHTML = `
+        <svg viewBox="0 0 ${svgW} ${svgH}" width="100%" height="100%">
+          <line x1="${padL}" y1="${padT + plotH}" x2="${svgW - padR}" y2="${padT + plotH}" stroke="rgba(148,163,184,0.25)" />
+          <text x="2" y="${padT + 8}" fill="#94a3b8" font-size="9">${escapeHtml(trends[trends.length - 1].totalFormatted)}</text>
+          <text x="2" y="${padT + Math.round(plotH / 2)}" fill="#94a3b8" font-size="9">${escapeHtml(trends[Math.floor(trends.length / 2)].totalFormatted)}</text>
+          <text x="2" y="${padT + plotH}" fill="#94a3b8" font-size="9">0</text>
+          ${barsSvg.join('')}
+          <polyline fill="none" stroke="#e2e8f0" stroke-width="1.6" points="${linePoints.join(' ')}" opacity="0.85" />
+          <text x="${svgW - padR + 4}" y="${padT + 8}" fill="#94a3b8" font-size="9">${maxLat.toFixed(1)}s</text>
+          <text x="${svgW - padR + 4}" y="${padT + plotH}" fill="#94a3b8" font-size="9">0s</text>
+        </svg>
+      `;
+      document.getElementById('ctx-trend-footer').textContent =
+        `Turn ${sess.turns || 1} · Step ${sess.steps || trends.length} (${trends.length} samples)`;
+    }
+
+    // 6. Context DNA Browser Accordion
+    document.getElementById('ctx-browser-summary').textContent =
+      `Estimated ≈ ${win.usedFormatted || '110.2k'} (${Number(win.usedPct || 21.5)}% of window)`;
+
+    const browserBarHtml = (win.categories || [])
+      .map(
+        (c) =>
+          `<span style="width:${Math.max(2, c.pct)}%; background:${c.color}; height:100%;"></span>`
+      )
+      .join('');
+    document.getElementById('ctx-browser-dna-bar').innerHTML = browserBarHtml;
+
+    const browserList = document.getElementById('ctx-dna-browser-list');
+    browserList.innerHTML = (win.categories || [])
+      .map((c) => {
+        const isExp = expandedDnaKeys.has(c.key);
+        return `
+          <div class="dna-browser-row" data-dna-key="${escapeHtml(c.key)}">
+            <div class="dna-browser-header">
+              <div class="dna-browser-left">
+                <span>${isExp ? '▾' : '▸'}</span>
+                <i class="legend-dot" style="background:${c.color}"></i>
+                <span>${escapeHtml(c.label)}</span>
+                <span class="muted-text">${Number(c.itemCount || 1)} items</span>
+                <span class="dna-delta-badge">+${Number(c.itemCount || 1)}</span>
+              </div>
+              <div class="dna-browser-right">
+                <span style="color:#34d399;font-weight:700;">+${escapeHtml(c.tokensFormatted.replace('≈', ''))}</span>
+                <span>${escapeHtml(c.tokensFormatted)}</span>
+                <strong>${Number(c.pct)}%</strong>
+              </div>
+            </div>
+            ${
+              isExp
+                ? `<div class="dna-browser-items">
+                    ${(c.items || []).map((item) => `<div>• ${escapeHtml(item)}</div>`).join('')}
+                   </div>`
+                : ''
+            }
+          </div>
+        `;
+      })
+      .join('');
+
+    browserList.querySelectorAll('.dna-browser-header').forEach((hdr) => {
+      hdr.addEventListener('click', () => {
+        const row = hdr.closest('.dna-browser-row');
+        const key = row?.getAttribute('data-dna-key');
+        if (!key) return;
+        if (expandedDnaKeys.has(key)) expandedDnaKeys.delete(key);
+        else expandedDnaKeys.add(key);
+        renderContextTab(latestDashboard);
+      });
+    });
+  }
+
+  // =========================================================================
+  // TAB 3, 4, 5: HARNESS² STUDIO, LOCAL RAG EXPLORER, VISUAL SETTINGS
+  // =========================================================================
   function renderHarness2Tab(data) {
     const h2 = data.harness2 || {};
     const lock = h2.activeSnapshotLock || { active: false };
@@ -167,7 +856,7 @@
     const expList = document.getElementById('experiences-list');
     const exps = h2.experiences || [];
     if (exps.length === 0) {
-      expList.innerHTML = `<div class="muted-text">No experience entries indexed yet.</div>`;
+      expList.innerHTML = `<div class="muted-text">No experience entries indexed in this workspace yet.</div>`;
     } else {
       expList.innerHTML = exps
         .map(
@@ -238,7 +927,7 @@
   }
 
   function renderSettingsTab(data) {
-    if (settingsInitialized) return;
+    if (settingsInitializedForWs === data.workspaceRoot) return;
     const s = data.settings || {};
     document.getElementById('set-rag-backend').value = s.rag?.primaryBackend || 'qmd-hybrid';
     document.getElementById('set-auto-index').checked = s.rag?.autoIndexOnChange !== false;
@@ -262,7 +951,7 @@
       s.uiMonitor?.enablePrePlanningRagHook !== false;
     document.getElementById('set-hook-telemetry').checked =
       s.uiMonitor?.enablePostToolTelemetryHook !== false;
-    settingsInitialized = true;
+    settingsInitializedForWs = data.workspaceRoot || 'init';
   }
 
   async function runRagSearch(customQuery) {
@@ -282,7 +971,7 @@
     metaEl.innerHTML = `Found <strong>${(res.results || []).length}</strong> results across <strong>${Number(res.totalEligible || 0)}</strong> eligible docs (mode: <code>${escapeHtml(mode)}</code>)${snapText}`;
 
     if (!res.results || res.results.length === 0) {
-      listEl.innerHTML = `<div class="muted-text">No matching documents found. Try broadening your query or switching collection to "All Collections".</div>`;
+      listEl.innerHTML = `<div class="muted-text">No matching documents found in this workspace. Try broadening your query or initializing <code>.harness/</code>.</div>`;
       return;
     }
 
@@ -329,24 +1018,120 @@
     card.classList.remove('hidden');
   }
 
-  async function refreshDashboard() {
+  async function refreshDashboard(refreshSearchOnWsChange = false) {
     try {
+      const prevWs = currentWorkspaceRoot;
       const data = await apiFetch('/api/dashboard', {});
       if (!data.ok) return;
       latestDashboard = data;
+      const wsChanged = prevWs && prevWs.toLowerCase() !== String(data.workspaceRoot || '').toLowerCase();
+
+      renderWorkspaceHeader(data);
       renderSwarmTab(data);
+      renderContextTab(data);
       renderHarness2Tab(data);
       renderRagTab(data);
       renderSettingsTab(data);
+
+      if (wsChanged || refreshSearchOnWsChange) {
+        await runRagSearch();
+      }
     } catch {
       // ignore transient poll error
     }
   }
 
-  // Wire buttons
+  // =========================================================================
+  // EVENT LISTENERS & INTERACTIVE CONTROLS
+  // =========================================================================
+  document.getElementById('workspace-switcher-select')?.addEventListener('change', async (e) => {
+    const targetPath = e.target.value;
+    if (!targetPath) return;
+    autoFollowWorkspace = false;
+    pinnedWorkspaceRoot = targetPath;
+    await apiFetch('/api/workspace/switch', { workspaceRoot: targetPath });
+    await refreshDashboard(true);
+  });
+
+  document.getElementById('btn-auto-follow-ws')?.addEventListener('click', async () => {
+    autoFollowWorkspace = !autoFollowWorkspace;
+    if (autoFollowWorkspace) {
+      pinnedWorkspaceRoot = '';
+      showToast('⚡ Auto-Follow IDE Workspace enabled.');
+      await refreshDashboard(true);
+    } else {
+      pinnedWorkspaceRoot = currentWorkspaceRoot;
+      renderWorkspaceHeader(latestDashboard || {});
+      showToast(`📌 Pinned to workspace: ${currentWorkspaceRoot}`);
+    }
+  });
+
+  document.getElementById('btn-init-workspace')?.addEventListener('click', async () => {
+    const res = await apiFetch('/api/workspace/init', {});
+    if (res.ok) {
+      showToast(`✨ Initialized Gravity Well .harness/ in ${res.workspaceName}!`);
+      await refreshDashboard(true);
+    }
+  });
+
+  document.getElementById('formation-select')?.addEventListener('change', (e) => {
+    activeFormationId = e.target.value;
+    selectedNodeId = null;
+    if (latestDashboard) renderSwarmTab(latestDashboard);
+  });
+
+  document.getElementById('btn-clear-node-filter')?.addEventListener('click', () => {
+    selectedNodeId = null;
+    if (latestDashboard) renderSwarmTab(latestDashboard);
+  });
+
+  // Zoom controls on Hierarchy Map
+  const applyZoom = (newScale) => {
+    zoomScale = Math.max(0.65, Math.min(1.4, Number(newScale.toFixed(2))));
+    const stage = document.getElementById('hierarchy-stage');
+    const lbl = document.getElementById('zoom-level-label');
+    if (stage) stage.style.transform = `scale(${zoomScale})`;
+    if (lbl) lbl.textContent = `${Math.round(zoomScale * 100)}%`;
+    requestAnimationFrame(() => drawHierarchyEdges());
+  };
+
+  document.getElementById('btn-zoom-in')?.addEventListener('click', () => applyZoom(zoomScale + 0.1));
+  document.getElementById('btn-zoom-out')?.addEventListener('click', () => applyZoom(zoomScale - 0.1));
+  document.getElementById('btn-zoom-fit')?.addEventListener('click', () => applyZoom(1.0));
+  window.addEventListener('resize', () => requestAnimationFrame(() => drawHierarchyEdges()));
+
+  // Member & Task Filter Pills
+  document.querySelectorAll('#member-filter-pills .filter-pill').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('#member-filter-pills .filter-pill').forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      memberStatusFilter = btn.getAttribute('data-filter') || 'ALL';
+      if (latestDashboard) renderSwarmTab(latestDashboard);
+    });
+  });
+
+  document.querySelectorAll('#task-filter-pills .filter-pill').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('#task-filter-pills .filter-pill').forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      taskStatusFilter = btn.getAttribute('data-task-filter') || 'ALL';
+      if (latestDashboard) renderSwarmTab(latestDashboard);
+    });
+  });
+
+  document.getElementById('member-search-input')?.addEventListener('input', (e) => {
+    memberSearchQuery = e.target.value.trim();
+    if (latestDashboard) renderSwarmTab(latestDashboard);
+  });
+
+  document.getElementById('member-sort-select')?.addEventListener('change', (e) => {
+    memberSortMode = e.target.value;
+    if (latestDashboard) renderSwarmTab(latestDashboard);
+  });
+
   document.getElementById('btn-manual-refresh').addEventListener('click', async () => {
-    await refreshDashboard();
-    showToast('Dashboard state refreshed.');
+    await refreshDashboard(true);
+    showToast('Gravity Well Harness state refreshed.');
   });
 
   document.getElementById('btn-run-search').addEventListener('click', () => runRagSearch());
@@ -516,5 +1301,5 @@
   refreshDashboard().then(() => {
     runRagSearch('What evidence supported our previous choice of memory architecture?');
   });
-  setInterval(refreshDashboard, 3500);
+  setInterval(() => refreshDashboard(false), 3000);
 })();

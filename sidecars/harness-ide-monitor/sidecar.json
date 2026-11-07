@@ -1,22 +1,22 @@
 {
   "command": "node",
   "args": ["launch.mjs"],
-  "display_name": "Harness² Swarm & RAG Monitor",
-  "description": "Real-time Main Agent & Subagent Swarm Monitor, Harness² Propose-Probe-Compose Studio, QMD Local Hybrid RAG Explorer, and Visual Settings Manager.",
+  "display_name": "Gravity Well Harness — Swarm & RAG Monitor",
+  "description": "Gravity Well Harness: Dynamic Multi-Tier Subagent Swarm Hierarchy & Team Formation Map, Context Window & Token DNA Analytics, Harness² Propose-Probe-Compose Studio, QMD Local Hybrid RAG Explorer, and Visual Settings Manager.",
   "has_web_ui": true,
   "restart_policy": "always",
   "ui_config": {
-    "display_name": "Harness² Swarm & RAG Monitor",
+    "display_name": "Gravity Well Harness — Swarm & RAG Monitor",
     "views": [
       {
         "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
         "path": "/",
-        "title": "Harness² Swarm & RAG Monitor"
+        "title": "Gravity Well Harness"
       }
     ]
   },
   "agent_permissions": {
-    "workspace_uris": [],
+    "workspace_uris": ["*"],
     "allows_user_interactions": true
   }
 }

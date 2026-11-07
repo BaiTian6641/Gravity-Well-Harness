@@ -160,7 +160,7 @@ test('5. Auxiliary Pane UI Sidecar Server responds on /, /api/status, /api/dashb
     const htmlRes = await fetch(`${base}/`);
     assert.equal(htmlRes.status, 200);
     const htmlText = await htmlRes.text();
-    assert.ok(htmlText.includes('Harness² Swarm'));
+    assert.ok(htmlText.includes('Gravity Well Harness'));
 
     const dashRes = await fetch(`${base}/api/dashboard`, {
       method: 'POST',
@@ -169,7 +169,32 @@ test('5. Auxiliary Pane UI Sidecar Server responds on /, /api/status, /api/dashb
     assert.equal(dashRes.status, 200);
     const dashData = await dashRes.json();
     assert.equal(dashData.ok, true);
+    assert.equal(dashData.formalName, 'Gravity Well Harness');
     assert.equal(dashData.swarm.configuredSwarmRoles.length, 4);
+
+    // Verify Multi-Tier Swarm Hierarchy Formations & Teams
+    assert.ok(dashData.swarm.formations['live-harness2']);
+    assert.ok(dashData.swarm.formations['compact-verification']);
+    assert.ok(dashData.swarm.formations['multi-stage-team']);
+    assert.equal(dashData.swarm.formations['multi-stage-team'].nodes.length, 13);
+    assert.ok(dashData.swarm.formations['live-harness2'].edges.length >= 5);
+    assert.ok(dashData.swarm.formations['live-harness2'].teams.length >= 3);
+
+    // Verify Context Window & Token DNA Analytics
+    assert.ok(dashData.contextAnalytics);
+    assert.equal(dashData.contextAnalytics.tokenStats.categories.length, 8);
+    assert.equal(dashData.contextAnalytics.latencyStats.categories.length, 6);
+    assert.equal(dashData.contextAnalytics.currentWindow.categories.length, 7);
+    assert.ok(dashData.contextAnalytics.stepTrends.length >= 10);
+
+    // Verify Smooth Workspace Switch Endpoint
+    const switchRes = await fetch(`${base}/api/workspace/switch`, {
+      method: 'POST',
+      body: JSON.stringify({ workspaceRoot: REPO_ROOT }),
+    });
+    const switchData = await switchRes.json();
+    assert.equal(switchData.ok, true);
+    assert.equal(switchData.hasHarness, true);
 
     const searchRes = await fetch(`${base}/api/rag/query`, {
       method: 'POST',

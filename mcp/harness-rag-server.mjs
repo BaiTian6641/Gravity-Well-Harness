@@ -1,11 +1,69 @@
 #!/usr/bin/env node
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HarnessKnowledgeEngine } from '../src/rag-engine.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const DEFAULT_WORKSPACE = process.env.HARNESS_WORKSPACE_ROOT || path.resolve(__dirname, '..');
+const REPO_ROOT = path.resolve(__dirname, '..');
+
+function resolveActiveWorkspaceRoot(args = {}) {
+  if (args?.workspace_root && fs.existsSync(args.workspace_root)) {
+    return path.resolve(args.workspace_root);
+  }
+  const envRoot = process.env.HARNESS_WORKSPACE_ROOT || process.env.ANTIGRAVITY_WORKSPACE_ROOT;
+  if (envRoot && fs.existsSync(envRoot)) {
+    return path.resolve(envRoot);
+  }
+  // Check active-workspace.json written by SessionStart / PostToolUse hooks and UI sidecar
+  try {
+    const activePath = path.join(
+      os.homedir(),
+      '.gemini',
+      'antigravity',
+      'sidecar_data',
+      'harness-ide-monitor',
+      'active-workspace.json'
+    );
+    if (fs.existsSync(activePath)) {
+      const data = JSON.parse(fs.readFileSync(activePath, 'utf8'));
+      if (data?.workspaceRoot && fs.existsSync(data.workspaceRoot)) {
+        return path.resolve(data.workspaceRoot);
+      }
+    }
+  } catch {}
+  // Check telemetry.json for most recently updated workspace
+  try {
+    const telPath = path.join(
+      os.homedir(),
+      '.gemini',
+      'antigravity',
+      'sidecar_data',
+      'harness-ide-monitor',
+      'telemetry.json'
+    );
+    if (fs.existsSync(telPath)) {
+      const tel = JSON.parse(fs.readFileSync(telPath, 'utf8'));
+      const sessions = Object.values(tel.sessions || {}).sort((a, b) =>
+        String(b.lastUpdatedAt || '').localeCompare(String(a.lastUpdatedAt || ''))
+      );
+      for (const s of sessions) {
+        if (s?.workspaceRoot && fs.existsSync(s.workspaceRoot)) {
+          return path.resolve(s.workspaceRoot);
+        }
+      }
+    }
+  } catch {}
+  if (fs.existsSync(path.join(process.cwd(), '.harness'))) {
+    return process.cwd();
+  }
+  if (fs.existsSync(path.join(REPO_ROOT, '.harness'))) {
+    return REPO_ROOT;
+  }
+  return process.cwd();
+}
 
 const TOOL_DEFINITIONS = [
   {
@@ -275,7 +333,7 @@ const TOOL_DEFINITIONS = [
 ];
 
 function getEngine(args = {}) {
-  const root = args.workspace_root || DEFAULT_WORKSPACE;
+  const root = resolveActiveWorkspaceRoot(args);
   return new HarnessKnowledgeEngine(root);
 }
 
@@ -361,7 +419,7 @@ async function processRpcMessage(msg, useContentLength = false) {
         },
         serverInfo: {
           name: 'harness_ide_rag_mcp',
-          version: '1.0.0'
+          version: '1.1.0'
         }
       });
     } else if (method === 'notifications/initialized' || method === 'initialized') {
@@ -415,7 +473,6 @@ async function processRpcMessage(msg, useContentLength = false) {
   }
 }
 
-// Start Stdio loop when executed directly
 if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
   let buffer = '';
   let useContentLength = false;

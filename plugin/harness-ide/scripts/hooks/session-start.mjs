@@ -13,10 +13,59 @@ function readStdinJson() {
   }
 }
 
+function recordActiveWorkspace(workspaceRoot, conversationId = '', source = 'SessionStart') {
+  try {
+    const dataDir = path.join(
+      os.homedir(),
+      '.gemini',
+      'antigravity',
+      'sidecar_data',
+      'harness-ide-monitor'
+    );
+    fs.mkdirSync(dataDir, { recursive: true });
+    const activeFile = path.join(dataDir, 'active-workspace.json');
+    let existing = { recentWorkspaces: [] };
+    if (fs.existsSync(activeFile)) {
+      try {
+        existing = JSON.parse(fs.readFileSync(activeFile, 'utf8'));
+      } catch {}
+    }
+    const cleanRoot = path.resolve(workspaceRoot);
+    const recents = Array.isArray(existing.recentWorkspaces) ? existing.recentWorkspaces : [];
+    const updatedRecents = [
+      cleanRoot,
+      ...recents.filter((w) => path.resolve(w).toLowerCase() !== cleanRoot.toLowerCase())
+    ].slice(0, 12);
+
+    fs.writeFileSync(
+      activeFile,
+      JSON.stringify(
+        {
+          workspaceRoot: cleanRoot,
+          conversationId,
+          source,
+          updatedAt: new Date().toISOString(),
+          recentWorkspaces: updatedRecents
+        },
+        null,
+        2
+      ),
+      'utf8'
+    );
+  } catch {
+    // ignore
+  }
+}
+
 function main() {
   const input = readStdinJson();
   const workspaceRoot =
-    (Array.isArray(input.workspacePaths) && input.workspacePaths[0]) || process.cwd();
+    (Array.isArray(input.workspacePaths) && input.workspacePaths[0]) ||
+    input.cwd ||
+    process.cwd();
+
+  const convId = input.conversationId || 'default-session';
+  recordActiveWorkspace(workspaceRoot, convId, 'SessionStart');
 
   const harnessDir = path.join(workspaceRoot, '.harness');
   if (!fs.existsSync(harnessDir)) {
@@ -48,7 +97,6 @@ function main() {
         // reset
       }
     }
-    const convId = input.conversationId || 'default-session';
     telemetry.sessions = telemetry.sessions || {};
     telemetry.sessions[convId] = {
       conversationId: convId,
@@ -79,7 +127,8 @@ function main() {
     }
 
     const msg = [
-      `[Harness² & Local RAG IDE Active]`,
+      `[Gravity Well Harness — Harness² & Local RAG IDE Active]`,
+      `- Active Workspace: ${workspaceRoot}`,
       `- Indexed Local Documents: ${status.totalDocuments} across project-knowledge, experiment-knowledge, and reference-knowledge.`,
       `- Snapshot Isolation Status: ${lockInfo}`,
       `- Lifecycle Rule: Query 'harness_query' before planning architectural or experimental changes; record lessons via 'harness_record_experience'; surface [Harness² Swarm & RAG Monitor](sidecar://harness-ide-monitor/) when inspecting swarm or RAG state.`
