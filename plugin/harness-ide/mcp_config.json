@@ -2,7 +2,9 @@
   "mcpServers": {
     "harness_ide_rag_mcp": {
       "command": "node",
-      "args": ["scripts/mcp-entry.mjs"]
+      "args": [
+        "scripts/mcp-entry.mjs"
+      ]
     },
     "harness_ide_context7": {
       "url": "https://mcp.context7.com/mcp"
