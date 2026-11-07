@@ -111,10 +111,18 @@
         <div class="card hierarchy-map-card">
           <div class="card-header">
             <div>
-              <span class="eyebrow">AGENT NETWORK · HIERARCHY &amp; DIRECTIONAL FLOW</span>
+              <span class="eyebrow">AGENT NETWORK · HIERARCHY &amp; 2D GRID FLOW</span>
               <h2 class="card-title" id="formation-title">Real-Time Main Agent &amp; Subagent Swarm Hierarchy</h2>
             </div>
-            <button class="icon-btn" id="btn-clear-node-filter" title="Reset node selection">Show All Nodes</button>
+            <div class="inline-pair" style="flex-wrap:wrap;">
+              <button class="icon-btn active" id="btn-toggle-hide-inactive" title="Hide inactive/finished subagents first; recalled subagents automatically rejoin the active network graph">
+                🙈 Hide Inactive First
+              </button>
+              <button class="icon-btn" id="btn-recall-all-subagents" title="Recall finished subagents so they rejoin the active 2D grid network graph">
+                ↺ Recall Subagents
+              </button>
+              <button class="icon-btn" id="btn-clear-node-filter" title="Reset node selection">Show All</button>
+            </div>
           </div>
 
           <!-- Context DNA Legend Row -->
@@ -127,8 +135,12 @@
             <span class="dna-legend-item"><i style="background:#3b82f6"></i>Assistant</span>
             <span class="dna-legend-item"><i style="background:#14b8a6"></i>Tool Results</span>
             <span class="dna-legend-item"><i style="background:#334155"></i>Free Window</span>
-            <span class="dna-legend-item"><span class="running-dash-icon"></span>Running Flow</span>
+            <span class="dna-legend-item"><span class="running-dash-icon"></span>Running / Recalled Flow</span>
+            <span class="dna-legend-item">⊞ 2D Parent Grid</span>
           </div>
+
+          <!-- Inactive / Finished Subagents Dock (Shown when inactive subagents are hidden from graph) -->
+          <div id="inactive-subagents-dock" class="inactive-subagents-dock hidden"></div>
 
           <!-- Zoomable / Pannable Hierarchy Tree Viewport -->
           <div class="hierarchy-viewport" id="hierarchy-viewport">

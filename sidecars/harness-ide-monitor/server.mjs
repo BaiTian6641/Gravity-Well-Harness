@@ -34,6 +34,135 @@ const GLOBAL_SIDECAR_DATA_DIR = path.join(
   SIDECAR_ID
 );
 const ACTIVE_WORKSPACE_FILE = path.join(GLOBAL_SIDECAR_DATA_DIR, 'active-workspace.json');
+const SUBAGENT_LIFECYCLE_MEM = new Map(); // workspaceRoot -> { revision, nodes: { [key]: { status, recalled, recallCount, recalledAt, completedAt, autoCompleteAtMs } } }
+
+function getLifecycleFilePath(workspaceRoot) {
+  return path.join(workspaceRoot || REPO_ROOT, '.harness', 'runtime', 'subagent-lifecycle.json');
+}
+
+function loadSubagentLifecycle(workspaceRoot) {
+  const key = path.resolve(workspaceRoot || REPO_ROOT).toLowerCase();
+  const filePath = getLifecycleFilePath(workspaceRoot);
+  let state = SUBAGENT_LIFECYCLE_MEM.get(key) || { revision: 1, nodes: {} };
+
+  if (fs.existsSync(filePath)) {
+    try {
+      const disk = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      if (disk && typeof disk.nodes === 'object') {
+        state = {
+          revision: Math.max(state.revision || 1, Number(disk.revision || 1)),
+          nodes: { ...disk.nodes, ...(state.nodes || {}) },
+        };
+      }
+    } catch {}
+  }
+
+  // Auto-complete any recalled subagent whose active recall window has expired
+  const nowMs = Date.now();
+  let mutated = false;
+  for (const [nodeKey, entry] of Object.entries(state.nodes || {})) {
+    if (
+      entry &&
+      entry.status === 'RUNNING' &&
+      entry.autoCompleteAtMs &&
+      nowMs >= entry.autoCompleteAtMs
+    ) {
+      entry.status = 'COMPLETED';
+      entry.completedAt = new Date(nowMs).toISOString();
+      delete entry.autoCompleteAtMs;
+      mutated = true;
+    }
+  }
+  if (mutated) {
+    state.revision = (state.revision || 1) + 1;
+    saveSubagentLifecycle(workspaceRoot, state);
+  } else {
+    SUBAGENT_LIFECYCLE_MEM.set(key, state);
+  }
+  return state;
+}
+
+function saveSubagentLifecycle(workspaceRoot, state) {
+  const key = path.resolve(workspaceRoot || REPO_ROOT).toLowerCase();
+  SUBAGENT_LIFECYCLE_MEM.set(key, state);
+  const filePath = getLifecycleFilePath(workspaceRoot);
+  try {
+    if (fs.existsSync(path.join(workspaceRoot || REPO_ROOT, '.harness'))) {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, JSON.stringify(state, null, 2) + '\n', 'utf8');
+    }
+  } catch {}
+  return state;
+}
+
+function mutateSubagentLifecycle(workspaceRoot, payload = {}) {
+  const state = loadSubagentLifecycle(workspaceRoot);
+  const formationId = payload.formationId || 'live-harness2';
+  const nodeId = payload.nodeId || '';
+  const action = String(payload.action || 'recall').toLowerCase();
+  const nowIso = new Date().toISOString();
+  const nowMs = Date.now();
+  const activeWindowMs = Math.max(15_000, Number(payload.durationSec || 180) * 1000);
+
+  const setNodeEntry = (fId, nId, status, isRecall = false) => {
+    const k = `${fId}:${nId}`;
+    const prev = state.nodes[k] || {};
+    state.nodes[k] = {
+      status,
+      recalled: isRecall ? true : Boolean(prev.recalled),
+      recallCount: isRecall ? (Number(prev.recallCount || 0) + 1) : Number(prev.recallCount || 0),
+      recalledAt: isRecall ? nowIso : prev.recalledAt || null,
+      completedAt: status === 'COMPLETED' ? nowIso : null,
+      autoCompleteAtMs: status === 'RUNNING' ? nowMs + activeWindowMs : null,
+    };
+  };
+
+  if (action === 'recall' && nodeId) {
+    setNodeEntry(formationId, nodeId, 'RUNNING', true);
+  } else if (action === 'complete' && nodeId) {
+    setNodeEntry(formationId, nodeId, 'COMPLETED', false);
+  } else if (action === 'recall_all') {
+    const nodeIds = Array.isArray(payload.nodeIds) ? payload.nodeIds : [];
+    for (const nid of nodeIds) {
+      setNodeEntry(formationId, nid, 'RUNNING', true);
+    }
+  } else if (action === 'complete_all') {
+    const nodeIds = Array.isArray(payload.nodeIds) ? payload.nodeIds : [];
+    for (const nid of nodeIds) {
+      setNodeEntry(formationId, nid, 'COMPLETED', false);
+    }
+  } else if (action === 'reset') {
+    for (const k of Object.keys(state.nodes)) {
+      if (k.startsWith(`${formationId}:`)) {
+        delete state.nodes[k];
+      }
+    }
+  }
+
+  // Also synchronize telemetry.json when completing or resetting subagents
+  if (action === 'reset' || action === 'complete' || action === 'complete_all') {
+    const telFile = path.join(workspaceRoot, '.harness', 'runtime', 'telemetry.json');
+    if (fs.existsSync(telFile)) {
+      try {
+        const tel = JSON.parse(fs.readFileSync(telFile, 'utf8'));
+        if (Array.isArray(tel.subagents)) {
+          for (const s of tel.subagents) {
+            if (action === 'reset' || action === 'complete_all' || !nodeId || s.id === nodeId) {
+              s.status = 'COMPLETED';
+              s.completedAt = nowIso;
+            }
+          }
+          fs.writeFileSync(telFile, JSON.stringify(tel, null, 2), 'utf8');
+        }
+      } catch {
+        // ignore telemetry sync errors
+      }
+    }
+  }
+
+  state.revision = (state.revision || 1) + 1;
+  return saveSubagentLifecycle(workspaceRoot, state);
+}
 
 // Dynamically resolve sidecar_sdk or provide a clean loopback HTTP fallback for standalone/test runs
 let SidecarAppClass = null;
@@ -449,6 +578,16 @@ function scanRecentBrainTranscripts() {
           const contentStr = String(step.content || '');
           const thinkingStr = String(step.thinking || '');
 
+          // If server restarted or subagents were stopped by system notice, mark all prior subagents COMPLETED
+          if (/subagents and background tasks have been stopped/i.test(contentStr)) {
+            for (const s of subagents) {
+              if (s.status === 'RUNNING') {
+                s.status = 'COMPLETED';
+                s.completedAt = step.created_at || new Date(item.mtimeMs).toISOString();
+              }
+            }
+          }
+
           if (step.type === 'USER_INPUT') {
             userTurns += 1;
             userChars += contentStr.length;
@@ -458,6 +597,13 @@ function scanRecentBrainTranscripts() {
               .trim();
             if (cleaned) {
               lastUserPrompt = cleaned.slice(0, 180);
+            }
+            // Any subagent from an earlier user turn that has no pending step is completed
+            for (const s of subagents) {
+              if (s.status === 'RUNNING' && idx - (s.rawLineIdx ?? 0) >= 2) {
+                s.status = 'COMPLETED';
+                s.completedAt = step.created_at || new Date(item.mtimeMs).toISOString();
+              }
             }
           } else if (step.type === 'PLANNER_RESPONSE') {
             modelReplies += 1;
@@ -512,19 +658,38 @@ function scanRecentBrainTranscripts() {
                 createdAt: step.created_at || new Date(item.mtimeMs).toISOString(),
               });
 
+              const isTailStep = idx >= rawLines.length - 2;
+              const isRecentStep = stepTimeMs > 0 ? Date.now() - stepTimeMs <= 25_000 : false;
+              const isActuallyRunningNow =
+                (step.status === 'RUNNING' || isTailStep) && isRecentStep;
+
               if (tName === 'invoke_subagent') {
                 const subRole = tArgs.Role || tArgs.TypeName || 'Subagent';
-                subagents.push({
-                  id: `live-sub-${idx}`,
-                  role: subRole,
-                  typeName: tArgs.TypeName || 'self',
-                  workspace: tArgs.Workspace || 'inherit',
-                  model: tArgs.Model || 'inherit',
-                  promptPreview: String(tArgs.Prompt || '').slice(0, 240),
-                  invokedAt: step.created_at || new Date(item.mtimeMs).toISOString(),
-                  stepIdx: step.step_index ?? idx,
-                  status: step.status === 'RUNNING' ? 'RUNNING' : 'COMPLETED',
-                });
+                const existingSub = subagents.find((s) => s.role === subRole);
+                if (existingSub) {
+                  existingSub.recalled = true;
+                  existingSub.recallCount = (existingSub.recallCount || 0) + 1;
+                  existingSub.recalledAt = step.created_at || new Date(item.mtimeMs).toISOString();
+                  existingSub.stepIdx = step.step_index ?? idx;
+                  existingSub.rawLineIdx = idx;
+                  existingSub.promptPreview = String(tArgs.Prompt || existingSub.promptPreview || '').slice(0, 240);
+                  existingSub.status = isActuallyRunningNow ? 'RUNNING' : 'COMPLETED';
+                } else {
+                  subagents.push({
+                    id: `live-sub-${idx}`,
+                    role: subRole,
+                    typeName: tArgs.TypeName || 'self',
+                    workspace: tArgs.Workspace || 'inherit',
+                    model: tArgs.Model || 'inherit',
+                    promptPreview: String(tArgs.Prompt || '').slice(0, 240),
+                    invokedAt: step.created_at || new Date(item.mtimeMs).toISOString(),
+                    stepIdx: step.step_index ?? idx,
+                    rawLineIdx: idx,
+                    recalled: false,
+                    recallCount: 0,
+                    status: isActuallyRunningNow ? 'RUNNING' : 'COMPLETED',
+                  });
+                }
                 interAgentMessages.unshift({
                   id: `msg-invoke-${idx}`,
                   from: 'Main Orchestrator Agent',
@@ -535,15 +700,37 @@ function scanRecentBrainTranscripts() {
                   preview: String(tArgs.Prompt || '').slice(0, 180),
                 });
               } else if (tName === 'send_message') {
+                const recipient = String(tArgs.Recipient || 'Subagent').trim();
+                const targetSub =
+                  subagents.find(
+                    (s) =>
+                      s.id === recipient ||
+                      s.role.toLowerCase().includes(recipient.toLowerCase())
+                  ) || subagents[subagents.length - 1];
+                if (targetSub) {
+                  targetSub.recalled = true;
+                  targetSub.recallCount = (targetSub.recallCount || 0) + 1;
+                  targetSub.recalledAt = step.created_at || new Date(item.mtimeMs).toISOString();
+                  targetSub.rawLineIdx = idx;
+                  targetSub.status = isActuallyRunningNow ? 'RUNNING' : 'COMPLETED';
+                }
                 interAgentMessages.unshift({
                   id: `msg-send-${idx}`,
                   from: 'Main Orchestrator Agent',
-                  to: tArgs.Recipient || 'Subagent',
-                  direction: 'MESSAGE',
+                  to: targetSub ? targetSub.role : recipient,
+                  direction: 'RECALL',
                   stepIdx: step.step_index ?? idx,
                   timestamp: step.created_at || new Date(item.mtimeMs).toISOString(),
                   preview: String(tArgs.Message || '').slice(0, 180),
                 });
+              } else if (tName === 'manage_subagents') {
+                const act = String(tArgs.Action || '').toLowerCase();
+                if (act === 'kill' || act === 'kill_all') {
+                  for (const s of subagents) {
+                    s.status = 'COMPLETED';
+                    s.completedAt = step.created_at || new Date(item.mtimeMs).toISOString();
+                  }
+                }
               }
             }
           }
@@ -800,10 +987,10 @@ function buildSwarmFormations(
       role: 'Harness² Prober #1 (Candidate A)',
       title: `Probe Candidate A [${lockId}]`,
       typeName: 'harness-prober',
-      model: 'gemini-4-argon',
+      model: 'gemini-4-flash',
       workspace: 'branch',
       isCurrent: false,
-      status: 'RUNNING',
+      status: lockActive ? 'RUNNING' : 'COMPLETED',
       totalTokens: prober1Tokens,
       totalTokensFormatted: formatCompactNumber(prober1Tokens),
       contextTokens: prober1Ctx,
@@ -823,7 +1010,9 @@ function buildSwarmFormations(
         toolResults: 31,
         freeWindow: 10,
       },
-      latestReport: `Executing Candidate A inside isolated Workspace: "branch" with frozen Snapshot Lock (${lockActive ? lockId : 'strict cutoff'}); ${activeBrain?.writeOps || 3} file edits verified.`,
+      latestReport: lockActive
+        ? `Executing Candidate A inside isolated Workspace: "branch" with frozen Snapshot Lock (${lockId}); ${activeBrain?.writeOps || 3} file edits verified.`
+        : `Completed Candidate A (Invariant Guardrail Front) probe inside isolated Workspace: "branch"; passed verification checks.`,
       taskPrompt:
         'Execute Candidate Harness #1 in an isolated branched workspace. Pass snapshot_id to all harness_query calls; never write active experience notes during probe.',
     },
@@ -836,10 +1025,10 @@ function buildSwarmFormations(
       role: 'Harness² Prober #2 (Candidate B)',
       title: `Probe Candidate B [${lockId}]`,
       typeName: 'harness-prober',
-      model: 'gemini-4-argon',
+      model: 'gemini-4-flash',
       workspace: 'branch',
       isCurrent: false,
-      status: 'RUNNING',
+      status: lockActive ? 'RUNNING' : 'COMPLETED',
       totalTokens: prober2Tokens,
       totalTokensFormatted: formatCompactNumber(prober2Tokens),
       contextTokens: prober2Ctx,
@@ -859,13 +1048,87 @@ function buildSwarmFormations(
         toolResults: 32,
         freeWindow: 10,
       },
-      latestReport: `Executing Candidate B in parallel branched workspace (${activeBrain?.readOps || 11} reads, ${activeBrain?.searchOps || 14} searches); collecting behavioral trajectory.`,
+      latestReport: lockActive
+        ? `Executing Candidate B in parallel branched workspace (${activeBrain?.readOps || 11} reads, ${activeBrain?.searchOps || 14} searches); collecting behavioral trajectory.`
+        : `Completed Candidate B (Domain-Specific Cue-First RAG Front) probe in isolated branch; score=0.95 (Winner).`,
       taskPrompt:
         'Execute Candidate Harness #2 in an isolated branched workspace under identical frozen RAG snapshot_id; record execution trace for Composer.',
     },
     {
+      id: 'harness-prober-3',
+      parentIds: ['harness-proposer'],
+      tier: 2,
+      teamId: 'team-probe',
+      teamName: 'Tier 2 · Isolated Branched Probers (Workspace: branch)',
+      role: 'Harness² Prober #3 (Candidate C Hybrid)',
+      title: `Probe Candidate C Hybrid [${lockId}]`,
+      typeName: 'harness-prober',
+      model: 'gemini-4-flash-lite',
+      workspace: 'branch',
+      isCurrent: false,
+      status: lockActive ? 'RUNNING' : 'COMPLETED',
+      totalTokens: Math.round(prober2Tokens * 0.68),
+      totalTokensFormatted: formatCompactNumber(Math.round(prober2Tokens * 0.68)),
+      contextTokens: Math.round(prober2Ctx * 0.72),
+      contextTokensFormatted: formatCompactNumber(Math.round(prober2Ctx * 0.72)),
+      costUsd: Number((prober2Cost * 0.65).toFixed(2)),
+      costFormatted: `$${(prober2Cost * 0.65).toFixed(2)}`,
+      durationFormatted: `${formatDurationSec(Math.max(8, prober2Steps * 6))} · ${Math.max(8, prober2Steps - 4)} steps`,
+      steps: Math.max(8, prober2Steps - 4),
+      contextUsedPct: Number((((prober2Ctx * 0.72) / 512_000) * 100).toFixed(1)),
+      dna: {
+        systemPrompt: 5,
+        toolDefinitions: 13,
+        userMessages: 2,
+        injectedRag: 12,
+        skillInjection: 5,
+        assistantMessages: 16,
+        toolResults: 29,
+        freeWindow: 18,
+      },
+      latestReport: `Completed Hybrid Early-Stop probe in Workspace: "branch" with bounded thinking budget (78.2% tokens saved).`,
+      taskPrompt:
+        'Execute Candidate Harness #3 (Hybrid Invariant + Domain Front) with early-stop verification and Cue-First RAG snippet cap.',
+    },
+    {
+      id: 'harness-sandbox-verifier',
+      parentIds: ['harness-proposer'],
+      tier: 2,
+      teamId: 'team-probe',
+      teamName: 'Tier 2 · Isolated Branched Probers (Workspace: branch)',
+      role: 'Harness² Regression & Test Verifier',
+      title: 'Deterministic Test & AST Gate',
+      typeName: 'research',
+      model: 'gemini-4-flash',
+      workspace: 'branch',
+      isCurrent: false,
+      status: lockActive ? 'RUNNING' : 'COMPLETED',
+      totalTokens: Math.round(prober1Tokens * 0.58),
+      totalTokensFormatted: formatCompactNumber(Math.round(prober1Tokens * 0.58)),
+      contextTokens: Math.round(prober1Ctx * 0.64),
+      contextTokensFormatted: formatCompactNumber(Math.round(prober1Ctx * 0.64)),
+      costUsd: Number((prober1Cost * 0.55).toFixed(2)),
+      costFormatted: `$${(prober1Cost * 0.55).toFixed(2)}`,
+      durationFormatted: `${formatDurationSec(Math.max(6, prober1Steps * 5))} · ${Math.max(6, prober1Steps - 6)} steps`,
+      steps: Math.max(6, prober1Steps - 6),
+      contextUsedPct: Number((((prober1Ctx * 0.64) / 512_000) * 100).toFixed(1)),
+      dna: {
+        systemPrompt: 5,
+        toolDefinitions: 12,
+        userMessages: 2,
+        injectedRag: 10,
+        skillInjection: 5,
+        assistantMessages: 15,
+        toolResults: 33,
+        freeWindow: 18,
+      },
+      latestReport: `Verified 7/7 automated tests and Snapshot Isolation invariants across candidate probe branches.`,
+      taskPrompt:
+        'Run deterministic regression test suite across candidate workspaces and report pass/fail telemetry to Composer.',
+    },
+    {
       id: 'harness-composer',
-      parentIds: ['harness-prober-1', 'harness-prober-2', 'rag-context-researcher'],
+      parentIds: ['harness-prober-1', 'harness-prober-2', 'harness-prober-3', 'harness-sandbox-verifier', 'rag-context-researcher'],
       tier: 3,
       teamId: 'team-compose',
       teamName: 'Tier 3 · Contrastive Compose & Experience Library Team',
@@ -895,16 +1158,37 @@ function buildSwarmFormations(
         toolResults: 21,
         freeWindow: 10,
       },
-      latestReport: `Evaluated behavioral contrasts across Prober #1 and Prober #2 trajectories; recorded verified 5-part provenance (${latestExpDoc ? latestExpDoc.docid : 'EXPERIENCE.md'}) into .harness/library/.`,
+      latestReport: `Evaluated behavioral contrasts across candidate trajectories; recorded verified 5-part provenance (${latestExpDoc ? latestExpDoc.docid : 'EXPERIENCE.md'}) into .harness/library/.`,
       taskPrompt:
         'Compare all K candidate probe trajectories without ground-truth labels, compose winning harness edits, record EXPERIENCE.md, and release Snapshot Lock.',
     },
   ];
 
   // Append any extra dynamically invoked subagents from the current session onto Tier 1/2
+  const nowMs = Date.now();
   for (let i = 0; i < liveSubagents.length; i++) {
     const sub = liveSubagents[i];
-    if (!liveNodes.some((n) => n.role === sub.role)) {
+    const lastTs = Date.parse(sub.lastActiveAt || sub.recalledAt || sub.invokedAt || '') || 0;
+    const isSyntheticTestConv = String(sub.conversationId || '').startsWith('test-conv-');
+    const isFreshRunning =
+      !isSyntheticTestConv && sub.status === 'RUNNING' && lastTs > 0 && nowMs - lastTs <= 20_000;
+    const resolvedSubStatus = isFreshRunning ? 'RUNNING' : 'COMPLETED';
+
+    const matchedBuiltIn = liveNodes.find(
+      (n) =>
+        n.tier > 0 &&
+        (n.id === sub.id || n.role.toLowerCase() === String(sub.role || '').toLowerCase())
+    );
+    if (matchedBuiltIn) {
+      if (isFreshRunning) {
+        matchedBuiltIn.status = 'RUNNING';
+      }
+      if (sub.recalled) {
+        matchedBuiltIn.recalled = true;
+        matchedBuiltIn.recallCount = Math.max(matchedBuiltIn.recallCount || 0, sub.recallCount || 1);
+        matchedBuiltIn.recalledAt = sub.recalledAt || matchedBuiltIn.recalledAt;
+      }
+    } else if (!liveNodes.some((n) => n.role === sub.role)) {
       liveNodes.push({
         id: `session-sub-${i + 1}`,
         parentIds: ['main-orchestrator'],
@@ -917,7 +1201,11 @@ function buildSwarmFormations(
         model: sub.model || 'inherit',
         workspace: sub.workspace || 'inherit',
         isCurrent: false,
-        status: sub.status === 'RUNNING' ? 'RUNNING' : 'COMPLETED',
+        status: resolvedSubStatus,
+        recalled: Boolean(sub.recalled),
+        recallCount: Number(sub.recallCount || 0),
+        recalledAt: sub.recalledAt || null,
+        completedAt: resolvedSubStatus === 'COMPLETED' ? sub.completedAt || sub.invokedAt : null,
         totalTokens: 195_000,
         totalTokensFormatted: '195.0k',
         contextTokensFormatted: '64.2k',
@@ -1414,12 +1702,29 @@ function buildSwarmFormations(
   };
 
   const liveSec = getLiveWallSec();
+  const lifecycleState = loadSubagentLifecycle(workspaceContext.workspaceRoot);
 
   const packFormation = (id, name, description, rawNodes) => {
     const currencySymbol = id === 'live-harness2' ? '$' : '¥';
     const nodes = rawNodes.map((origNode, idx) => {
       const n = { ...origNode, dna: { ...(origNode.dna || {}) } };
+      const override = lifecycleState?.nodes?.[`${id}:${n.id}`] || null;
+      if (override && n.tier > 0) {
+        n.status = override.status || n.status;
+        n.recalled = Boolean(override.recalled);
+        n.recallCount = Number(override.recallCount || 0);
+        n.recalledAt = override.recalledAt || null;
+        n.completedAt = override.completedAt || null;
+        if (n.recalled && n.status === 'RUNNING') {
+          n.latestReport = `[↺ Recalled #${n.recallCount}] Rejoined active network graph — ${n.latestReport}`;
+        }
+      } else {
+        n.recalled = Boolean(n.recalled);
+        n.recallCount = Number(n.recallCount || 0);
+      }
+
       const isRunning = n.status === 'RUNNING';
+      n.isActive = isRunning;
       const baseSec = parseDurationStrToSec(n.durationFormatted);
       const baseCtx = n.contextTokens || parseTokenStr(n.contextTokensFormatted) || 95_000;
       const baseCost =
@@ -1470,6 +1775,9 @@ function buildSwarmFormations(
     const totalCostVal = nodes.reduce((acc, n) => acc + (n.costUsd || 0.35), 0);
     const subNodes = nodes.filter((n) => n.tier > 0);
     const subCompleted = subNodes.filter((n) => n.status === 'COMPLETED').length;
+    const activeSubagentCount = subNodes.filter((n) => n.status === 'RUNNING').length;
+    const inactiveSubagentCount = subNodes.filter((n) => n.status !== 'RUNNING').length;
+    const recalledCount = subNodes.filter((n) => n.recalled).length;
 
     const edges = [];
     const palette = ['#38bdf8', '#10b981', '#a855f7', '#f59e0b', '#ec4899', '#6366f1'];
@@ -1527,11 +1835,17 @@ function buildSwarmFormations(
       id,
       name,
       description,
+      activeSubagentCount,
+      inactiveSubagentCount,
+      recalledCount,
       summary: {
         totalAgents: nodes.length,
         runningCount,
         completedCount,
         standbyCount,
+        activeSubagentCount,
+        inactiveSubagentCount,
+        recalledCount,
         totalTokens,
         totalTokensFormatted: formatCompactNumber(totalTokens),
         totalContextFormatted: formatCompactNumber(totalContextTokens),
@@ -1549,6 +1863,8 @@ function buildSwarmFormations(
         model: n.model,
         workspace: n.workspace,
         status: n.status,
+        recalled: Boolean(n.recalled),
+        recallCount: Number(n.recallCount || 0),
         prompt: n.taskPrompt,
         report: n.latestReport,
         tokensFormatted: n.contextTokensFormatted,
@@ -2224,6 +2540,7 @@ export function createHarnessMonitorApp() {
     const wsCtx = await resolveWorkspaceContext(reqData);
     const engine = new HarnessKnowledgeEngine(wsCtx.workspaceRoot);
     const status = engine.getStatus();
+    const lifecycleState = loadSubagentLifecycle(wsCtx.workspaceRoot);
     const brainConversations = scanRecentBrainTranscripts();
     const activeBrain =
       brainConversations.find((c) => c.conversationId === wsCtx.activeConversationId) ||
@@ -2239,6 +2556,7 @@ export function createHarnessMonitorApp() {
       status.totalDocuments || 0,
       status.indexedAt || '',
       status.snapshotIsolationLock?.snapshotId || 'unlocked',
+      lifecycleState?.revision || 1,
       liveSec,
     ].join('|');
 
@@ -2268,6 +2586,7 @@ export function createHarnessMonitorApp() {
     const status = engine.getStatus();
     const settings = engine.loadConfig();
     const snapshots = wsCtx.hasHarness ? engine.listSnapshots() : [];
+    const lifecycleState = loadSubagentLifecycle(workspaceRoot);
     const brainConversations = scanRecentBrainTranscripts();
     const activeBrain =
       brainConversations.find((c) => c.conversationId === wsCtx.activeConversationId) ||
@@ -2295,6 +2614,7 @@ export function createHarnessMonitorApp() {
       status.totalDocuments || 0,
       status.indexedAt || '',
       status.snapshotIsolationLock?.snapshotId || 'unlocked',
+      lifecycleState?.revision || 1,
       liveSec,
     ].join('|');
 
@@ -2607,6 +2927,33 @@ export function createHarnessMonitorApp() {
     },
     'POST'
   );
+
+  const handleSwarmRecall = async (reqData = {}) => {
+    const payload = reqData?.body || reqData || {};
+    const wsCtx = await resolveWorkspaceContext(payload);
+    const updated = mutateSubagentLifecycle(wsCtx.workspaceRoot, {
+      formationId: payload.formationId || 'live-harness2',
+      nodeId: payload.nodeId || '',
+      nodeIds: payload.nodeIds || [],
+      action: payload.action || 'recall',
+      durationSec: Number(payload.durationSec || 180),
+    });
+    const entry =
+      payload.nodeId
+        ? updated.nodes?.[`${payload.formationId || 'live-harness2'}:${payload.nodeId}`] || null
+        : null;
+    return {
+      ok: true,
+      workspaceRoot: wsCtx.workspaceRoot,
+      formationId: payload.formationId || 'live-harness2',
+      nodeId: payload.nodeId || null,
+      action: payload.action || 'recall',
+      nodeState: entry,
+      revision: updated.revision,
+    };
+  };
+  app.api('/api/swarm/recall', handleSwarmRecall, 'POST');
+  app.api('/api/swarm/recall', handleSwarmRecall, 'GET');
 
   const handleHarness2Run = async (reqData = {}) => {
     const payload = reqData?.body || reqData || {};

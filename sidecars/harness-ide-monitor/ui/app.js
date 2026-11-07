@@ -136,6 +136,7 @@
   let latestDashboard = null;
   let settingsInitializedForWs = '';
   let activeFormationId = 'live-harness2';
+  let hideInactiveSubagents = true;
   let selectedNodeId = null;
   let hoveredNodeId = null;
   let memberStatusFilter = 'ALL';
@@ -462,12 +463,123 @@
     drawHierarchyEdges();
   }
 
+  function computeGridColumns(count) {
+    if (count <= 1) return 1;
+    if (count === 2) return 2;
+    if (count === 3) return 2; // 2x2 compact grid instead of wide 1x3 row
+    if (count === 4) return 2; // 2x2 square grid instead of 1x4 straight line
+    if (count <= 6) return 3;  // 3x2 compact grid instead of 1x6 straight line
+    if (count <= 9) return 3;  // 3x3 compact grid
+    return 4;                  // 4xM grid for 10+ subagents
+  }
+
+  function getVisibleGraphTopology(formation) {
+    const allNodes = formation?.nodes || [];
+    const nodesById = new Map(allNodes.map((n) => [n.id, n]));
+    const rootNode = allNodes.find((n) => Number(n.tier || 0) === 0) || allNodes[0] || null;
+    const rootId = rootNode?.id || 'main-orchestrator';
+
+    const visibleNodes = [];
+    const hiddenInactiveNodes = [];
+
+    for (const n of allNodes) {
+      const isRoot = Number(n.tier || 0) === 0;
+      const isActive = n.status === 'RUNNING';
+      if (isRoot || !hideInactiveSubagents || isActive) {
+        visibleNodes.push(n);
+      } else {
+        hiddenInactiveNodes.push(n);
+      }
+    }
+
+    const visibleIdSet = new Set(visibleNodes.map((n) => n.id));
+
+    // Resolve nearest visible ancestor for each visible node so recalled subagents
+    // connect cleanly even if an intermediate parent node is finished/hidden
+    const resolveVisibleAncestors = (node) => {
+      if (Number(node.tier || 0) === 0) return [];
+      const found = new Set();
+      const queue = [...(node.parentIds || [])];
+      const visited = new Set();
+      while (queue.length > 0) {
+        const pid = queue.shift();
+        if (!pid || visited.has(pid)) continue;
+        visited.add(pid);
+        if (visibleIdSet.has(pid)) {
+          found.add(pid);
+        } else {
+          const pNode = nodesById.get(pid);
+          if (pNode && Array.isArray(pNode.parentIds)) {
+            queue.push(...pNode.parentIds);
+          }
+        }
+      }
+      if (found.size === 0 && visibleIdSet.has(rootId) && node.id !== rootId) {
+        found.add(rootId);
+      }
+      return Array.from(found);
+    };
+
+    const palette = ['#38bdf8', '#10b981', '#a855f7', '#f59e0b', '#ec4899', '#6366f1'];
+    let colorIdx = 0;
+    const visibleEdges = [];
+    const effectivePrimaryParent = new Map();
+
+    for (const n of visibleNodes) {
+      const ancestors = resolveVisibleAncestors(n);
+      effectivePrimaryParent.set(n.id, ancestors[0] || rootId);
+      for (const pid of ancestors) {
+        visibleEdges.push({
+          id: `${pid}->${n.id}`,
+          from: pid,
+          to: n.id,
+          status: n.status === 'RUNNING' ? 'RUNNING' : 'COMPLETED',
+          recalled: Boolean(n.recalled),
+          color: palette[colorIdx++ % palette.length],
+        });
+      }
+    }
+
+    return {
+      allNodes,
+      visibleNodes,
+      hiddenInactiveNodes,
+      visibleEdges,
+      effectivePrimaryParent,
+      nodesById,
+      rootId,
+    };
+  }
+
+  async function triggerSubagentLifecycle(action, nodeId = '', nodeIds = []) {
+    const res = await apiFetch('/api/swarm/recall', {
+      formationId: activeFormationId,
+      action,
+      nodeId,
+      nodeIds,
+      durationSec: 180,
+    });
+    if (res && res.ok) {
+      if (action === 'recall') {
+        showToast(`↺ Recalled subagent '${nodeId}' — rejoined active 2D network graph!`);
+      } else if (action === 'recall_all') {
+        showToast(`↺ Recalled ${nodeIds.length} subagents to active 2D network graph!`);
+      } else if (action === 'complete') {
+        showToast(`✓ Marked '${nodeId}' completed (parked in inactive subagents).`);
+      }
+      lastRenderedNodeSignature = '';
+      lastRenderedMemberSignature = '';
+      await refreshDashboard(true);
+    }
+  }
+
   function drawHierarchyEdges() {
     const formation = getActiveFormation(latestDashboard);
     const svg = document.getElementById('hierarchy-edges-svg');
     const stage = document.getElementById('hierarchy-stage');
     if (!formation || !svg || !stage) return;
 
+    const topology = getVisibleGraphTopology(formation);
     const stageRect = stage.getBoundingClientRect();
     const scale = zoomScale || 1;
     const width = Math.max(stage.scrollWidth, stageRect.width / scale, 540);
@@ -480,7 +592,7 @@
     const lineage = getLineageSet(formation, focusNodeId);
     const pathsHtml = [];
 
-    for (const edge of formation.edges || []) {
+    for (const edge of topology.visibleEdges) {
       const fromEl = stage.querySelector(`[data-node-id="${edge.from}"]`);
       const toEl = stage.querySelector(`[data-node-id="${edge.to}"]`);
       if (!fromEl || !toEl) continue;
@@ -492,16 +604,22 @@
       const y1 = (r1.bottom - stageRect.top) / scale;
       const x2 = (r2.left - stageRect.left + r2.width / 2) / scale;
       const y2 = (r2.top - stageRect.top) / scale;
-      const midY = y1 + (y2 - y1) * 0.5;
+      const dy = Math.max(24, y2 - y1);
+      const cp1Y = y1 + dy * 0.42;
+      const cp2Y = y2 - dy * 0.38;
 
       const isHighlighted = lineage && lineage.has(edge.from) && lineage.has(edge.to);
       const isDimmed = lineage && !isHighlighted;
       const runningCls = edge.status === 'RUNNING' ? 'edge-running' : '';
       const focusCls = isHighlighted ? 'edge-highlighted' : isDimmed ? 'edge-dimmed' : '';
-      const strokeColor = edge.status === 'RUNNING' ? '#10b981' : edge.color || '#38bdf8';
+      const strokeColor = edge.recalled
+        ? '#34d399'
+        : edge.status === 'RUNNING'
+          ? '#10b981'
+          : edge.color || '#38bdf8';
 
       pathsHtml.push(
-        `<path class="edge-path ${runningCls} ${focusCls}" d="M ${x1} ${y1} C ${x1} ${midY}, ${x2} ${midY}, ${x2} ${y2}" stroke="${strokeColor}" />`
+        `<path class="edge-path ${runningCls} ${focusCls}" d="M ${x1} ${y1} C ${x1} ${cp1Y}, ${x2} ${cp2Y}, ${x2} ${y2}" stroke="${strokeColor}" />`
       );
       pathsHtml.push(
         `<circle cx="${x2}" cy="${y2 - 2}" r="3" fill="${strokeColor}" opacity="${isDimmed ? 0.2 : 0.9}" />`
@@ -602,9 +720,99 @@
 
     document.getElementById('formation-title').textContent = formation.name;
 
-    // Group nodes by tier (0, 1, 2, 3)
+    const topology = getVisibleGraphTopology(formation);
+    const { visibleNodes, hiddenInactiveNodes, effectivePrimaryParent, nodesById, rootId } =
+      topology;
+
+    const hideBtn = document.getElementById('btn-toggle-hide-inactive');
+    if (hideBtn) {
+      hideBtn.classList.toggle('active', hideInactiveSubagents);
+      hideBtn.textContent = hideInactiveSubagents
+        ? `🙈 Hide Inactive First (${hiddenInactiveNodes.length} hidden)`
+        : `👁️ Showing All (+${(formation.nodes || []).filter((n) => n.tier > 0 && n.status !== 'RUNNING').length} inactive)`;
+    }
+
+    const recallAllBtn = document.getElementById('btn-recall-all-subagents');
+    if (recallAllBtn) {
+      const allFinishedSubIds = (formation.nodes || [])
+        .filter((n) => Number(n.tier || 0) > 0 && n.status !== 'RUNNING')
+        .map((n) => n.id);
+      const allRunningSubIds = (formation.nodes || [])
+        .filter((n) => Number(n.tier || 0) > 0 && n.status === 'RUNNING')
+        .map((n) => n.id);
+      if (allFinishedSubIds.length > 0) {
+        recallAllBtn.textContent = `↺ Recall Finished (${allFinishedSubIds.length})`;
+        recallAllBtn.setAttribute('data-action-mode', 'recall_all');
+      } else if (allRunningSubIds.length > 0) {
+        recallAllBtn.textContent = `✓ Finish Active (${allRunningSubIds.length})`;
+        recallAllBtn.setAttribute('data-action-mode', 'complete_all');
+      }
+    }
+
+    // Render Inactive / Finished Subagents Dock (when inactive subagents are hidden from graph)
+    const dockEl = document.getElementById('inactive-subagents-dock');
+    if (dockEl) {
+      if (hideInactiveSubagents && hiddenInactiveNodes.length > 0) {
+        dockEl.classList.remove('hidden');
+        dockEl.innerHTML = `
+          <div class="inactive-dock-top">
+            <span>
+              <strong style="color:#38bdf8;">✓ ${hiddenInactiveNodes.length} Finished Subagent${hiddenInactiveNodes.length === 1 ? '' : 's'} Hidden from Graph</strong>
+              <span class="muted-text"> — Click <strong>↺ Recall</strong> (or call <code>send_message</code>) so a subagent rejoins the active 2D network graph:</span>
+            </span>
+            <div class="inline-pair">
+              <button class="recall-mini-btn" id="dock-btn-recall-all">↺ Recall All (${hiddenInactiveNodes.length}) into 2D Grid</button>
+              <button class="recall-mini-btn btn-complete-sub" id="dock-btn-show-inactive">👁️ Show Inactive on Graph</button>
+            </div>
+          </div>
+          <div class="inactive-dock-chips">
+            ${hiddenInactiveNodes
+              .map(
+                (hn) => `
+              <div class="inactive-sub-chip" data-dock-node-id="${escapeHtml(hn.id)}">
+                <span class="inactive-chip-name" title="${escapeHtml(hn.role)} (${escapeHtml(hn.durationFormatted)})">
+                  <span class="status-dot dot-completed" style="display:inline-block;margin-right:4px;"></span>
+                  ${escapeHtml(hn.role)}
+                </span>
+                <button class="recall-mini-btn btn-dock-recall-single" data-recall-id="${escapeHtml(hn.id)}" title="Recall ${escapeHtml(hn.role)} to rejoin the active network graph">
+                  ↺ Recall
+                </button>
+              </div>
+            `
+              )
+              .join('')}
+          </div>
+        `;
+        dockEl.querySelectorAll('.btn-dock-recall-single').forEach((btn) => {
+          btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const nid = btn.getAttribute('data-recall-id');
+            if (nid) triggerSubagentLifecycle('recall', nid);
+          });
+        });
+        dockEl.querySelector('#dock-btn-recall-all')?.addEventListener('click', (e) => {
+          e.stopPropagation();
+          triggerSubagentLifecycle(
+            'recall_all',
+            '',
+            hiddenInactiveNodes.map((n) => n.id)
+          );
+        });
+        dockEl.querySelector('#dock-btn-show-inactive')?.addEventListener('click', (e) => {
+          e.stopPropagation();
+          hideInactiveSubagents = false;
+          lastRenderedNodeSignature = '';
+          renderSwarmTab(latestDashboard);
+        });
+      } else {
+        dockEl.classList.add('hidden');
+        dockEl.innerHTML = '';
+      }
+    }
+
+    // Group visible nodes by tier, then inside each tier group by effectiveParentId into 2D Grids!
     const tiersMap = new Map();
-    for (const node of formation.nodes || []) {
+    for (const node of visibleNodes) {
       const t = Number(node.tier || 0);
       if (!tiersMap.has(t)) tiersMap.set(t, []);
       tiersMap.get(t).push(node);
@@ -614,19 +822,22 @@
     const lineage = getLineageSet(formation, focusNodeId);
 
     const tiersContainer = document.getElementById('hierarchy-tiers-container');
-    const currentSignature = `${activeFormationId}:${(formation.nodes || []).map((n) => n.id).join(',')}`;
+    const currentSignature = `${activeFormationId}:hide=${hideInactiveSubagents}:${visibleNodes
+      .map((n) => `${n.id}:${n.status}:${n.recalled ? 1 : 0}`)
+      .join(',')}`;
 
-    // Non-destructive in-place DOM patching when formation topology is unchanged
+    // Non-destructive in-place DOM patching when visible topology & statuses are unchanged
     if (
       currentSignature === lastRenderedNodeSignature &&
-      tiersContainer.querySelectorAll('.h-node-card').length === (formation.nodes || []).length
+      tiersContainer.querySelectorAll('.h-node-card').length === visibleNodes.length
     ) {
-      for (const n of formation.nodes || []) {
+      for (const n of visibleNodes) {
         const card = tiersContainer.querySelector(`[data-node-id="${n.id}"]`);
         if (!card) continue;
         const isSelected = selectedNodeId === n.id || hoveredNodeId === n.id;
         const isDimmed = Boolean(lineage && !lineage.has(n.id));
         card.classList.toggle('node-running', n.status === 'RUNNING');
+        card.classList.toggle('node-recalled', Boolean(n.recalled && n.status === 'RUNNING'));
         card.classList.toggle('node-current', Boolean(n.isCurrent));
         card.classList.toggle('node-selected', isSelected);
         card.classList.toggle('node-dimmed', isDimmed);
@@ -671,54 +882,109 @@
       }
     } else {
       lastRenderedNodeSignature = currentSignature;
-      tiersContainer.innerHTML = sortedTiers
-        .map(
-          ([tierNum, nodes]) => `
-          <div class="hierarchy-tier-row" data-tier="${tierNum}">
-            ${nodes
-              .map((n) => {
-                const isSelected = selectedNodeId === n.id || hoveredNodeId === n.id;
-                const isDimmed = lineage && !lineage.has(n.id);
-                const dotClass =
-                  n.status === 'RUNNING'
-                    ? 'dot-running'
-                    : n.status === 'COMPLETED'
-                      ? 'dot-completed'
-                      : 'dot-standby';
-                const badgeText = n.isCurrent
-                  ? 'Current'
-                  : n.workspace === 'branch'
-                    ? 'branch'
-                    : `T${n.tier}`;
-                const badgeClass = n.workspace === 'branch' ? 'badge-branch' : '';
-                const offset = getNodeOffset(n.id);
-                const transformStyle =
-                  offset.x || offset.y
-                    ? `style="transform: translate3d(${offset.x}px, ${offset.y}px, 0);"`
-                    : '';
 
-                return `
-                  <div class="h-node-card ${n.status === 'RUNNING' ? 'node-running' : ''} ${n.isCurrent ? 'node-current' : ''} ${isSelected ? 'node-selected' : ''} ${isDimmed ? 'node-dimmed' : ''}" data-node-id="${escapeHtml(n.id)}" ${transformStyle}>
-                    <div class="h-node-header">
-                      <div class="h-node-title-wrap">
-                        <span class="status-dot ${dotClass}"></span>
-                        <span class="h-node-title" title="${escapeHtml(n.role)}">${escapeHtml(n.role)}</span>
-                      </div>
-                      <span class="h-node-badge ${badgeClass}">${escapeHtml(badgeText)}</span>
-                    </div>
-                    <div class="h-node-tokens">${escapeHtml(n.totalTokensFormatted)} · ${escapeHtml(n.costFormatted)}</div>
-                    ${renderNodeDnaBar(n.dna)}
-                    <div class="h-node-footer">
-                      <span>${escapeHtml(n.durationFormatted)}</span>
-                      <span class="h-node-pct">${Number(n.contextUsedPct || 0)}%</span>
-                    </div>
-                  </div>
-                `;
-              })
-              .join('')}
+      const renderSingleNodeCard = (n) => {
+        const isSelected = selectedNodeId === n.id || hoveredNodeId === n.id;
+        const isDimmed = lineage && !lineage.has(n.id);
+        const isRecalledActive = Boolean(n.recalled && n.status === 'RUNNING');
+        const dotClass =
+          n.status === 'RUNNING'
+            ? 'dot-running'
+            : n.status === 'COMPLETED'
+              ? 'dot-completed'
+              : 'dot-standby';
+        const badgeText = n.isCurrent
+          ? 'Current'
+          : isRecalledActive
+            ? `↺ Recalled${n.recallCount > 1 ? ` #${n.recallCount}` : ''}`
+            : n.workspace === 'branch'
+              ? 'branch'
+              : `T${n.tier}`;
+        const badgeClass = isRecalledActive
+          ? 'badge-recalled'
+          : n.workspace === 'branch'
+            ? 'badge-branch'
+            : '';
+        const offset = getNodeOffset(n.id);
+        const transformStyle =
+          offset.x || offset.y
+            ? `style="transform: translate3d(${offset.x}px, ${offset.y}px, 0);"`
+            : '';
+
+        return `
+          <div class="h-node-card ${n.status === 'RUNNING' ? 'node-running' : ''} ${isRecalledActive ? 'node-recalled' : ''} ${n.isCurrent ? 'node-current' : ''} ${isSelected ? 'node-selected' : ''} ${isDimmed ? 'node-dimmed' : ''}" data-node-id="${escapeHtml(n.id)}" ${transformStyle}>
+            <div class="h-node-header">
+              <div class="h-node-title-wrap">
+                <span class="status-dot ${dotClass}"></span>
+                <span class="h-node-title" title="${escapeHtml(n.role)}">${escapeHtml(n.role)}</span>
+              </div>
+              <span class="h-node-badge ${badgeClass}">${escapeHtml(badgeText)}</span>
+            </div>
+            <div class="h-node-tokens">${escapeHtml(n.totalTokensFormatted)} · ${escapeHtml(n.costFormatted)}</div>
+            ${renderNodeDnaBar(n.dna)}
+            <div class="h-node-footer">
+              <span>${escapeHtml(n.durationFormatted)}</span>
+              <span class="h-node-pct">${Number(n.contextUsedPct || 0)}%</span>
+            </div>
           </div>
-        `
-        )
+        `;
+      };
+
+      tiersContainer.innerHTML = sortedTiers
+        .map(([tierNum, nodes]) => {
+          if (tierNum === 0) {
+            return `
+              <div class="hierarchy-tier-row" data-tier="0">
+                <div class="hierarchy-parent-cluster cluster-root">
+                  <div class="subagent-cards-grid" style="--grid-cols: ${computeGridColumns(nodes.length)};">
+                    ${nodes.map((n) => renderSingleNodeCard(n)).join('')}
+                  </div>
+                </div>
+              </div>
+            `;
+          }
+
+          // Group this tier's visible subagents by their primary parent node so each parent's
+          // children are arranged in a compact 2D Multi-Column Grid instead of a 1D straight line!
+          const parentGroups = new Map();
+          for (const n of nodes) {
+            const pid = effectivePrimaryParent.get(n.id) || n.parentIds?.[0] || rootId;
+            if (!parentGroups.has(pid)) parentGroups.set(pid, []);
+            parentGroups.get(pid).push(n);
+          }
+
+          const clustersHtml = Array.from(parentGroups.entries())
+            .map(([pid, groupNodes]) => {
+              const parentObj = nodesById.get(pid);
+              const parentLabel = parentObj ? parentObj.role : 'Parent Orchestrator';
+              const cols = computeGridColumns(groupNodes.length);
+              const rows = Math.ceil(groupNodes.length / cols);
+              const hiddenForParent = hiddenInactiveNodes.filter((hn) =>
+                (hn.parentIds || []).includes(pid)
+              ).length;
+
+              return `
+                <div class="hierarchy-parent-cluster" data-parent-cluster="${escapeHtml(pid)}">
+                  <div class="cluster-header-bar">
+                    <span>↳ ${escapeHtml(parentLabel)}</span>
+                    <span class="cluster-grid-badge">
+                      ⊞ ${cols}×${rows} Grid · ${groupNodes.length} shown${hiddenForParent > 0 ? ` · +${hiddenForParent} hidden` : ''}
+                    </span>
+                  </div>
+                  <div class="subagent-cards-grid" style="--grid-cols: ${cols};">
+                    ${groupNodes.map((n) => renderSingleNodeCard(n)).join('')}
+                  </div>
+                </div>
+              `;
+            })
+            .join('');
+
+          return `
+            <div class="hierarchy-tier-row" data-tier="${tierNum}">
+              ${clustersHtml}
+            </div>
+          `;
+        })
         .join('');
 
       tiersContainer.querySelectorAll('.h-node-card').forEach((card) => {
@@ -728,7 +994,7 @@
 
     requestAnimationFrame(() => drawHierarchyEdges());
 
-    // Render Right Top: Swarm Teams & Members (编队成员) with In-Place Live Patching
+    // Render Right Top: Swarm Teams & Members (编队成员) with Recall / Complete controls
     const teamsContainer = document.getElementById('swarm-teams-container');
     document.getElementById('team-members-count-badge').textContent =
       `${(formation.nodes || []).length} Agents`;
@@ -756,7 +1022,7 @@
       }
       if (members.length > 0) {
         filteredTeams.push({ teamName: team.teamName, members });
-        for (const m of members) visibleMemberIds.push(m.id);
+        for (const m of members) visibleMemberIds.push(`${m.id}:${m.status}:${m.recalled ? 1 : 0}`);
       }
     }
 
@@ -797,17 +1063,29 @@
                 .map((m) => {
                   const isRunning = m.status === 'RUNNING';
                   const isSel = selectedNodeId === m.id;
+                  const isSub = Number(m.tier || 0) > 0;
+                  const actionBtnHtml = isSub
+                    ? isRunning
+                      ? `<button class="recall-mini-btn btn-complete-sub btn-member-lifecycle" data-lc-action="complete" data-lc-node="${escapeHtml(m.id)}" title="Mark finished &amp; hide from active graph">✓ Finish</button>`
+                      : `<button class="recall-mini-btn btn-member-lifecycle" data-lc-action="recall" data-lc-node="${escapeHtml(m.id)}" title="Recall subagent to rejoin the active 2D network graph">↺ Recall</button>`
+                    : `<span>→</span>`;
+                  const statusLabel = isRunning
+                    ? m.recalled
+                      ? `● Running (↺ Recalled #${m.recallCount || 1})`
+                      : '● Running'
+                    : '✓ Finished (Inactive)';
+
                   return `
                     <div class="member-card ${isRunning ? 'member-running' : ''} ${isSel ? 'member-selected' : ''}" data-member-id="${escapeHtml(m.id)}">
                       <div class="member-card-top">
                         <span class="member-role" title="${escapeHtml(m.role)}">${escapeHtml(m.role)}</span>
                         <span class="status-dot ${isRunning ? 'dot-running' : 'dot-completed'}"></span>
                       </div>
-                      <div class="member-meta">${escapeHtml(m.status === 'RUNNING' ? 'Running' : 'Completed')} · <code>${escapeHtml(m.model)}</code></div>
+                      <div class="member-meta">${escapeHtml(statusLabel)} · <code>${escapeHtml(m.model)}</code></div>
                       <div class="member-report">${escapeHtml(m.latestReport || '')}</div>
                       <div class="member-footer">
                         <span>${escapeHtml(m.contextTokensFormatted)} · ${escapeHtml(m.durationFormatted)}</span>
-                        <span>→</span>
+                        ${actionBtnHtml}
                       </div>
                     </div>
                   `;
@@ -828,9 +1106,19 @@
         card.addEventListener('mouseleave', () => {
           hideNodeHoverPreview();
         });
-        card.addEventListener('click', () => {
+        card.addEventListener('click', (e) => {
+          if (e.target.closest('.btn-member-lifecycle')) return;
           selectedNodeId = selectedNodeId === mid ? null : mid;
           renderSwarmTab(latestDashboard);
+        });
+      });
+
+      teamsContainer.querySelectorAll('.btn-member-lifecycle').forEach((btn) => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const act = btn.getAttribute('data-lc-action') || 'recall';
+          const nid = btn.getAttribute('data-lc-node') || '';
+          if (nid) triggerSubagentLifecycle(act, nid);
         });
       });
     }
@@ -1579,6 +1867,38 @@
     lastRenderedNodeSignature = '';
     applyStageTransform(false);
     if (latestDashboard) renderSwarmTab(latestDashboard);
+  });
+
+  document.getElementById('btn-toggle-hide-inactive')?.addEventListener('click', () => {
+    hideInactiveSubagents = !hideInactiveSubagents;
+    lastRenderedNodeSignature = '';
+    if (latestDashboard) renderSwarmTab(latestDashboard);
+    showToast(
+      hideInactiveSubagents
+        ? '🙈 Inactive subagents hidden first — recalled subagents rejoin the active 2D graph.'
+        : '👁️ Showing all subagents (active + completed) in 2D parent grids.'
+    );
+  });
+
+  document.getElementById('btn-recall-all-subagents')?.addEventListener('click', async (e) => {
+    const formation = getActiveFormation(latestDashboard);
+    if (!formation) return;
+    const mode = e.currentTarget.getAttribute('data-action-mode') || 'recall_all';
+    if (mode === 'complete_all') {
+      const runningIds = (formation.nodes || [])
+        .filter((n) => Number(n.tier || 0) > 0 && n.status === 'RUNNING')
+        .map((n) => n.id);
+      if (runningIds.length > 0) {
+        await triggerSubagentLifecycle('complete_all', '', runningIds);
+      }
+    } else {
+      const finishedIds = (formation.nodes || [])
+        .filter((n) => Number(n.tier || 0) > 0 && n.status !== 'RUNNING')
+        .map((n) => n.id);
+      if (finishedIds.length > 0) {
+        await triggerSubagentLifecycle('recall_all', '', finishedIds);
+      }
+    }
   });
 
   document.getElementById('btn-clear-node-filter')?.addEventListener('click', () => {

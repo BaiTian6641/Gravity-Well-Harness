@@ -111,19 +111,92 @@ function main() {
         sess.transcriptPath = input.transcriptPath;
       }
 
-      // Track subagent invocations in real time
+      sess.subagents = Array.isArray(sess.subagents) ? sess.subagents : [];
+      const currentStepIdx = Number(input.stepIdx || sess.toolCallCount || 0);
+      const nowMs = Date.now();
+
+      // 1. Auto-complete any previously RUNNING subagent whose turn has finished
+      for (const existingSub of sess.subagents) {
+        if (existingSub.status === 'RUNNING') {
+          const lastStep = Number(existingSub.lastActiveStepIdx ?? existingSub.stepIdx ?? 0);
+          const lastTimeMs = Date.parse(existingSub.lastActiveAt || existingSub.invokedAt || '') || 0;
+          const stepDelta = currentStepIdx - lastStep;
+          const elapsedMs = lastTimeMs > 0 ? nowMs - lastTimeMs : 0;
+          if (stepDelta >= 2 || elapsedMs > 25_000) {
+            existingSub.status = 'COMPLETED';
+            existingSub.completedAt = nowIso;
+          }
+        }
+      }
+
+      // 2. Track subagent invocations, recalls (send_message), and terminations (manage_subagents)
       if (toolName === 'invoke_subagent') {
-        sess.subagents = sess.subagents || [];
-        sess.subagents.push({
-          role: toolArgs.Role || toolArgs.TypeName || 'Subagent',
-          typeName: toolArgs.TypeName || 'self',
-          workspace: toolArgs.Workspace || 'inherit',
-          model: toolArgs.Model || 'inherit',
-          promptPreview: String(toolArgs.Prompt || '').slice(0, 220),
-          invokedAt: nowIso,
-          stepIdx: input.stepIdx || 0,
-          status: input.error ? 'ERROR' : 'RUNNING'
-        });
+        const roleName = toolArgs.Role || toolArgs.TypeName || 'Subagent';
+        const typeName = toolArgs.TypeName || 'self';
+        const existing = sess.subagents.find(
+          (s) => s.role === roleName || (s.typeName === typeName && s.role === roleName)
+        );
+        if (existing) {
+          existing.status = input.error ? 'ERROR' : 'RUNNING';
+          existing.recalled = true;
+          existing.recallCount = (existing.recallCount || 0) + 1;
+          existing.recalledAt = nowIso;
+          existing.lastActiveAt = nowIso;
+          existing.lastActiveStepIdx = currentStepIdx;
+          existing.promptPreview = String(toolArgs.Prompt || existing.promptPreview || '').slice(0, 220);
+        } else {
+          sess.subagents.push({
+            id: `sub-${sess.subagents.length + 1}-${currentStepIdx}`,
+            role: roleName,
+            typeName,
+            workspace: toolArgs.Workspace || 'inherit',
+            model: toolArgs.Model || 'inherit',
+            promptPreview: String(toolArgs.Prompt || '').slice(0, 220),
+            invokedAt: nowIso,
+            lastActiveAt: nowIso,
+            stepIdx: currentStepIdx,
+            lastActiveStepIdx: currentStepIdx,
+            recalled: false,
+            recallCount: 0,
+            status: input.error ? 'ERROR' : 'RUNNING'
+          });
+        }
+      } else if (toolName === 'send_message') {
+        const recipient = String(toolArgs.Recipient || '').trim();
+        const target =
+          sess.subagents.find(
+            (s) =>
+              s.conversationId === recipient ||
+              s.id === recipient ||
+              s.role.toLowerCase().includes(recipient.toLowerCase())
+          ) || sess.subagents[sess.subagents.length - 1];
+        if (target) {
+          target.status = input.error ? 'ERROR' : 'RUNNING';
+          target.recalled = true;
+          target.recallCount = (target.recallCount || 0) + 1;
+          target.recalledAt = nowIso;
+          target.lastActiveAt = nowIso;
+          target.lastActiveStepIdx = currentStepIdx;
+          if (toolArgs.Message) {
+            target.promptPreview = String(toolArgs.Message).slice(0, 220);
+          }
+        }
+      } else if (toolName === 'manage_subagents') {
+        const action = String(toolArgs.Action || '').toLowerCase();
+        if (action === 'kill_all') {
+          for (const s of sess.subagents) {
+            s.status = 'COMPLETED';
+            s.completedAt = nowIso;
+          }
+        } else if (action === 'kill') {
+          const ids = Array.isArray(toolArgs.ConversationIds) ? toolArgs.ConversationIds : [];
+          for (const s of sess.subagents) {
+            if (ids.length === 0 || ids.includes(s.conversationId) || ids.includes(s.id)) {
+              s.status = 'COMPLETED';
+              s.completedAt = nowIso;
+            }
+          }
+        }
       }
 
       telemetry.recentEvents = telemetry.recentEvents || [];

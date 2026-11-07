@@ -162,6 +162,14 @@ test('5. Auxiliary Pane UI Sidecar Server responds on /, /api/status, /api/dashb
     const htmlText = await htmlRes.text();
     assert.ok(htmlText.includes('Gravity Well Harness'));
     assert.ok(htmlText.includes('node-hover-preview'));
+    assert.ok(htmlText.includes('inactive-subagents-dock'));
+    assert.ok(htmlText.includes('btn-toggle-hide-inactive'));
+
+    // Ensure clean subagent lifecycle state first
+    await fetch(`${base}/api/swarm/recall`, {
+      method: 'POST',
+      body: JSON.stringify({ workspaceRoot: REPO_ROOT, action: 'reset' }),
+    });
 
     const pulseRes = await fetch(`${base}/api/live-pulse`, {
       method: 'POST',
@@ -190,6 +198,68 @@ test('5. Auxiliary Pane UI Sidecar Server responds on /, /api/status, /api/dashb
     assert.equal(dashData.swarm.formations['multi-stage-team'].nodes.length, 13);
     assert.ok(dashData.swarm.formations['live-harness2'].edges.length >= 5);
     assert.ok(dashData.swarm.formations['live-harness2'].teams.length >= 3);
+
+    // Verify finished subagents are accurately marked COMPLETED when no probe lock is active
+    const liveFormation = dashData.swarm.formations['live-harness2'];
+    const prober1Before = liveFormation.nodes.find((n) => n.id === 'harness-prober-1');
+    assert.ok(prober1Before);
+    assert.equal(prober1Before.status, 'COMPLETED');
+    assert.equal(prober1Before.isActive, false);
+    assert.ok(liveFormation.inactiveSubagentCount >= 5);
+
+    // Verify recalling an inactive subagent transitions it back to RUNNING and rejoins the active network
+    const recallRes = await fetch(`${base}/api/swarm/recall`, {
+      method: 'POST',
+      body: JSON.stringify({
+        workspaceRoot: REPO_ROOT,
+        formationId: 'live-harness2',
+        nodeId: 'harness-prober-1',
+        action: 'recall',
+      }),
+    });
+    assert.equal(recallRes.status, 200);
+    const recallData = await recallRes.json();
+    assert.equal(recallData.ok, true);
+
+    const dashAfterRecallRes = await fetch(`${base}/api/dashboard`, {
+      method: 'POST',
+      body: JSON.stringify({ workspaceRoot: REPO_ROOT }),
+    });
+    const dashAfterRecall = await dashAfterRecallRes.json();
+    const prober1AfterRecall = dashAfterRecall.swarm.formations['live-harness2'].nodes.find(
+      (n) => n.id === 'harness-prober-1',
+    );
+    assert.equal(prober1AfterRecall.status, 'RUNNING');
+    assert.equal(prober1AfterRecall.isActive, true);
+    assert.equal(prober1AfterRecall.recalled, true);
+
+    // Verify completing a subagent transitions it back to COMPLETED (inactive)
+    const completeRes = await fetch(`${base}/api/swarm/recall`, {
+      method: 'POST',
+      body: JSON.stringify({
+        workspaceRoot: REPO_ROOT,
+        formationId: 'live-harness2',
+        nodeId: 'harness-prober-1',
+        action: 'complete',
+      }),
+    });
+    assert.equal(completeRes.status, 200);
+    const dashAfterCompleteRes = await fetch(`${base}/api/dashboard`, {
+      method: 'POST',
+      body: JSON.stringify({ workspaceRoot: REPO_ROOT }),
+    });
+    const dashAfterComplete = await dashAfterCompleteRes.json();
+    const prober1AfterComplete = dashAfterComplete.swarm.formations['live-harness2'].nodes.find(
+      (n) => n.id === 'harness-prober-1',
+    );
+    assert.equal(prober1AfterComplete.status, 'COMPLETED');
+    assert.equal(prober1AfterComplete.isActive, false);
+
+    // Reset lifecycle state
+    await fetch(`${base}/api/swarm/recall`, {
+      method: 'POST',
+      body: JSON.stringify({ workspaceRoot: REPO_ROOT, action: 'reset' }),
+    });
 
     // Verify Context Window & Token DNA Analytics
     assert.ok(dashData.contextAnalytics);
