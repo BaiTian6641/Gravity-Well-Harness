@@ -4,23 +4,6 @@ import http from 'node:http';
 import os from 'node:os';
 import path, { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import {
-  createAgyCssHandler,
-  createAssetHandler,
-  createShellClientHandler,
-  createShellCssHandler,
-  FallbackResponse,
-  registerUiRoutes,
-} from 'antigravity-sidecar-kit/server';
-import { exitWithLanguageServer } from 'antigravity-sidecar-kit/lifecycle';
-import { persistSidecarRuntime } from 'antigravity-sidecar-kit/rpc';
-import { resolveHostTheme } from 'antigravity-sidecar-kit/theme';
-import {
-  extractTrajectoryWorkspace,
-  extractWorkspaceName,
-  normalizeWorkspacePath,
-  resolveActiveWorkspace,
-} from 'antigravity-sidecar-kit/workspace';
 import { HarnessKnowledgeEngine } from './rag-engine.mjs';
 import {
   setSecretInVault,
@@ -54,16 +37,144 @@ const GLOBAL_SIDECAR_DATA_DIR = path.join(
   SIDECAR_ID
 );
 const ACTIVE_WORKSPACE_FILE = path.join(GLOBAL_SIDECAR_DATA_DIR, 'active-workspace.json');
-const SUBAGENT_LIFECYCLE_MEM = new Map(); // workspaceRoot -> { revision, nodes: { [key]: { status, recalled, recallCount, recalledAt, completedAt } } }
+const SUBAGENT_LIFECYCLE_MEM = new Map();
+
+class FallbackResponse {
+  constructor({ status = 200, contentType = 'text/plain; charset=utf-8', body = '', headers = {} } = {}) {
+    this.status = status;
+    this.contentType = contentType;
+    this.body = body;
+    this.headers = headers;
+  }
+}
+
+function createAssetHandler(baseDir, relPath, contentType, { ResponseClass = FallbackResponse } = {}) {
+  return async () => {
+    const fullPath = path.join(baseDir, relPath);
+    if (!fs.existsSync(fullPath)) {
+      return new ResponseClass({
+        status: 404,
+        contentType: 'text/plain; charset=utf-8',
+        body: `Not Found: ${relPath}`,
+      });
+    }
+    return new ResponseClass({
+      status: 200,
+      contentType,
+      body: fs.readFileSync(fullPath, 'utf8'),
+    });
+  };
+}
+
+function createAgyCssHandler({ ResponseClass = FallbackResponse } = {}) {
+  return async () =>
+    new ResponseClass({
+      status: 200,
+      contentType: 'text/css; charset=utf-8',
+      body: '/* Gravity Well Harness Monitor Base Styles */',
+    });
+}
+
+function createShellCssHandler({ ResponseClass = FallbackResponse } = {}) {
+  return async () =>
+    new ResponseClass({
+      status: 200,
+      contentType: 'text/css; charset=utf-8',
+      body: '/* Gravity Well Harness Shell Styles */',
+    });
+}
+
+function createShellClientHandler({ ResponseClass = FallbackResponse } = {}) {
+  return async () =>
+    new ResponseClass({
+      status: 200,
+      contentType: 'text/javascript; charset=utf-8',
+      body: '/* Gravity Well Harness Standalone Shell Client */',
+    });
+}
+
+function registerUiRoutes(app, { ResponseClass = FallbackResponse } = {}) {
+  app.page('/agy-ui.css', createAgyCssHandler({ ResponseClass }));
+  app.page('/agy-ui.js', createShellClientHandler({ ResponseClass }));
+}
+
+function resolveHostTheme() {
+  return {
+    kind: 'dark',
+    name: process.env.AGY_THEME || 'Tokyo Night',
+  };
+}
+
+function normalizeWorkspacePath(raw) {
+  if (!raw || typeof raw !== 'string') return '';
+  let str = raw.trim();
+  if (!str) return '';
+  if (str.startsWith('file://')) {
+    try {
+      str = fileURLToPath(str);
+    } catch {
+      str = decodeURIComponent(str.replace(/^file:\/\/\/?/, ''));
+    }
+  }
+  return path.resolve(str);
+}
+
+function extractWorkspaceName(normPath) {
+  if (!normPath) return '';
+  return path.basename(String(normPath).replace(/[\\/]+$/, ''));
+}
+
+function resolveActiveWorkspace({ clientWorkspaceUris = [] } = {}) {
+  if (Array.isArray(clientWorkspaceUris) && clientWorkspaceUris.length > 0) {
+    const norm = normalizeWorkspacePath(clientWorkspaceUris[0]);
+    if (norm && fs.existsSync(norm)) {
+      return { workspacePath: norm, source: 'client_uri' };
+    }
+  }
+  return { workspacePath: '', source: 'none' };
+}
+
+function persistSidecarRuntime(sidecarId = SIDECAR_ID, port = 0) {
+  try {
+    fs.mkdirSync(GLOBAL_SIDECAR_DATA_DIR, { recursive: true });
+    fs.writeFileSync(
+      path.join(GLOBAL_SIDECAR_DATA_DIR, 'runtime.json'),
+      JSON.stringify(
+        {
+          sidecarId,
+          pid: process.pid,
+          port: Number(port || 0),
+          updatedAt: new Date().toISOString(),
+        },
+        null,
+        2
+      ),
+      'utf8'
+    );
+  } catch {}
+}
+
+function exitWithLanguageServer({ app } = {}) {
+  const shutdown = () => {
+    try {
+      if (app && typeof app.close === 'function') {
+        app.close();
+      }
+    } catch {}
+    process.exit(0);
+  };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
+}
 
 export const SURFACE_COMPATIBILITY_MATRIX = Object.freeze({
   'antigravity-ide': {
     surface: 'antigravity-ide',
     supportedContracts: [
-      'plugin.json (skills, agents, rules, hooks, mcpServers, sidecars)',
-      'hooks.json (SessionStart, PostToolUse)',
+      'plugin.json (skills, agents, rules, hooks, mcpServers)',
+      'hooks.json (SessionStart, PreInvocation, PostToolUse)',
       'mcp_config.json (stdio & remote HTTP MCP servers)',
-      'sidecar://harness-ide-monitor/ (Auxiliary Pane UI via antigravity-sidecar-kit)',
+      'Standalone authenticated loopback HTTP monitor (127.0.0.1)',
       'invoke_subagent (Workspace: inherit | branch | share)',
     ],
     privateHostRpcUsed: false,
@@ -170,39 +281,85 @@ function saveSubagentLifecycle(workspaceRoot, state) {
 
 function mutateSubagentLifecycle(workspaceRoot, payload = {}) {
   const state = loadSubagentLifecycle(workspaceRoot);
+  state.annotations = state.annotations && typeof state.annotations === 'object' ? state.annotations : {};
   const formationId = payload.formationId || 'live-harness2';
   const nodeId = payload.nodeId || '';
   const action = String(payload.action || 'recall').toLowerCase();
   const nowIso = new Date().toISOString();
+  const isUiAnnotation = ['hide', 'show', 'bookmark', 'unbookmark', 'annotate'].includes(action);
 
-  const setNodeEntry = (fId, nId, status, isRecall = false) => {
+  if (isUiAnnotation) {
+    const targets =
+      Array.isArray(payload.nodeIds) && payload.nodeIds.length > 0
+        ? payload.nodeIds
+        : nodeId
+          ? [nodeId]
+          : [];
+    for (const nid of targets) {
+      const k = `${formationId}:${nid}`;
+      const prevAnn = state.annotations[k] || {};
+      state.annotations[k] = {
+        ...prevAnn,
+        hidden: action === 'hide' ? true : action === 'show' ? false : Boolean(prevAnn.hidden),
+        bookmarked:
+          action === 'bookmark' ? true : action === 'unbookmark' ? false : Boolean(prevAnn.bookmarked),
+        note: payload.note !== undefined ? String(payload.note) : prevAnn.note || null,
+        updatedAt: nowIso,
+      };
+    }
+    state.revision = (state.revision || 1) + 1;
+    return saveSubagentLifecycle(workspaceRoot, state);
+  }
+
+  const executorAck = Boolean(payload.executorAck === true || payload.demoMode === true);
+  const setNodeEntry = (fId, nId, status, isRecall = false, controlStatus = 'acknowledged') => {
     const k = `${fId}:${nId}`;
     const prev = state.nodes[k] || {};
     state.nodes[k] = {
       status,
+      controlStatus,
       recalled: isRecall ? true : Boolean(prev.recalled),
       recallCount: isRecall ? (Number(prev.recallCount || 0) + 1) : Number(prev.recallCount || 0),
       recalledAt: isRecall ? nowIso : prev.recalledAt || null,
       completedAt: status === 'COMPLETED' ? nowIso : null,
       cancelledAt: status === 'CANCELLED' ? nowIso : null,
+      receiptId: payload.receiptId || prev.receiptId || null,
     };
   };
 
   if (action === 'recall' && nodeId) {
-    setNodeEntry(formationId, nodeId, 'RUNNING', true);
+    setNodeEntry(
+      formationId,
+      nodeId,
+      executorAck ? 'RUNNING' : 'PENDING_RECALL',
+      executorAck,
+      executorAck ? 'acknowledged' : 'pending_acknowledgment'
+    );
   } else if (action === 'complete' && nodeId) {
-    setNodeEntry(formationId, nodeId, 'COMPLETED', false);
+    setNodeEntry(formationId, nodeId, 'COMPLETED', false, 'verified_receipt');
   } else if ((action === 'cancel' || action === 'kill') && nodeId) {
-    setNodeEntry(formationId, nodeId, 'CANCELLED', false);
+    setNodeEntry(
+      formationId,
+      nodeId,
+      executorAck ? 'CANCELLED' : 'PENDING_CANCEL',
+      false,
+      executorAck ? 'acknowledged' : 'pending_acknowledgment'
+    );
   } else if (action === 'recall_all') {
     const nodeIds = Array.isArray(payload.nodeIds) ? payload.nodeIds : [];
     for (const nid of nodeIds) {
-      setNodeEntry(formationId, nid, 'RUNNING', true);
+      setNodeEntry(
+        formationId,
+        nid,
+        executorAck ? 'RUNNING' : 'PENDING_RECALL',
+        executorAck,
+        executorAck ? 'acknowledged' : 'pending_acknowledgment'
+      );
     }
   } else if (action === 'complete_all') {
     const nodeIds = Array.isArray(payload.nodeIds) ? payload.nodeIds : [];
     for (const nid of nodeIds) {
-      setNodeEntry(formationId, nid, 'COMPLETED', false);
+      setNodeEntry(formationId, nid, 'COMPLETED', false, 'verified_receipt');
     }
   } else if (action === 'reset') {
     for (const k of Object.keys(state.nodes)) {
@@ -212,9 +369,11 @@ function mutateSubagentLifecycle(workspaceRoot, payload = {}) {
     }
   }
 
-  // Synchronize telemetry.json (both top-level subagents and per-session subagents) on all lifecycle transitions
+  // Synchronize telemetry.json ONLY when executorAck is true (or reset/complete with verified receipt)
+  const shouldSyncExecutionState =
+    executorAck || action === 'reset' || action === 'complete' || action === 'complete_all';
   const telFile = path.join(workspaceRoot, '.harness', 'runtime', 'telemetry.json');
-  if (fs.existsSync(telFile)) {
+  if (shouldSyncExecutionState && fs.existsSync(telFile)) {
     try {
       const tel = JSON.parse(fs.readFileSync(telFile, 'utf8'));
       let changed = false;
@@ -1085,8 +1244,8 @@ function parseTranscriptFile(convId, transcriptFile) {
       readOps,
       writeOps,
       searchOps,
-      ragInjections: Math.max(2, ragInjections),
-      skillInjections: Math.max(1, skillInjections),
+      ragInjections,
+      skillInjections,
       userChars,
       assistantChars,
       thinkingChars,
@@ -1191,13 +1350,14 @@ function inspectTelemetryActivity(workspaceRoot, activeBrain = null, telemetryOv
       : typeof tel?.totalTokens === 'number' && tel.totalTokens >= 0
         ? tel.totalTokens
         : null;
+  const hasExplicitObservedTokens = explicitObservedTokens !== null;
   const hasTranscriptChars = Boolean(
     activeBrain &&
       (Number(activeBrain.userChars || 0) > 0 ||
         Number(activeBrain.assistantChars || 0) > 0 ||
         Number(activeBrain.thinkingChars || 0) > 0)
   );
-  const hasObservedTokenTelemetry = explicitObservedTokens !== null || hasTranscriptChars;
+  const hasObservedTokenTelemetry = hasExplicitObservedTokens || hasTranscriptChars;
   return {
     tel,
     telSessions,
@@ -1208,6 +1368,7 @@ function inspectTelemetryActivity(workspaceRoot, activeBrain = null, telemetryOv
     hasHookActivity,
     hasRealTranscriptOrEvents,
     explicitObservedTokens,
+    hasExplicitObservedTokens,
     hasTranscriptChars,
     hasObservedTokenTelemetry,
   };
@@ -1696,6 +1857,40 @@ export function buildSwarmFormations(
       const uniqueNodeId = liveNodes.some((n) => n.id === subNodeId)
         ? `${subNodeId}-${i + 1}`
         : subNodeId;
+      const subObservedTokens =
+        typeof sub.observedTokens === 'number' && sub.observedTokens >= 0
+          ? sub.observedTokens
+          : typeof sub.totalTokens === 'number' && sub.totalTokens >= 0
+            ? sub.totalTokens
+            : demoMode
+              ? 195_000
+              : null;
+      const subContextTokens =
+        typeof sub.contextTokens === 'number' && sub.contextTokens >= 0
+          ? sub.contextTokens
+          : demoMode
+            ? 64_200
+            : null;
+      const subCostUsd =
+        typeof sub.costUsd === 'number' && sub.costUsd >= 0
+          ? sub.costUsd
+          : demoMode
+            ? 0.21
+            : null;
+      const subSteps =
+        typeof sub.steps === 'number' && sub.steps >= 0 ? sub.steps : demoMode ? 16 : null;
+      const subDurationSec =
+        typeof sub.durationSec === 'number' && sub.durationSec >= 0
+          ? sub.durationSec
+          : demoMode
+            ? 135
+            : null;
+      const subTelemetryQuality =
+        subObservedTokens !== null && !demoMode
+          ? 'observed'
+          : demoMode
+            ? 'simulated'
+            : 'unavailable';
       liveNodes.push({
         id: uniqueNodeId,
         parentIds: ['main-orchestrator'],
@@ -1709,30 +1904,51 @@ export function buildSwarmFormations(
         workspace: sub.workspace || 'inherit',
         isCurrent: false,
         status: resolvedSubStatus,
+        telemetryQuality: subTelemetryQuality,
         recalled: Boolean(sub.recalled),
         recallCount: Number(sub.recallCount || 0),
         recalledAt: sub.recalledAt || null,
         completedAt: resolvedSubStatus === 'COMPLETED' ? sub.completedAt || sub.invokedAt : null,
         cancelledAt: resolvedSubStatus === 'CANCELLED' ? sub.cancelledAt || sub.invokedAt : null,
         terminationReason: sub.terminationReason || null,
-        totalTokens: 195_000,
-        totalTokensFormatted: '195.0k',
-        contextTokensFormatted: '64.2k',
-        costFormatted: '$0.21',
-        durationFormatted: '2m15s · 16 steps',
-        steps: 16,
-        contextUsedPct: 12.5,
-        dna: {
-          systemPrompt: 6,
-          toolDefinitions: 15,
-          userMessages: 4,
-          injectedRag: 15,
-          skillInjection: 5,
-          assistantMessages: 20,
-          toolResults: 25,
-          freeWindow: 10,
-        },
-        latestReport: sub.promptPreview || 'Session subagent task completed.',
+        totalTokens: subObservedTokens,
+        totalTokensFormatted:
+          subObservedTokens !== null ? formatCompactNumber(subObservedTokens) : 'unavailable',
+        contextTokens: subContextTokens,
+        contextTokensFormatted:
+          subContextTokens !== null ? formatCompactNumber(subContextTokens) : 'unavailable',
+        costUsd: subCostUsd,
+        costFormatted: subCostUsd !== null ? `$${subCostUsd.toFixed(2)}` : 'unavailable',
+        durationSec: subDurationSec,
+        durationFormatted:
+          subDurationSec !== null && subSteps !== null
+            ? `${formatDurationSec(subDurationSec)} · ${subSteps} steps`
+            : 'unavailable',
+        steps: subSteps,
+        contextUsedPct:
+          subContextTokens !== null ? Number(((subContextTokens / 512_000) * 100).toFixed(1)) : null,
+        dna: demoMode
+          ? {
+              systemPrompt: 6,
+              toolDefinitions: 15,
+              userMessages: 4,
+              injectedRag: 15,
+              skillInjection: 5,
+              assistantMessages: 20,
+              toolResults: 25,
+              freeWindow: 10,
+            }
+          : {
+              systemPrompt: 0,
+              toolDefinitions: 0,
+              userMessages: 0,
+              injectedRag: 0,
+              skillInjection: 0,
+              assistantMessages: 0,
+              toolResults: 0,
+              freeWindow: 100,
+            },
+        latestReport: sub.promptPreview || 'Session subagent task recorded.',
         taskPrompt: sub.promptPreview || 'Delegated subagent execution.',
       });
     }
@@ -2275,26 +2491,59 @@ export function buildSwarmFormations(
 
       const isRunning = n.status === 'RUNNING';
       n.isActive = isRunning;
-      const baseSec = parseDurationStrToSec(n.durationFormatted);
-      const baseCtx =
-        n.contextTokens !== undefined
-          ? n.contextTokens
-          : parseTokenStr(n.contextTokensFormatted) || (hasObservedActivity ? 95_000 : 0);
-      const baseCost =
-        n.costUsd !== undefined
-          ? n.costUsd
-          : parseFloat(String(n.costFormatted || '0').replace(/[^0-9.]/g, '')) || 0;
 
-      n.durationSec = baseSec;
-      n.steps = Number(n.steps || 0);
-      n.durationFormatted = `${formatDurationSec(baseSec)} · ${n.steps} steps`;
-      n.totalTokens = Number(n.totalTokens || 0);
-      n.totalTokensFormatted = formatCompactNumber(n.totalTokens);
-      n.contextTokens = baseCtx;
-      n.contextTokensFormatted = formatCompactNumber(baseCtx);
-      n.costUsd = baseCost;
-      n.costFormatted = `${currencySymbol}${Number(baseCost || 0).toFixed(2)}`;
-      n.contextUsedPct = Number(((baseCtx / 512_000) * 100).toFixed(1));
+      if (n.steps === null) {
+        n.durationSec = n.durationSec ?? null;
+        n.durationFormatted = 'unavailable';
+      } else {
+        const baseSec =
+          typeof n.durationSec === 'number' && n.durationSec >= 0
+            ? n.durationSec
+            : parseDurationStrToSec(n.durationFormatted);
+        n.durationSec = baseSec;
+        n.steps = Number(n.steps || 0);
+        n.durationFormatted = `${formatDurationSec(baseSec)} · ${n.steps} steps`;
+      }
+
+      if (n.totalTokens === null || (n.totalTokens === undefined && !demoMode)) {
+        n.totalTokens = null;
+        n.totalTokensFormatted = 'unavailable';
+      } else {
+        n.totalTokens = Number(n.totalTokens || 0);
+        n.totalTokensFormatted = formatCompactNumber(n.totalTokens);
+      }
+
+      if (
+        n.contextTokens === null ||
+        (n.contextTokens === undefined && !demoMode && n.contextTokensFormatted === 'unavailable')
+      ) {
+        n.contextTokens = null;
+        n.contextTokensFormatted = 'unavailable';
+        n.contextUsedPct = null;
+      } else {
+        const baseCtx =
+          n.contextTokens !== undefined
+            ? n.contextTokens
+            : parseTokenStr(n.contextTokensFormatted) || (hasObservedActivity ? 95_000 : 0);
+        n.contextTokens = baseCtx;
+        n.contextTokensFormatted = formatCompactNumber(baseCtx);
+        n.contextUsedPct = Number(((baseCtx / 512_000) * 100).toFixed(1));
+      }
+
+      if (
+        n.costUsd === null ||
+        (n.costUsd === undefined && !demoMode && n.costFormatted === 'unavailable')
+      ) {
+        n.costUsd = null;
+        n.costFormatted = 'unavailable';
+      } else {
+        const baseCost =
+          n.costUsd !== undefined
+            ? n.costUsd
+            : parseFloat(String(n.costFormatted || '0').replace(/[^0-9.]/g, '')) || 0;
+        n.costUsd = baseCost;
+        n.costFormatted = `${currencySymbol}${Number(baseCost || 0).toFixed(2)}`;
+      }
       return n;
     });
 
@@ -2483,11 +2732,13 @@ export function buildContextAndTokenAnalytics(arg1, arg2 = null, arg3 = [], arg4
   const hasRealTranscriptOrEvents = activity.hasRealTranscriptOrEvents;
   const hasObservedOrDemo = hasRealTranscriptOrEvents || demoMode;
   const hasTokenCounts = activity.hasObservedTokenTelemetry || demoMode;
-  const telemetryQuality = activity.hasObservedTokenTelemetry
+  const telemetryQuality = activity.hasExplicitObservedTokens
     ? 'observed'
-    : demoMode
-      ? 'simulated'
-      : 'unavailable';
+    : activity.hasTranscriptChars
+      ? 'estimated'
+      : demoMode
+        ? 'simulated'
+        : 'unavailable';
   const eventsQuality = hasRealTranscriptOrEvents
     ? 'observed'
     : demoMode
@@ -2521,12 +2772,16 @@ export function buildContextAndTokenAnalytics(arg1, arg2 = null, arg3 = [], arg4
   const ragInjected = hasTokenCounts
     ? Math.max(ragDocuments.length, activeBrain?.ragInjections || 0)
     : activeBrain?.ragInjections || 0;
-  const compacted = steps > 45 ? 1 : 0;
+  const compacted = demoMode
+    ? steps > 45
+      ? 1
+      : 0
+    : Number(activity.tel?.compactedCount || activeBrain?.compactedCount || 0);
   const pruned = 0;
   const contextEventsTotal = ragInjected + compacted + pruned;
-  const skillsLoaded = hasTokenCounts
+  const skillsLoaded = demoMode
     ? Math.max(1, activeBrain?.skillInjections || 2)
-    : activeBrain?.skillInjections || 0;
+    : Number(activeBrain?.skillInjections || 0);
 
   // Token counts: ONLY reported when actual token telemetry or transcript character counts exist, or when demoMode is true!
   const sysTokens = demoMode ? 4_200 : 0;
@@ -2569,8 +2824,14 @@ export function buildContextAndTokenAnalytics(arg1, arg2 = null, arg3 = [], arg4
     assistantTokens +
     toolResultTokens +
     outputThinkingTokens;
+  const observedSessionTokens =
+    activity.explicitObservedTokens ?? (demoMode ? computedSumTokens : null);
+  const estimatedSessionTokens =
+    activity.explicitObservedTokens === null && activity.hasTranscriptChars
+      ? computedSumTokens
+      : null;
   const totalSessionTokens = hasTokenCounts
-    ? (activity.explicitObservedTokens ?? computedSumTokens)
+    ? (observedSessionTokens ?? estimatedSessionTokens)
     : null;
 
   const pct = (val) =>
@@ -2916,7 +3177,8 @@ export function buildContextAndTokenAnalytics(arg1, arg2 = null, arg3 = [], arg4
     eventsQuality,
     observedSteps: steps,
     observedSubagentCount: subCount,
-    observedTokens: totalSessionTokens,
+    observedTokens: observedSessionTokens,
+    estimatedTokens: estimatedSessionTokens,
     usedTokens: usedWindowTokens,
     totalSteps: steps,
     totalTokens: totalSessionTokens,
@@ -2959,7 +3221,8 @@ export function buildContextAndTokenAnalytics(arg1, arg2 = null, arg3 = [], arg4
     },
     tokenStats: {
       quality: telemetryQuality,
-      observedTokens: totalSessionTokens,
+      observedTokens: observedSessionTokens,
+      estimatedTokens: estimatedSessionTokens,
       totalTokens: totalSessionTokens,
       totalFormatted:
         totalSessionTokens !== null ? formatCompactNumber(totalSessionTokens) : 'unavailable',
@@ -2976,7 +3239,9 @@ export function buildContextAndTokenAnalytics(arg1, arg2 = null, arg3 = [], arg4
     currentWindow: {
       quality: telemetryQuality,
       modelName: 'Gemini 4 Argon (High) · Gravity Well Harness',
-      observedTokens: usedWindowTokens,
+      observedTokens: activity.tel?.usedTokens ?? (demoMode ? usedWindowTokens : null),
+      estimatedTokens:
+        activity.tel?.usedTokens === undefined && !demoMode ? usedWindowTokens : null,
       totalTokens: usedWindowTokens,
       usedTokens: usedWindowTokens,
       usedFormatted:
@@ -3681,6 +3946,8 @@ export function createHarnessMonitorApp(options = {}) {
         receiptId: payload.receipt_id ?? payload.receiptId,
         evaluationReceipt: payload.evaluation_receipt ?? payload.evaluationReceipt,
         synthetic: payload.synthetic,
+        requestId: payload.request_id ?? payload.requestId,
+        attemptId: payload.attempt_id ?? payload.attemptId,
       });
       return { ok: res?.ok !== false, ...res };
     },
@@ -3693,41 +3960,111 @@ export function createHarnessMonitorApp(options = {}) {
     const action = String(payload.action || 'recall').toLowerCase();
     const nodeId = String(payload.nodeId || '').trim();
     const activity = inspectTelemetryActivity(wsCtx.workspaceRoot);
+    const isDemo = Boolean(
+      payload.demoMode === true || payload.allowTemplatePreview === true || reqData?.appDemoMode
+    );
+    const requestedIds =
+      Array.isArray(payload.nodeIds) && payload.nodeIds.length > 0
+        ? payload.nodeIds.map((x) => String(x || '').trim()).filter(Boolean)
+        : nodeId
+          ? [nodeId]
+          : [];
 
-    if (action === 'recall') {
-      const isRecordedWorker = activity.telSubs.some((s) => s.id === nodeId);
-      const isKnownTemplateWorker = KNOWN_TEMPLATE_NODE_IDS.has(nodeId);
-      if (!nodeId || (!isRecordedWorker && !isKnownTemplateWorker)) {
+    if (action !== 'reset') {
+      if (requestedIds.length === 0) {
         return {
-          status: 404,
+          status: 400,
           contentType: 'application/json; charset=utf-8',
           body: JSON.stringify({
             ok: false,
-            status: 'not_found',
-            error: 'UNKNOWN_OR_UNREGISTERED_WORKER',
-            nodeId: nodeId || null,
+            status: 'bad_request',
+            error: 'MISSING_TARGET_WORKER_ID',
+            nodeId: null,
             nodeState: null,
           }),
         };
       }
 
-      if (
-        !isRecordedWorker &&
-        payload.demoMode !== true &&
-        payload.allowTemplatePreview !== true &&
-        !reqData?.appDemoMode
-      ) {
+      const unknownIds = requestedIds.filter(
+        (id) => !activity.telSubs.some((s) => s.id === id) && !KNOWN_TEMPLATE_NODE_IDS.has(id)
+      );
+      if (unknownIds.length > 0) {
         return {
-          status: 409,
+          status: Array.isArray(payload.nodeIds) ? 400 : 404,
           contentType: 'application/json; charset=utf-8',
           body: JSON.stringify({
             ok: false,
-            status: 'unavailable',
-            error: 'NO_REGISTERED_EXECUTOR_FOR_WORKER',
-            nodeId,
+            status: 'not_found',
+            error: 'UNKNOWN_OR_UNREGISTERED_WORKER',
+            unknownTargets: unknownIds,
+            nodeId: nodeId || unknownIds[0] || null,
             nodeState: null,
           }),
         };
+      }
+
+      if (!isDemo) {
+        const templateOnlyIds = requestedIds.filter(
+          (id) => !activity.telSubs.some((s) => s.id === id)
+        );
+        if (templateOnlyIds.length > 0) {
+          return {
+            status: 409,
+            contentType: 'application/json; charset=utf-8',
+            body: JSON.stringify({
+              ok: false,
+              status: 'unavailable',
+              error: 'NO_REGISTERED_EXECUTOR_FOR_WORKER',
+              nodeId: nodeId || templateOnlyIds[0] || null,
+              nodeState: null,
+            }),
+          };
+        }
+
+        if (action === 'complete' || action === 'complete_all') {
+          const receiptId =
+            payload.receiptId ||
+            payload.receipt_id ||
+            payload.evaluationReceipt ||
+            payload.evaluation_receipt ||
+            null;
+          const engine = new HarnessKnowledgeEngine(wsCtx.workspaceRoot);
+          const verified = receiptId ? engine.verifyEvaluationReceipt(receiptId) : { ok: false };
+          if (!verified.ok) {
+            return {
+              status: 409,
+              contentType: 'application/json; charset=utf-8',
+              body: JSON.stringify({
+                ok: false,
+                status: 'unverified',
+                error: 'COMPLETION_REQUIRES_VERIFIED_RECEIPT',
+                reason: verified.reason || 'MISSING_RECEIPT',
+                nodeId: nodeId || requestedIds[0] || null,
+                nodeState: null,
+              }),
+            };
+          }
+        } else if (['recall', 'recall_all', 'cancel', 'kill'].includes(action)) {
+          const hasExecutorAck = Boolean(
+            payload.executorAck === true ||
+              payload.executor_ack === true ||
+              payload.executorSessionId ||
+              payload.executor_session_id
+          );
+          if (!hasExecutorAck) {
+            return {
+              status: 409,
+              contentType: 'application/json; charset=utf-8',
+              body: JSON.stringify({
+                ok: false,
+                status: 'unavailable',
+                error: 'NO_REGISTERED_EXECUTOR_FOR_WORKER',
+                nodeId: nodeId || requestedIds[0] || null,
+                nodeState: null,
+              }),
+            };
+          }
+        }
       }
     }
 
@@ -3737,6 +4074,19 @@ export function createHarnessMonitorApp(options = {}) {
       nodeIds: payload.nodeIds || [],
       action,
       durationSec: Number(payload.durationSec || 180),
+      demoMode: isDemo,
+      executorAck: Boolean(
+        payload.executorAck === true ||
+          payload.executor_ack === true ||
+          payload.executorSessionId ||
+          payload.executor_session_id
+      ),
+      receiptId:
+        payload.receiptId ||
+        payload.receipt_id ||
+        payload.evaluationReceipt ||
+        payload.evaluation_receipt ||
+        null,
     });
     const entry = nodeId
       ? updated.nodes?.[`${payload.formationId || 'live-harness2'}:${nodeId}`] || null
@@ -3785,6 +4135,12 @@ export function createHarnessMonitorApp(options = {}) {
       strictExecution: strictExec,
       demoMode: isDemo,
       passThreshold: payload.passThreshold ?? payload.pass_threshold,
+      executorId: payload.executorId ?? payload.executor_id,
+      verifierId: payload.verifierId ?? payload.verifier_id,
+      command: payload.command,
+      verifierCommand: payload.verifierCommand ?? payload.verifier_command,
+      baselineTokens: payload.baselineTokens ?? payload.baseline_tokens,
+      requestId: payload.requestId ?? payload.request_id,
     });
     return { ok: report?.ok !== false, ...report };
   };

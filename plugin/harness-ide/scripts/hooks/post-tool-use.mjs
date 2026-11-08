@@ -162,7 +162,12 @@ export function processPostToolUse(input = {}) {
     input.cwd ||
     process.cwd();
 
-  const convId = input.conversationId || 'default-session';
+  const convId =
+    input.conversationId ||
+    input.conversation_id ||
+    input.sessionId ||
+    input.session_id ||
+    'default-session';
   recordActiveWorkspace(workspaceRoot, convId, 'PostToolUse');
 
   const harnessDir = path.join(workspaceRoot, '.harness');
@@ -172,8 +177,10 @@ export function processPostToolUse(input = {}) {
 
   const engine = new HarnessKnowledgeEngine(workspaceRoot);
   const config = engine.loadConfig();
-  const toolName = input.toolCall?.name || 'unknown_tool';
-  const toolArgs = input.toolCall?.args || {};
+  const toolName =
+    input.toolCall?.name || input.tool_name || input.toolName || 'unknown_tool';
+  const toolArgs = input.toolCall?.args || input.tool_args || input.toolArgs || {};
+  const rawStepVal = input.stepIdx ?? input.step_index ?? input.stepIndex;
   const nowIso = new Date().toISOString();
   const hasToolError = Boolean(
     input.error ||
@@ -213,19 +220,38 @@ export function processPostToolUse(input = {}) {
       }
       const sess = telemetry.sessions[convId];
       sess.lastUpdatedAt = nowIso;
-      sess.toolCallCount = (sess.toolCallCount || 0) + 1;
+      const explicitStep =
+        rawStepVal !== undefined && rawStepVal !== null ? Number(rawStepVal) : null;
+      const existingEventsList = Array.isArray(telemetry.recentEvents)
+        ? telemetry.recentEvents
+        : Array.isArray(telemetry.events)
+          ? telemetry.events
+          : [];
+      const isReplayedEvent =
+        explicitStep !== null &&
+        existingEventsList.some(
+          (ev) =>
+            ev &&
+            ev.conversationId === convId &&
+            Number(ev.stepIdx) === explicitStep &&
+            ev.toolName === toolName
+        );
+      if (!isReplayedEvent) {
+        sess.toolCallCount = (sess.toolCallCount || 0) + 1;
+      }
       if (input.transcriptPath) {
         sess.transcriptPath = input.transcriptPath;
       }
 
       sess.subagents = Array.isArray(sess.subagents) ? sess.subagents : [];
-      const currentStepIdx = Number(input.stepIdx ?? sess.toolCallCount ?? 0);
+      const currentStepIdx = Number(rawStepVal ?? sess.toolCallCount ?? 0);
 
       // Track subagent invocations (supporting official batched args.Subagents array),
       // recalls (send_message), and explicit terminations (manage_subagents).
       // NOTE (F11 / F08 / WP6):
       // - Never auto-complete RUNNING subagents based on step count or elapsed time
-      // - Never merge/deduplicate subagents that share the same Role
+      // - Never merge/deduplicate subagents that share the same Role across different batch indices or steps
+      // - Deduplicate replayed hook events with the same deterministic eventKey
       // - Never transition or add RUNNING subagents when hasToolError is true
       // - Mark killed subagents as CANCELLED (not COMPLETED)
       if (toolName === 'invoke_subagent') {
@@ -240,6 +266,20 @@ export function processPostToolUse(input = {}) {
               (batch.length === 1
                 ? input.toolCall?.result?.conversationId || input.result?.conversationId || null
                 : null);
+            const eventKey =
+              explicitStep !== null
+                ? `${convId}:step-${explicitStep}:batch-${idx}:${resolvedConvId || spec.id || roleName}:${typeName}`
+                : resolvedConvId || spec.id
+                  ? `${convId}:id-${resolvedConvId || spec.id}:batch-${idx}`
+                  : null;
+            const existingReplay =
+              eventKey !== null
+                ? sess.subagents.find((s) => s && s.eventKey === eventKey)
+                : null;
+            if (existingReplay) {
+              existingReplay.lastActiveAt = nowIso;
+              continue;
+            }
             const baseId =
               spec.id ||
               resolvedConvId ||
@@ -250,6 +290,7 @@ export function processPostToolUse(input = {}) {
 
             sess.subagents.push({
               id: uniqueId,
+              eventKey,
               conversationId: resolvedConvId,
               role: roleName,
               typeName,
@@ -335,27 +376,30 @@ export function processPostToolUse(input = {}) {
         Array.isArray(s?.subagents) ? s.subagents : []
       );
       telemetry.recentEvents = telemetry.recentEvents || [];
-      const firstSubRole =
-        Array.isArray(toolArgs.Subagents) && toolArgs.Subagents[0]
-          ? toolArgs.Subagents.map((s) => s.Role || s.TypeName || 'Subagent').join(', ')
-          : toolArgs.Role;
-      const errDetail =
-        input.error || input.toolError || input.toolCall?.error || input.result?.error || null;
-      telemetry.recentEvents.unshift({
-        timestamp: nowIso,
-        conversationId: convId,
-        stepIdx: input.stepIdx ?? 0,
-        toolName,
-        summary:
-          toolArgs.toolSummary ||
-          firstSubRole ||
-          toolArgs.Path ||
-          toolArgs.query ||
-          toolArgs.CommandLine?.slice(0, 80) ||
+      if (!isReplayedEvent) {
+        const firstSubRole =
+          Array.isArray(toolArgs.Subagents) && toolArgs.Subagents[0]
+            ? toolArgs.Subagents.map((s) => s.Role || s.TypeName || 'Subagent').join(', ')
+            : toolArgs.Role;
+        const errDetail =
+          input.error || input.toolError || input.toolCall?.error || input.result?.error || null;
+        telemetry.recentEvents.unshift({
+          timestamp: nowIso,
+          conversationId: convId,
+          stepIdx: currentStepIdx,
           toolName,
-        error: errDetail
-      });
-      telemetry.recentEvents = telemetry.recentEvents.slice(0, 60);
+          summary:
+            toolArgs.toolSummary ||
+            firstSubRole ||
+            toolArgs.Path ||
+            toolArgs.query ||
+            toolArgs.CommandLine?.slice(0, 80) ||
+            toolName,
+          error: errDetail
+        });
+        telemetry.recentEvents = telemetry.recentEvents.slice(0, 60);
+      }
+      telemetry.events = telemetry.recentEvents;
 
       writeJsonAtomic(telemetryFile, telemetry);
 

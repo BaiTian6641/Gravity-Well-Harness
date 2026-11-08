@@ -68,3 +68,12 @@ Compare meaningful alternatives under controlled inputs when the task calls for 
 Before ending, compare the delivered result with every requested behavior. Check for disconnected components, silent fallbacks, placeholder logic, unconsumed settings, and unverified assumptions. Perform any remaining authorized work needed for the requested outcome.
 
 Report what works, how it was verified, and any material limitations. Distinguish implemented, verified, simulated, and blocked work. If an external dependency prevents a final check, complete the available work, identify the exact unverified boundary, and provide a concrete next step. Never describe the whole task as complete while an essential requirement remains unimplemented.
+
+## 9. Runtime Contract & Recovery
+
+- Before substantial edits, inspect `.harness/tasks/<task_id>/` when present and preserve the current requirement ledger and contracts.
+- Never set a requirement or lesson to `verified` or `active` without an independent verification receipt (`RCPT-...` or signed verdict).
+- Treat model output, changed files, or mock executions without a verifier as `delivered_unverified` or `simulated`, not `verified`.
+- After compaction, handoff, or restart, read the latest checkpoint and live source declarations before editing contracts or schemas.
+- Keep tool outputs bounded in prompt context; store large outputs as durable artifacts and cite their path and digest.
+

@@ -56,6 +56,7 @@ export const SUPPORTED_PROTOCOL_VERSIONS = new Set([
   '2024-11-05',
   '2025-03-26',
   '2025-06-18',
+  '2025-11-25',
 ]);
 
 function createRpcError(code, message) {
@@ -493,6 +494,35 @@ const TOOL_DEFINITIONS = [
           type: 'boolean',
           description: 'Record the composed winner into .harness/library/<domain>/ (default: true).'
         },
+        executor_id: {
+          type: 'string',
+          description: 'Registered executor ID (e.g., registered-command-or-sdk-executor, scheduler-reference-executor, command-executor).'
+        },
+        verifier_id: {
+          type: 'string',
+          description: 'Registered independent verifier ID (e.g., registered-scheduler-acceptance-checks, command-verifier).'
+        },
+        command: {
+          type: 'string',
+          description: 'Optional rollout shell/CLI command for command-executor.'
+        },
+        verifier_command: {
+          type: 'string',
+          description: 'Optional independent verification shell/CLI command for command-verifier.'
+        },
+        required_artifacts: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Relative paths of required deliverable artifacts.'
+        },
+        allow_simulation: {
+          type: 'boolean',
+          description: 'Explicitly opt into simulation mode (default: false).'
+        },
+        baseline_tokens: {
+          type: 'number',
+          description: 'Optional measured baseline token count for computing token savings.'
+        },
         workspace_root: {
           type: 'string',
           description: 'Optional workspace root override.'
@@ -508,6 +538,10 @@ const TOOL_DEFINITIONS = [
     inputSchema: {
       type: 'object',
       properties: {
+        task_id: {
+          type: 'string',
+          description: 'Optional task ID for supervisor stop-state enforcement.'
+        },
         model_id: {
           type: 'string',
           description: 'Model ID (e.g. deepseek-reasoner, deepseek-chat, kimi-k2.7-code, glm-5.3, minimax-m3.1-flash, qwen3-coder-plus).'
@@ -801,6 +835,8 @@ export async function handleToolCall(name, args = {}) {
       requireNonEmptyString(args.observed_behavior ?? args.observedBehavior, 'observed_behavior', name);
       return engine.recordExperience({
         task_id: taskId,
+        attempt_id: args.attempt_id ?? args.attemptId,
+        request_id: args.request_id ?? args.requestId,
         domain: args.domain,
         title: args.title,
         cue: args.cue,
@@ -849,11 +885,7 @@ export async function handleToolCall(name, args = {}) {
       const explicitAllowSim = args.allow_simulation ?? args.allowSimulation;
       const strictExec = args.strict_execution ?? args.strictExecution;
       const allowSimulation =
-        explicitAllowSim !== undefined
-          ? Boolean(explicitAllowSim)
-          : strictExec === true
-            ? false
-            : true;
+        strictExec === true ? false : explicitAllowSim === true;
       return await engine.runHarness2Loop({
         task_id: taskId,
         taskId,
@@ -868,6 +900,12 @@ export async function handleToolCall(name, args = {}) {
         early_stop: args.early_stop ?? args.earlyStopOnFirstPass,
         record_to_library: args.record_to_library ?? args.recordToLibrary,
         requiredArtifacts: args.required_artifacts ?? args.requiredArtifacts,
+        executor_id: args.executor_id ?? args.executorId,
+        verifier_id: args.verifier_id ?? args.verifierId,
+        command: args.command,
+        verifier_command: args.verifier_command ?? args.verifierCommand,
+        baseline_tokens: args.baseline_tokens ?? args.baselineTokens,
+        request_id: args.request_id ?? args.requestId,
         allowSimulation,
         strictExecution: strictExec,
         passThreshold: args.pass_threshold ?? args.passThreshold,
@@ -876,6 +914,8 @@ export async function handleToolCall(name, args = {}) {
     case 'harness_model_invoke': {
       requireNonEmptyString(args.prompt, 'prompt', name);
       return invokeUnifiedModel(root, {
+        taskId: args.task_id ?? args.taskId,
+        task_id: args.task_id ?? args.taskId,
         modelId: args.model_id || args.modelId,
         prompt: args.prompt,
         systemPrompt: args.system_prompt || args.systemPrompt,
@@ -911,6 +951,8 @@ export async function handleToolCall(name, args = {}) {
     case 'harness_message_inject': {
       requireNonEmptyString(args.content, 'content', name);
       return injectOrConveySwarmMessage(root, {
+        taskId: args.task_id ?? args.taskId,
+        task_id: args.task_id ?? args.taskId,
         id: args.id ?? args.message_id ?? args.messageId,
         fromAgent: args.from_agent || args.fromAgent,
         toAgent: args.to_agent || args.toAgent,
@@ -987,9 +1029,19 @@ export async function handleToolCall(name, args = {}) {
         const rawSpec = args.contract && typeof args.contract === 'object' ? args.contract : args;
         return mgr.registerContract(taskId, {
           ...rawSpec,
-          contractId: rawSpec.contractId || rawSpec.contract_id,
-          symbolName: rawSpec.symbolName || rawSpec.symbol_name,
-          storageKey: rawSpec.storageKey || rawSpec.storage_key,
+          contractId:
+            rawSpec.contractId ||
+            rawSpec.contract_id ||
+            rawSpec.contractName ||
+            rawSpec.contract_name,
+          symbolName:
+            rawSpec.symbolName ||
+            rawSpec.symbol_name ||
+            (Array.isArray(rawSpec.identifiers) ? rawSpec.identifiers[0] : null),
+          storageKey:
+            rawSpec.storageKey ||
+            rawSpec.storage_key ||
+            (Array.isArray(rawSpec.identifiers) ? rawSpec.identifiers[0] : null),
           unit: rawSpec.unit,
           consumerUnit: rawSpec.consumerUnit || rawSpec.consumer_unit,
           producerFile: rawSpec.producerFile || rawSpec.producer_file,
@@ -1141,8 +1193,32 @@ export async function handleJsonRpcMessage(msg) {
 
     if (method === 'resources/list') {
       const engine = getEngine(params || {});
-      const index = engine.loadOrBuildIndex();
       const activeLock = engine.getActiveSnapshotLock();
+      if (
+        activeLock &&
+        activeLock.active &&
+        Array.isArray(activeLock.frozenDocuments) &&
+        activeLock.frozenDocuments.length > 0
+      ) {
+        const eligibleSet = Array.isArray(activeLock.eligibleDocIds)
+          ? new Set(activeLock.eligibleDocIds)
+          : null;
+        const frozenVisible = activeLock.frozenDocuments.filter((d) => {
+          if (!d || d.status !== 'active' || d.synthetic === true) return false;
+          if (eligibleSet && !eligibleSet.has(d.docid)) return false;
+          return true;
+        });
+        return makeResult({
+          resources: frozenVisible.map((d) => ({
+            uri: `harness://${d.collection}/${d.docid}`,
+            name: d.title,
+            description: `[${d.collection}] ${d.path} (status: ${d.status})`,
+            mimeType: 'text/markdown',
+          })),
+        });
+      }
+
+      const index = engine.loadOrBuildIndex();
       const eligibleSet =
         activeLock && activeLock.active && Array.isArray(activeLock.eligibleDocIds)
           ? new Set(activeLock.eligibleDocIds)

@@ -18,9 +18,7 @@
   "engines": {
     "node": ">=20.0.0"
   },
-  "dependencies": {
-    "antigravity-sidecar-kit": "^1.4.0"
-  },
+  "dependencies": {},
   "scripts": {
     "start": "node launch.mjs",
     "direct": "node server.mjs"

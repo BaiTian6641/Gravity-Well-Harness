@@ -1825,28 +1825,35 @@ export function isStrictExecution(options = {}, cfg = null) {
 
 export function isTaskEscalatedStopped(workspaceRoot, taskId) {
   if (!taskId || typeof taskId !== 'string') return false;
-  const safeId = taskId.trim();
+  const safeId = taskId
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]/g, '-')
+    .slice(0, 80);
   if (!safeId || safeId.includes('..') || safeId.includes('/') || safeId.includes('\\')) {
     return false;
   }
-  try {
-    const stateFile = path.join(
-      path.resolve(workspaceRoot || process.cwd()),
-      '.harness',
-      'tasks',
-      safeId,
-      'state.json'
-    );
-    if (!fs.existsSync(stateFile)) return false;
-    const stateData = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-    return Boolean(
-      stateData &&
+  const taskDir = path.join(
+    path.resolve(workspaceRoot || process.cwd()),
+    '.harness',
+    'tasks',
+    safeId
+  );
+  for (const fileName of ['state.json', 'progress-guard.json']) {
+    try {
+      const fpath = path.join(taskDir, fileName);
+      if (!fs.existsSync(fpath)) continue;
+      const stateData = JSON.parse(fs.readFileSync(fpath, 'utf8'));
+      if (
+        stateData &&
         (stateData.shouldStopRetryLoop === true ||
-          stateData.status === 'escalated_focused_restart')
-    );
-  } catch {
-    return false;
+          stateData.status === 'escalated_focused_restart' ||
+          stateData.status === 'escalated_stop')
+      ) {
+        return true;
+      }
+    } catch {}
   }
+  return false;
 }
 
 export const resolveStrictMode = isStrictExecution;

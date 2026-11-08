@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { HarnessKnowledgeEngine } from './rag-engine.mjs';
 
 /**
  * Gravity Well Harness — Argon Context Resilience & Durable Task State Manager
@@ -414,10 +415,121 @@ export class ContextResilienceManager {
     );
   }
 
-  loadRequirementLedger(taskId) {
+  createAuthenticatedVerdict(options = {}) {
+    const engine = new HarnessKnowledgeEngine(this.workspaceRoot);
+    return engine.createSignedVerdict(options);
+  }
+
+  writeAuthenticatedVerdict(targetPath, options = {}) {
+    const absPath = resolveContainedRealPath(this.workspaceRoot, path.resolve(this.workspaceRoot, String(targetPath)));
+    const signed = this.createAuthenticatedVerdict(options);
+    writeJsonAtomic(absPath, signed);
+    return signed;
+  }
+
+  _revalidateVerifiedRequirements(taskId, ledger, driftedFiles = new Set(), driftedSymbols = new Set(), issues = []) {
+    if (!ledger || !Array.isArray(ledger.requirements)) {
+      return { mutated: false, invalidatedRequirements: [] };
+    }
+    let mutated = false;
+    const invalidatedRequirements = [];
+
+    for (const req of ledger.requirements) {
+      if (!req || req.state !== 'verified') continue;
+      const reasons = [];
+      const cRefs = (req.consumerRefs || []).map((r) => this._parseConsumerRef(r));
+
+      for (const r of cRefs) {
+        if (!r.file) continue;
+        if (driftedFiles.has(r.file) || (r.symbol && driftedSymbols.has(r.symbol))) {
+          reasons.push(`contract_drift:${r.file}${r.symbol ? `#${r.symbol}` : ''}`);
+          continue;
+        }
+        const currentDigest = this.getFileDigest(r.file);
+        if (!currentDigest) {
+          reasons.push(`missing_consumer_file:${r.file}`);
+          continue;
+        }
+        if (
+          req.verifiedConsumerDigests &&
+          req.verifiedConsumerDigests[r.file] &&
+          currentDigest !== req.verifiedConsumerDigests[r.file]
+        ) {
+          reasons.push(`consumer_file_modified:${r.file}`);
+          continue;
+        }
+        if (r.symbol) {
+          try {
+            const full = this._resolveWorkspaceFile(r.file);
+            const rawContent = fs.readFileSync(full, 'utf8');
+            const codeOnly = stripCommentsAndStringLiterals(rawContent);
+            if (!codeOnly.includes(r.symbol)) {
+              reasons.push(`missing_consumer_symbol:${r.file}#${r.symbol}`);
+            }
+          } catch {
+            reasons.push(`unreadable_consumer_file:${r.file}`);
+          }
+        }
+      }
+
+      for (const evRef of req.evidenceRefs || []) {
+        const refKey =
+          typeof evRef === 'string'
+            ? evRef.trim()
+            : String(evRef?.file || evRef?.receiptId || '').trim();
+        const evCheck = this._inspectEvidenceRef(evRef);
+        if (!evCheck.exists || !evCheck.validVerdict) {
+          reasons.push(`invalid_or_missing_evidence:${refKey}`);
+          continue;
+        }
+        if (
+          req.verifiedEvidenceDigests &&
+          req.verifiedEvidenceDigests[refKey] &&
+          evCheck.digest &&
+          evCheck.digest !== req.verifiedEvidenceDigests[refKey]
+        ) {
+          reasons.push(`evidence_modified:${refKey}`);
+        }
+      }
+
+      if (
+        reasons.length === 0 &&
+        issues.some((i) => i.code.startsWith('CTX-02_') || i.code.startsWith('CTX-05_')) &&
+        cRefs.some(
+          (r) =>
+            driftedFiles.has(r.file) || (r.symbol && driftedSymbols.has(r.symbol))
+        )
+      ) {
+        reasons.push(issues.map((i) => `${i.code}:${i.contractId}`).join(', '));
+      }
+
+      if (reasons.length > 0) {
+        req.state = 'implemented_unverified';
+        req.invalidatedByContractDrift = true;
+        req.invalidatedReason = reasons.join(', ');
+        req.demotionReason = reasons.join(', ');
+        invalidatedRequirements.push(req.id);
+        mutated = true;
+      }
+    }
+
+    return { mutated, invalidatedRequirements };
+  }
+
+  loadRequirementLedger(taskId, { skipRevalidate = false } = {}) {
     const file = this.getLedgerPath(taskId);
     const existing = readJsonSafe(file, null);
-    if (existing) return existing;
+    if (existing) {
+      if (!skipRevalidate) {
+        const reval = this._revalidateVerifiedRequirements(taskId, existing);
+        if (reval.mutated) {
+          existing.revision = (existing.revision || 0) + 1;
+          existing.updatedAt = new Date().toISOString();
+          writeJsonAtomic(file, existing);
+        }
+      }
+      return existing;
+    }
     return {
       schemaVersion: 1,
       taskId,
@@ -455,69 +567,87 @@ export class ContextResilienceManager {
         ? evRef.trim()
         : String(evRef?.file || evRef?.receiptId || '').trim();
     if (!refStr) {
-      return { exists: false, validVerdict: false, reason: 'Empty evidence reference' };
+      return { exists: false, validVerdict: false, digest: null, reason: 'Empty evidence reference' };
     }
-    if (/^RCPT-[A-Z0-9-]+$/i.test(refStr)) {
+    const engine = new HarnessKnowledgeEngine(this.workspaceRoot);
+
+    if (/^RCPT-[A-Z0-9_-]+$/i.test(refStr)) {
       const receiptPath = this._resolveWorkspaceFile(
         path.join('.harness', 'receipts', `${refStr}.json`)
       );
       if (!fs.existsSync(receiptPath) || !fs.statSync(receiptPath).isFile()) {
-        return { exists: false, validVerdict: false, reason: 'Receipt file does not exist on disk' };
+        return {
+          exists: false,
+          validVerdict: false,
+          digest: null,
+          reason: 'Receipt file does not exist on disk'
+        };
       }
-      const parsed = readJsonSafe(receiptPath, null);
-      const validReceipt = Boolean(
-        parsed &&
-          typeof parsed === 'object' &&
-          parsed.passed === true &&
-          parsed.synthetic !== true &&
-          typeof parsed.signature === 'string' &&
-          parsed.signature.length === 64
-      );
+      const rawText = fs.readFileSync(receiptPath, 'utf8');
+      const rcptCheck = engine.verifyEvaluationReceipt(refStr);
       return {
         exists: true,
-        validVerdict: validReceipt,
-        reason: validReceipt ? 'Valid evaluation receipt' : 'Receipt is not a passing non-synthetic signed receipt',
+        validVerdict: rcptCheck.valid === true,
+        digest: sha256Text(rawText),
+        reason: rcptCheck.valid
+          ? 'Valid cryptographic evaluation receipt'
+          : `Receipt failed cryptographic verification (${rcptCheck.error || 'INVALID_RECEIPT'})`,
       };
     }
+
     const cleanFile = refStr.split('#')[0].trim();
     const full = this._resolveWorkspaceFile(cleanFile);
     if (!fs.existsSync(full) || !fs.statSync(full).isFile() || fs.statSync(full).size === 0) {
-      return { exists: false, validVerdict: false, reason: 'Evidence file does not exist on disk' };
+      return {
+        exists: false,
+        validVerdict: false,
+        digest: null,
+        reason: 'Evidence file does not exist on disk'
+      };
     }
     if (!cleanFile.toLowerCase().endsWith('.json')) {
       return {
         exists: true,
         validVerdict: false,
-        reason: 'Evidence reference must be a passing evaluation receipt (RCPT-*) or JSON verification verdict (.json), not a source or prose file',
+        digest: null,
+        reason:
+          'Evidence reference must be a passing evaluation receipt (RCPT-*) or HMAC-authenticated JSON verification verdict (.json), not a source or prose file',
       };
     }
+    const rawText = fs.readFileSync(full, 'utf8');
+    const fileDigest = sha256Text(rawText);
     const parsed = readJsonSafe(full, null);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return { exists: true, validVerdict: false, reason: 'Evidence JSON is malformed or not an object' };
+      return {
+        exists: true,
+        validVerdict: false,
+        digest: fileDigest,
+        reason: 'Evidence JSON is malformed or not an object'
+      };
     }
-    const passedFlag =
-      parsed.passed === true ||
-      parsed.passed_verification === true ||
-      parsed.passedVerification === true ||
-      (parsed.ok === true &&
-        parsed.passed !== false &&
-        parsed.passed_verification !== false &&
-        parsed.passedVerification !== false);
-    const notSynthetic = parsed.synthetic !== true;
-    const notFailedStatus =
-      parsed.status !== 'failed' &&
-      parsed.status !== 'simulated' &&
-      parsed.status !== 'error';
-    const exitOk =
-      (parsed.exitCode === undefined || parsed.exitCode === 0) &&
-      (parsed.returncode === undefined || parsed.returncode === 0);
-    const validVerdict = Boolean(passedFlag && notSynthetic && notFailedStatus && exitOk);
+
+    // If the JSON file is a stored evaluation receipt, verify its receipt HMAC & artifacts
+    if (typeof parsed.receiptId === 'string' && /^RCPT-[A-Z0-9_-]+$/i.test(parsed.receiptId)) {
+      const rcptCheck = engine.verifyEvaluationReceipt(parsed.receiptId);
+      return {
+        exists: true,
+        validVerdict: rcptCheck.valid === true,
+        digest: fileDigest,
+        reason: rcptCheck.valid
+          ? 'Valid evaluation receipt file'
+          : `Receipt file failed cryptographic verification (${rcptCheck.error || 'INVALID_RECEIPT'})`
+      };
+    }
+
+    // Otherwise require an HMAC-authenticated verifier verdict (reject unsigned caller-authored JSON)
+    const vCheck = engine.verifySignedVerdict(parsed);
     return {
       exists: true,
-      validVerdict,
-      reason: validVerdict
-        ? 'Valid JSON verification verdict'
-        : 'Evidence JSON does not record a passing, non-synthetic verification verdict',
+      validVerdict: vCheck.valid === true,
+      digest: fileDigest,
+      reason: vCheck.valid
+        ? 'Valid HMAC-authenticated JSON verification verdict'
+        : `Evidence JSON is not an authenticated passing verification verdict (${vCheck.error || 'UNSIGNED_VERDICT_EVIDENCE'})`,
     };
   }
 
@@ -528,7 +658,7 @@ export class ContextResilienceManager {
 
   upsertRequirementLedger(taskId, { objective, userCorrection, requirements = [] } = {}) {
     return this._withTaskLock(taskId, () => {
-      const ledger = this.loadRequirementLedger(taskId);
+      const ledger = this.loadRequirementLedger(taskId, { skipRevalidate: true });
       if (objective !== undefined) ledger.objective = String(objective);
       if (userCorrection) {
         ledger.userCorrections = ledger.userCorrections || [];
@@ -585,9 +715,13 @@ export class ContextResilienceManager {
               `Requirement ${req.id} cannot transition to "verified" without observed evidenceRefs.`
             );
           }
+          const evidenceDigests = {};
           for (const evRef of merged.evidenceRefs) {
             const evCheck = this._inspectEvidenceRef(evRef);
-            const evLabel = typeof evRef === 'string' ? evRef : JSON.stringify(evRef);
+            const evLabel =
+              typeof evRef === 'string'
+                ? evRef.trim()
+                : String(evRef?.file || evRef?.receiptId || JSON.stringify(evRef)).trim();
             if (!evCheck.exists) {
               throw new Error(
                 `CTX-06 violation for ${req.id}: evidence reference "${evLabel}" does not exist on disk.`
@@ -597,6 +731,9 @@ export class ContextResilienceManager {
               throw new Error(
                 `CTX-06 violation for ${req.id}: evidence reference "${evLabel}" is not a valid passing verification verdict (${evCheck.reason}).`
               );
+            }
+            if (evCheck.digest) {
+              evidenceDigests[evLabel] = evCheck.digest;
             }
           }
           if (
@@ -632,7 +769,9 @@ export class ContextResilienceManager {
             consumerDigests[parsedRef.file] = sha256Text(rawContent);
           }
           merged.verifiedConsumerDigests = consumerDigests;
+          merged.verifiedEvidenceDigests = evidenceDigests;
           merged.invalidatedByContractDrift = false;
+          merged.invalidatedReason = null;
         }
 
         reqMap.set(req.id, merged);
@@ -731,9 +870,9 @@ export class ContextResilienceManager {
 
   /**
    * CTX-02 & CTX-05: Validates all registered contracts against current on-disk files.
-   * Marks any contract whose producer or consumer file digest changed as `stale_invalidated`,
-   * verifies exact storageKey / symbolName presence in non-comment code, AND automatically
-   * invalidates (`implemented_unverified`) any verified requirements affected by drift.
+   * Marks any contract whose producer or consumer file digest changed or is missing as `stale_invalidated`,
+   * verifies exact storageKey / symbolName presence in non-comment code, AND unconditionally
+   * revalidates (`implemented_unverified`) any verified requirements affected by consumer or evidence drift.
    */
   validateContracts(taskId) {
     return this._withTaskLock(taskId, () => {
@@ -746,71 +885,99 @@ export class ContextResilienceManager {
       for (const c of reg.contracts) {
         let contractValid = true;
         if (c.producerFile) {
-          const currentProducerDigest = this.getFileDigest(c.producerFile);
-          if (c.producerDigest && currentProducerDigest !== c.producerDigest) {
+          const fullProd = this._resolveWorkspaceFile(c.producerFile);
+          if (!fs.existsSync(fullProd) || !fs.statSync(fullProd).isFile()) {
             c.status = 'stale_invalidated';
             contractValid = false;
             mutated = true;
             driftedFiles.add(c.producerFile);
             driftedSymbols.add(c.symbolName);
             issues.push({
-              code: 'CTX-05_STALE_PRODUCER',
+              code: 'CTX-05_MISSING_PRODUCER_FILE',
               contractId: c.contractId,
               file: c.producerFile,
-              message: `Producer file "${c.producerFile}" changed since contract "${c.contractId}" was recorded; re-read declaration.`,
+              message: `Producer file "${c.producerFile}" for contract "${c.contractId}" does not exist on disk.`,
             });
-          }
-          const fullProd = this._resolveWorkspaceFile(c.producerFile);
-          if (fs.existsSync(fullProd) && c.storageKey) {
-            const text = stripCodeComments(fs.readFileSync(fullProd, 'utf8'));
-            if (!text.includes(c.storageKey)) {
-              c.status = 'key_drift_invalidated';
+          } else {
+            const currentProducerDigest = this.getFileDigest(c.producerFile);
+            if (c.producerDigest && currentProducerDigest !== c.producerDigest) {
+              c.status = 'stale_invalidated';
               contractValid = false;
               mutated = true;
               driftedFiles.add(c.producerFile);
               driftedSymbols.add(c.symbolName);
               issues.push({
-                code: 'CTX-02_KEY_DRIFT_PRODUCER',
+                code: 'CTX-05_STALE_PRODUCER',
                 contractId: c.contractId,
-                storageKey: c.storageKey,
                 file: c.producerFile,
-                message: `Exact storage key "${c.storageKey}" missing in producer "${c.producerFile}".`,
+                message: `Producer file "${c.producerFile}" changed since contract "${c.contractId}" was recorded; re-read declaration.`,
               });
+            }
+            if (c.storageKey) {
+              const text = stripCodeComments(fs.readFileSync(fullProd, 'utf8'));
+              if (!text.includes(c.storageKey)) {
+                c.status = 'key_drift_invalidated';
+                contractValid = false;
+                mutated = true;
+                driftedFiles.add(c.producerFile);
+                driftedSymbols.add(c.symbolName);
+                issues.push({
+                  code: 'CTX-02_KEY_DRIFT_PRODUCER',
+                  contractId: c.contractId,
+                  storageKey: c.storageKey,
+                  file: c.producerFile,
+                  message: `Exact storage key "${c.storageKey}" missing in producer "${c.producerFile}".`,
+                });
+              }
             }
           }
         }
 
         if (c.consumerFile) {
-          const currentConsumerDigest = this.getFileDigest(c.consumerFile);
-          if (c.consumerDigest && currentConsumerDigest !== c.consumerDigest) {
+          const fullCons = this._resolveWorkspaceFile(c.consumerFile);
+          if (!fs.existsSync(fullCons) || !fs.statSync(fullCons).isFile()) {
             c.status = 'stale_invalidated';
             contractValid = false;
             mutated = true;
             driftedFiles.add(c.consumerFile);
             driftedSymbols.add(c.symbolName);
             issues.push({
-              code: 'CTX-05_STALE_CONSUMER',
+              code: 'CTX-05_MISSING_CONSUMER_FILE',
               contractId: c.contractId,
               file: c.consumerFile,
-              message: `Consumer file "${c.consumerFile}" changed since contract "${c.contractId}" was recorded; re-read declaration.`,
+              message: `Consumer file "${c.consumerFile}" for contract "${c.contractId}" does not exist on disk.`,
             });
-          }
-          const fullCons = this._resolveWorkspaceFile(c.consumerFile);
-          if (fs.existsSync(fullCons) && c.storageKey) {
-            const text = stripCodeComments(fs.readFileSync(fullCons, 'utf8'));
-            if (!text.includes(c.storageKey)) {
-              c.status = 'key_drift_invalidated';
+          } else {
+            const currentConsumerDigest = this.getFileDigest(c.consumerFile);
+            if (c.consumerDigest && currentConsumerDigest !== c.consumerDigest) {
+              c.status = 'stale_invalidated';
               contractValid = false;
               mutated = true;
               driftedFiles.add(c.consumerFile);
               driftedSymbols.add(c.symbolName);
               issues.push({
-                code: 'CTX-02_KEY_DRIFT_CONSUMER',
+                code: 'CTX-05_STALE_CONSUMER',
                 contractId: c.contractId,
-                storageKey: c.storageKey,
                 file: c.consumerFile,
-                message: `Exact storage key "${c.storageKey}" missing in consumer "${c.consumerFile}".`,
+                message: `Consumer file "${c.consumerFile}" changed since contract "${c.contractId}" was recorded; re-read declaration.`,
               });
+            }
+            if (c.storageKey) {
+              const text = stripCodeComments(fs.readFileSync(fullCons, 'utf8'));
+              if (!text.includes(c.storageKey)) {
+                c.status = 'key_drift_invalidated';
+                contractValid = false;
+                mutated = true;
+                driftedFiles.add(c.consumerFile);
+                driftedSymbols.add(c.symbolName);
+                issues.push({
+                  code: 'CTX-02_KEY_DRIFT_CONSUMER',
+                  contractId: c.contractId,
+                  storageKey: c.storageKey,
+                  file: c.consumerFile,
+                  message: `Exact storage key "${c.storageKey}" missing in consumer "${c.consumerFile}".`,
+                });
+              }
             }
           }
         }
@@ -827,46 +994,56 @@ export class ContextResilienceManager {
         writeJsonAtomic(this.getContractsPath(taskId), reg);
       }
 
-      // If any contract drifted or failed validation, invalidate affected verified requirements in the ledger
-      const invalidatedRequirements = [];
-      if (issues.length > 0) {
-        const ledgerPath = this.getLedgerPath(taskId);
-        const ledger = readJsonSafe(ledgerPath, null);
-        if (ledger && Array.isArray(ledger.requirements)) {
-          let ledgerMutated = false;
-          for (const req of ledger.requirements) {
-            if (req.state !== 'verified') continue;
-            const cRefs = (req.consumerRefs || []).map((r) => this._parseConsumerRef(r));
-            const matchesDriftedFileOrSymbol =
-              cRefs.some(
-                (r) =>
-                  driftedFiles.has(r.file) ||
-                  (r.symbol && driftedSymbols.has(r.symbol)) ||
-                  (req.verifiedConsumerDigests?.[r.file] &&
-                    this.getFileDigest(r.file) !== req.verifiedConsumerDigests[r.file])
-              ) || issues.some((i) => i.code.startsWith('CTX-02_') || i.code.startsWith('CTX-05_'));
-
-            if (matchesDriftedFileOrSymbol) {
-              req.state = 'implemented_unverified';
-              req.invalidatedByContractDrift = true;
-              req.invalidatedReason = issues.map((i) => `${i.code}:${i.contractId}`).join(', ');
+      // Unconditionally revalidate all verified requirements in the ledger (even when reg.contracts is empty!)
+      let invalidatedRequirements = [];
+      const ledgerPath = this.getLedgerPath(taskId);
+      const ledger = readJsonSafe(ledgerPath, null);
+      if (ledger && Array.isArray(ledger.requirements)) {
+        const reval = this._revalidateVerifiedRequirements(
+          taskId,
+          ledger,
+          driftedFiles,
+          driftedSymbols,
+          issues
+        );
+        invalidatedRequirements = reval.invalidatedRequirements;
+        if (reval.mutated) {
+          ledger.revision = (ledger.revision || 0) + 1;
+          ledger.updatedAt = new Date().toISOString();
+          writeJsonAtomic(ledgerPath, ledger);
+        }
+        for (const req of ledger.requirements) {
+          if (req.invalidatedByContractDrift) {
+            if (!invalidatedRequirements.includes(req.id)) {
               invalidatedRequirements.push(req.id);
-              ledgerMutated = true;
             }
-          }
-          if (ledgerMutated) {
-            ledger.revision = (ledger.revision || 0) + 1;
-            ledger.updatedAt = new Date().toISOString();
-            writeJsonAtomic(ledgerPath, ledger);
+            if (
+              !issues.some(
+                (i) =>
+                  i.code === 'CTX-05_VERIFIED_REQUIREMENT_REGRESSED' && i.requirementId === req.id
+              )
+            ) {
+              issues.push({
+                code: 'CTX-05_VERIFIED_REQUIREMENT_REGRESSED',
+                type: 'CTX-05_VERIFIED_REQUIREMENT_REGRESSED',
+                requirementId: req.id,
+                message: req.invalidatedReason || 'Verified requirement invalidated by evidence or consumer drift.',
+              });
+            }
           }
         }
       }
 
+      for (const issue of issues) {
+        if (!issue.type) issue.type = issue.code;
+      }
+
       return {
-        ok: issues.length === 0,
+        ok: issues.length === 0 && invalidatedRequirements.length === 0,
         taskId,
         contractsCount: reg.contracts.length,
         issues,
+        mismatches: issues,
         invalidatedRequirements,
         contracts: reg.contracts,
       };
@@ -966,7 +1143,7 @@ export class ContextResilienceManager {
           workerId: w.workerId,
           parentId: w.parentId || 'main-orchestrator',
           taskId: w.taskId || taskId,
-          executorSessionId: w.executorSessionId || null,
+          executorSessionId: w.executorSessionId || w.executor_session_id || null,
           ownership: w.ownership || [],
           openChecks: Array.from(new Set([...(w.openChecks || []), ...openRequirements])),
         })),
@@ -1065,6 +1242,7 @@ export class ContextResilienceManager {
         options?.executorSessionId ||
         options?.executor_session_id ||
         worker.executorSessionId ||
+        worker.executor_session_id ||
         null;
 
       const recoveryToken = `REC-${taskId}-${workerId}-L${liveLedger.revision}-C${cp.checkpointRevision}`;
@@ -1103,9 +1281,13 @@ export class ContextResilienceManager {
         workerId: worker.workerId,
         parentId: worker.parentId,
         executorSessionId: resolvedSessionId,
+        executor_session_id: resolvedSessionId,
         checkpointRevision: cp.checkpointRevision,
+        checkpoint_revision: cp.checkpointRevision,
         ledgerRevision: liveLedger.revision,
+        ledger_revision: liveLedger.revision,
         packetDigest,
+        packet_digest: packetDigest,
         ownership: worker.ownership,
         openChecks: mergedOpenChecks,
         openRequirements: liveOpenRequirements,
@@ -1114,6 +1296,7 @@ export class ContextResilienceManager {
         staleContractIssues,
         contractValidation: cp.contractValidation,
         recoveryToken,
+        recovery_token: recoveryToken,
         recoveryStatus: 'pending_acknowledgment',
       };
     });
@@ -1121,8 +1304,9 @@ export class ContextResilienceManager {
 
   /**
    * Confirms that a resumed worker received and acknowledged its authoritative recovery packet.
-   * Requires a matching `recoveryToken`, verifies that the live ledger and checkpoint have not
-   * advanced past the issued packet (`STALE_RECOVERY_PACKET`), and validates session/revision fields.
+   * Requires a matching `recoveryToken`, a bound `executorSessionId`, verifies that the live ledger
+   * and checkpoint have not advanced past the issued packet (`STALE_RECOVERY_PACKET`), and validates
+   * both camelCase and snake_case revision/digest/session fields.
    */
   acknowledgeRecoveryPacket(taskId, workerId, recoveryTokenOrOptions = null) {
     return this._withTaskLock(taskId, () => {
@@ -1139,14 +1323,14 @@ export class ContextResilienceManager {
           error: `No pending recovery packet found for worker "${workerId}".`,
         };
       }
+      const opts =
+        recoveryTokenOrOptions && typeof recoveryTokenOrOptions === 'object'
+          ? recoveryTokenOrOptions
+          : {};
       const suppliedToken =
         typeof recoveryTokenOrOptions === 'string'
           ? recoveryTokenOrOptions.trim()
-          : String(
-              recoveryTokenOrOptions?.recoveryToken ||
-                recoveryTokenOrOptions?.recovery_token ||
-                ''
-            ).trim();
+          : String(opts.recoveryToken ?? opts.recovery_token ?? '').trim();
       if (!suppliedToken) {
         return {
           ok: false,
@@ -1164,49 +1348,60 @@ export class ContextResilienceManager {
         };
       }
 
-      if (recoveryTokenOrOptions && typeof recoveryTokenOrOptions === 'object') {
-        if (
-          recoveryTokenOrOptions.checkpointRevision !== undefined &&
-          Number(recoveryTokenOrOptions.checkpointRevision) !== Number(entry.checkpointRevision)
-        ) {
-          return {
-            ok: false,
-            acknowledged: false,
-            error: 'CHECKPOINT_REVISION_MISMATCH',
-          };
-        }
-        if (
-          recoveryTokenOrOptions.ledgerRevision !== undefined &&
-          Number(recoveryTokenOrOptions.ledgerRevision) !== Number(entry.ledgerRevision)
-        ) {
-          return {
-            ok: false,
-            acknowledged: false,
-            error: 'LEDGER_REVISION_MISMATCH',
-          };
-        }
-        if (
-          recoveryTokenOrOptions.packetDigest &&
-          entry.packetDigest &&
-          String(recoveryTokenOrOptions.packetDigest) !== String(entry.packetDigest)
-        ) {
-          return {
-            ok: false,
-            acknowledged: false,
-            error: 'PACKET_DIGEST_MISMATCH',
-          };
-        }
-        if (
-          entry.executorSessionId &&
-          recoveryTokenOrOptions.executorSessionId !== undefined &&
-          recoveryTokenOrOptions.executorSessionId !== entry.executorSessionId
-        ) {
-          return {
-            ok: false,
-            acknowledged: false,
-            error: 'EXECUTOR_SESSION_ID_MISMATCH',
-          };
-        }
+      const suppliedCpRev = opts.checkpointRevision ?? opts.checkpoint_revision;
+      if (
+        suppliedCpRev !== undefined &&
+        suppliedCpRev !== null &&
+        Number(suppliedCpRev) !== Number(entry.checkpointRevision)
+      ) {
+        return {
+          ok: false,
+          acknowledged: false,
+          error: 'CHECKPOINT_REVISION_MISMATCH',
+        };
+      }
+
+      const suppliedLedgerRev = opts.ledgerRevision ?? opts.ledger_revision;
+      if (
+        suppliedLedgerRev !== undefined &&
+        suppliedLedgerRev !== null &&
+        Number(suppliedLedgerRev) !== Number(entry.ledgerRevision)
+      ) {
+        return {
+          ok: false,
+          acknowledged: false,
+          error: 'LEDGER_REVISION_MISMATCH',
+        };
+      }
+
+      const suppliedPacketDigest = opts.packetDigest ?? opts.packet_digest;
+      if (
+        suppliedPacketDigest !== undefined &&
+        suppliedPacketDigest !== null &&
+        String(suppliedPacketDigest).trim() !== '' &&
+        String(suppliedPacketDigest) !== String(entry.packetDigest)
+      ) {
+        return {
+          ok: false,
+          acknowledged: false,
+          error: 'PACKET_DIGEST_MISMATCH',
+        };
+      }
+
+      const suppliedSessionId = opts.executorSessionId ?? opts.executor_session_id;
+      if (!entry.executorSessionId || !suppliedSessionId || !String(suppliedSessionId).trim()) {
+        return {
+          ok: false,
+          acknowledged: false,
+          error: 'EXECUTOR_SESSION_REQUIRED_FOR_ACKNOWLEDGMENT',
+        };
+      }
+      if (String(suppliedSessionId).trim() !== String(entry.executorSessionId).trim()) {
+        return {
+          ok: false,
+          acknowledged: false,
+          error: 'EXECUTOR_SESSION_ID_MISMATCH',
+        };
       }
 
       // Verify that neither the requirement ledger nor checkpoint has advanced since the recovery packet was issued
@@ -1239,6 +1434,8 @@ export class ContextResilienceManager {
       return {
         ok: true,
         acknowledged: true,
+        status: 'RUNNING',
+        workerStatus: 'acknowledged',
         taskId,
         workerId,
         executorSessionId: entry.executorSessionId || null,
@@ -1257,12 +1454,31 @@ export class ContextResilienceManager {
   /**
    * CTX-08: Stores full large tool output on disk under `.harness/tasks/<taskId>/artifacts/`
    * with symlink-safe containment and returns bounded evidence + an artifact reference.
+   * Strictly enforces that `maxContextChars` is a finite positive integer and that
+   * `boundedExcerpt.length <= maxContextChars` (including the artifact reference suffix).
    */
-  storeBoundedToolOutput(taskId, toolName, rawOutput, maxContextChars = 600) {
+  storeBoundedToolOutput(taskId, toolName, rawOutput, maxContextCharsOrOpts = 600) {
     const cleanTool = String(toolName || 'tool').replace(/[^a-zA-Z0-9._-]/g, '_');
     if (!cleanTool || cleanTool.includes('..')) {
       throw new Error(`Invalid toolName "${toolName}"`);
     }
+    const maxContextChars =
+      maxContextCharsOrOpts &&
+      typeof maxContextCharsOrOpts === 'object' &&
+      !Array.isArray(maxContextCharsOrOpts)
+        ? (maxContextCharsOrOpts.maxContextChars ?? maxContextCharsOrOpts.max_context_chars)
+        : maxContextCharsOrOpts;
+    if (
+      typeof maxContextChars !== 'number' ||
+      !Number.isFinite(maxContextChars) ||
+      !Number.isInteger(maxContextChars) ||
+      maxContextChars <= 0
+    ) {
+      throw new Error(
+        `CTX-08 invalid maxContextChars "${maxContextChars}": maxContextChars must be a finite positive integer.`
+      );
+    }
+    const effectiveMax = Math.min(4000, maxContextChars);
     const text = String(rawOutput ?? '');
     const taskDir = this._resolveSafeTaskDir(taskId);
     const artifactsDir = resolveContainedRealPath(
@@ -1278,15 +1494,23 @@ export class ContextResilienceManager {
     fs.writeFileSync(artifactFile, text, { encoding: 'utf8', mode: 0o600 });
     const relRef = path.relative(this.workspaceRoot, artifactFile).replace(/\\/g, '/');
 
-    const truncated = text.length > maxContextChars;
-    const boundedExcerpt = truncated
-      ? `${text.slice(0, maxContextChars)}… [Bounded: ${text.length} chars stored at ${relRef}]`
-      : text;
+    const truncated = text.length > effectiveMax;
+    let boundedExcerpt = text;
+    if (truncated) {
+      const suffix = `… [Bounded: ${text.length} chars stored at ${relRef}]`;
+      if (effectiveMax <= suffix.length) {
+        boundedExcerpt = suffix.slice(0, effectiveMax);
+      } else {
+        const bodyBudget = effectiveMax - suffix.length;
+        boundedExcerpt = `${text.slice(0, bodyBudget)}${suffix}`;
+      }
+    }
 
     return {
       stored: true,
       fullLength: text.length,
       truncated,
+      maxContextChars: effectiveMax,
       artifactRef: relRef,
       digest,
       boundedExcerpt,

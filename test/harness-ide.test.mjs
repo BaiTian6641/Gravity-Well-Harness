@@ -1123,15 +1123,15 @@ test('13. CTX-01..CTX-12: Gemini 4 Argon Context Resilience (Requirement Ledger,
       /CTX-07 violation/
     );
 
-    // Valid Requirement Ledger upsert (using a passing non-synthetic verification verdict JSON)
+    // Valid Requirement Ledger upsert (using a passing HMAC-authenticated verification verdict JSON)
     const tempVerdictRel = `.harness/runtime/verdict-ctx13-${Date.now()}.json`;
     const tempVerdictAbs = path.join(REPO_ROOT, tempVerdictRel);
-    fs.mkdirSync(path.dirname(tempVerdictAbs), { recursive: true });
-    fs.writeFileSync(
-      tempVerdictAbs,
-      JSON.stringify({ passed: true, score: 0.99, synthetic: false }, null, 2),
-      'utf8'
-    );
+    ctxMgr.writeAuthenticatedVerdict(tempVerdictRel, {
+      taskId: tempTaskId,
+      passed: true,
+      score: 0.99,
+      synthetic: false,
+    });
     let ledger;
     try {
       ledger = ctxMgr.upsertRequirementLedger(tempTaskId, {
@@ -1621,11 +1621,12 @@ test('16. WP4 & WP5: Public Antigravity Interfaces, Default Rule Deployment, Com
       '// commentedOutHandler is not implemented yet\nexport function activeHandler() { return "ACT_KEY_1"; }\n',
       'utf8'
     );
-    fs.writeFileSync(
-      tempVerdictAbs,
-      JSON.stringify({ passed: true, score: 0.98, synthetic: false }, null, 2),
-      'utf8'
-    );
+    ctxMgr.writeAuthenticatedVerdict(tempVerdictRel, {
+      taskId: tempTaskId,
+      passed: true,
+      score: 0.98,
+      synthetic: false,
+    });
 
     // Rejects consumerRef whose symbol only appears in comments
     assert.throws(
@@ -1997,10 +1998,14 @@ test('17. WP6, WP7 & WP8: Multi-Process Concurrency, Symlink Containment, Authen
       'export function runVerifiedFeature() { return "WP7_CONTRACT_KEY"; }\n',
       'utf8'
     );
-    fs.writeFileSync(
-      path.join(e2eWs, '.harness', 'runtime', 'wp7-verdict.json'),
-      JSON.stringify({ passed: true, score: 0.99, synthetic: false }, null, 2),
-      'utf8'
+    new ContextResilienceManager(e2eWs).writeAuthenticatedVerdict(
+      '.harness/runtime/wp7-verdict.json',
+      {
+        taskId: 'task-wp7-e2e',
+        passed: true,
+        score: 0.99,
+        synthetic: false,
+      }
     );
 
     // Step A: Register task ledger & contract via MCP harness_task_ledger
@@ -2435,11 +2440,12 @@ test('18. PR A–G: Verification Authority, Frozen Snapshot Query Blobs, Danglin
       'export const label = "stringLiteralOnlySymbol";\nexport function realSymbol() { return 1; }\n',
       'utf8'
     );
-    fs.writeFileSync(
-      path.join(isoWs, '.harness', 'runtime', 'verdict-pass.json'),
-      JSON.stringify({ passed: true, score: 1.0, synthetic: false }),
-      'utf8'
-    );
+    ctxMgr.writeAuthenticatedVerdict('.harness/runtime/verdict-pass.json', {
+      taskId: 'task-pr-e',
+      passed: true,
+      score: 1.0,
+      synthetic: false,
+    });
 
     // Rejects source code file as evidenceRefs
     assert.throws(
@@ -2630,4 +2636,600 @@ test('18. PR A–G: Verification Authority, Frozen Snapshot Query Blobs, Danglin
     fs.rmSync(isoWs, { recursive: true, force: true });
   }
 });
+
+test('19. WP1–WP8 Full Verification Authority, Sequential Early-Stop, Immutable Revisions, Context Resilience & Scheduler E2E Acceptance', async () => {
+  const wpWs = fs.mkdtempSync(path.join(os.tmpdir(), 'gravity-well-wp1-8-'));
+  try {
+    const engine = new HarnessKnowledgeEngine(wpWs);
+    engine.ensureDirectories();
+    const ctxMgr = new ContextResilienceManager(wpWs);
+
+    // --- WP1: Unsigned caller JSON verdict rejection & post-verification evidence/consumer revalidation ---
+    fs.mkdirSync(path.join(wpWs, 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(wpWs, 'src', 'svc.mjs'),
+      'export function runSvc() { return "SVC_OK"; }\n',
+      'utf8'
+    );
+    const unsignedVerdictRel = '.harness/runtime/unsigned-caller-verdict.json';
+    fs.mkdirSync(path.join(wpWs, '.harness', 'runtime'), { recursive: true });
+    fs.writeFileSync(
+      path.join(wpWs, unsignedVerdictRel),
+      JSON.stringify({ passed: true, score: 0.99, synthetic: false }, null, 2),
+      'utf8'
+    );
+
+    assert.throws(
+      () =>
+        ctxMgr.upsertRequirementLedger('task-wp1-auth', {
+          objective: 'Reject unsigned caller verdict JSON',
+          requirements: [
+            {
+              id: 'REQ-WP1-UNSIGNED',
+              behavior: 'Must reject unsigned JSON verdict',
+              state: 'verified',
+              acceptanceChecks: ['verdict check'],
+              evidenceRefs: [unsignedVerdictRel],
+              consumerRefs: [{ file: 'src/svc.mjs', symbol: 'runSvc' }],
+            },
+          ],
+        }),
+      /UNSIGNED_VERDICT_EVIDENCE/
+    );
+
+    const signedVerdictRel = '.harness/runtime/signed-verdict.json';
+    ctxMgr.writeAuthenticatedVerdict(signedVerdictRel, {
+      taskId: 'task-wp1-auth',
+      passed: true,
+      score: 0.99,
+      synthetic: false,
+    });
+    const verifiedLedger = ctxMgr.upsertRequirementLedger('task-wp1-auth', {
+      objective: 'Accept HMAC-authenticated verdict JSON',
+      requirements: [
+        {
+          id: 'REQ-WP1-SIGNED',
+          behavior: 'Must accept signed JSON verdict and revalidate on load',
+          state: 'verified',
+          acceptanceChecks: ['signed verdict check'],
+          evidenceRefs: [signedVerdictRel],
+          consumerRefs: [{ file: 'src/svc.mjs', symbol: 'runSvc' }],
+        },
+      ],
+    });
+    assert.equal(verifiedLedger.requirements[0].state, 'verified');
+
+    // Deleting the evidence file after verification must demote the requirement to implemented_unverified on loadRequirementLedger and validateContracts (even when contracts is empty!)
+    fs.unlinkSync(path.join(wpWs, signedVerdictRel));
+    const revalidatedOnLoad = ctxMgr.loadRequirementLedger('task-wp1-auth');
+    assert.equal(revalidatedOnLoad.requirements[0].state, 'implemented_unverified');
+    assert.ok(
+      String(revalidatedOnLoad.requirements[0].demotionReason).includes('invalid_or_missing_evidence')
+    );
+
+    const emptyContractsValidation = ctxMgr.validateContracts('task-wp1-auth');
+    assert.equal(emptyContractsValidation.ok, false);
+    assert.ok(
+      emptyContractsValidation.mismatches.some((m) => m.type === 'CTX-05_VERIFIED_REQUIREMENT_REGRESSED')
+    );
+
+    // --- WP1 & WP2 (Python): Unverified rollout rejection, simulation provenance with GEMINI_API_KEY, upstream harness2 surface & public SDK config ---
+    const pyCheck = spawnSync(
+      'python',
+      [
+        '-c',
+        `
+import json, os, sys, tempfile
+from pathlib import Path
+sys.path.insert(0, ${JSON.stringify(REPO_ROOT)})
+from adapters.harness2_antigravity_executor import (
+    AntigravityExecutor,
+    AntigravityBenchmarkAdapter,
+    BenchSpec,
+    BenchPrompts,
+    ChannelSpec,
+    RunView,
+    Install,
+    build_sdk_agent_config,
+    validate_sdk_agent_config,
+)
+
+ws = Path(${JSON.stringify(wpWs)})
+
+# 1. Rollout without validator_cmd must NEVER be scored as verified
+adapter = AntigravityBenchmarkAdapter(workspace_root=str(ws))
+spec = adapter.bench_spec(domain="software-engineering")
+assert isinstance(spec.prompts, BenchPrompts)
+assert hasattr(spec.prompts, "proposer_hint") and hasattr(spec.prompts, "composer_header")
+assert spec.install_mode in ("full_tree", "filesystem", "command")
+ch = ChannelSpec(name="test", description="desc", max_bytes=1024)
+assert ch.name == "test"
+
+# Duck-typed Install with staging_dir only
+class DuckInstall:
+    def __init__(self, staging_dir):
+        self.staging_dir = Path(staging_dir)
+
+duck_dir = ws / ".harness" / "runtime" / "duck-stage"
+duck_dir.mkdir(parents=True, exist_ok=True)
+(duck_dir / "run.py").write_text(
+    "from pathlib import Path\\nPath('deliverables').mkdir(exist_ok=True)\\nPath('deliverables/out.txt').write_text('hello', encoding='utf-8')\\n",
+    encoding="utf-8",
+)
+run_paths = adapter.substrate.execute(
+    "t-unverified",
+    install=DuckInstall(duck_dir),
+    run_ids=["run-duck-1"],
+)
+assert isinstance(run_paths, list) and len(run_paths) == 1
+run_out_dir = run_paths[0]
+rv = RunView(run_id="run-duck-1", task_id="t-unverified", run_dir=run_out_dir, delivered=adapter.delivered(run_out_dir))
+assert isinstance(rv, RunView) and rv.delivered is True
+scored = adapter.score(run_out_dir, task_id="t-unverified", required_files=["out.txt"])
+assert scored is not None, "Expected score dict for delivered_unverified run"
+assert scored["verifier_executed"] is False
+assert scored["passed_verification"] is False
+assert scored["status"] == "delivered_unverified"
+assert scored["score"] == 0.0
+
+# 2. Simulation provenance even when GEMINI_API_KEY is present in environment
+os.environ["GEMINI_API_KEY"] = "fake-key-for-provenance-test"
+try:
+    exec_sim = AntigravityExecutor(workspace_root=str(ws), allow_simulation=True, strict_execution=False)
+    loop_res = exec_sim.run_propose_probe_compose(
+        task_id="py-sim-with-env-key",
+        problem="Test simulation provenance when GEMINI_API_KEY is set",
+        domain="software-engineering",
+    )
+    assert loop_res.get("synthetic") is True, f"Expected synthetic=True, got {loop_res.get('synthetic')}"
+    assert loop_res.get("execution_mode") == "simulation", f"Expected simulation, got {loop_res.get('execution_mode')}"
+    assert loop_res.get("eval_receipt_id") is None, f"Expected no receipt for simulation, got {loop_res.get('eval_receipt_id')}"
+    assert (loop_res.get("experience_record") or {}).get("status") == "candidate", f"Expected candidate, got {loop_res.get('experience_record')}"
+finally:
+    os.environ.pop("GEMINI_API_KEY", None)
+
+# 3. Public SDK config validation rejects unsupported keys
+cfg = build_sdk_agent_config(workspace_root=str(ws), model="gemini-2.5-pro")
+v_ok = validate_sdk_agent_config(cfg)
+assert v_ok["ok"] is True
+v_bad = validate_sdk_agent_config({**cfg, "thinking_budget": 8192})
+assert v_bad["ok"] is False and "thinking_budget" in v_bad["unsupported_keys"]
+print("PYTHON_WP1_WP2_OK")
+`,
+      ],
+      { encoding: 'utf8', timeout: 30000 }
+    );
+    assert.equal(pyCheck.status, 0, `Python WP1/WP2 check failed: ${pyCheck.stderr || pyCheck.stdout}`);
+    assert.ok(pyCheck.stdout.includes('PYTHON_WP1_WP2_OK'));
+
+    // --- WP3: Honest usage accounting, full workspace staging, sequential early-stop & MCP default allowSimulation=false ---
+    const { handleToolCall } = await import('../mcp/harness-rag-server.mjs');
+    const mcpDefaultNoSim = await handleToolCall('harness_run_loop', {
+      workspace_root: wpWs,
+      task_id: 'task-mcp-default-nosim',
+      problem: 'Without executor or allow_simulation, MCP harness_run_loop must not simulate',
+      k: 2,
+    });
+    assert.equal(mcpDefaultNoSim.ok, false);
+    assert.notEqual(mcpDefaultNoSim.executionMode, 'simulation');
+
+    // Create a workspace helper module and executor/verifier scripts so candidate staging must copy the workspace source tree for relative imports to work
+    const markerFile = path.join(wpWs, '.harness', 'runtime', 'seq-executions.log');
+    fs.writeFileSync(
+      path.join(wpWs, 'src', 'shared-helper.mjs'),
+      'export function getSharedMagic() { return "STAGED_SOURCE_TREE_OK"; }\n',
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(wpWs, 'src', 'run-seq-exec.mjs'),
+      [
+        'import fs from "node:fs";',
+        'import { getSharedMagic } from "./shared-helper.mjs";',
+        `fs.appendFileSync(${JSON.stringify(markerFile)}, (process.env.HARNESS_CANDIDATE_ID || "CAND") + "\\n");`,
+        'fs.mkdirSync("dist", { recursive: true });',
+        'fs.writeFileSync("dist/staged-out.txt", getSharedMagic(), "utf8");',
+      ].join('\n') + '\n',
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(wpWs, 'src', 'run-seq-verify.mjs'),
+      [
+        'import fs from "node:fs";',
+        'const txt = fs.readFileSync("dist/staged-out.txt", "utf8");',
+        'if (txt.trim() !== "STAGED_SOURCE_TREE_OK") process.exit(1);',
+      ].join('\n') + '\n',
+      'utf8'
+    );
+    engine.registerExecutor('seq-staging-executor', {
+      type: 'command',
+      command: 'node src/run-seq-exec.mjs',
+    });
+    engine.registerVerifier('seq-staging-verifier', {
+      type: 'command',
+      command: 'node src/run-seq-verify.mjs',
+    });
+
+    const seqLoop = await handleToolCall('harness_run_loop', {
+      workspace_root: wpWs,
+      task_id: 'task-wp3-seq',
+      domain: 'software-engineering',
+      problem: 'Verify sequential early-stop and workspace staging',
+      k: 2,
+      mode: 'sequential',
+      early_stop: true,
+      executor_id: 'seq-staging-executor',
+      verifier_id: 'seq-staging-verifier',
+      required_artifacts: ['dist/staged-out.txt'],
+    });
+    assert.equal(seqLoop.ok, true);
+    assert.equal(seqLoop.status, 'succeeded');
+    assert.equal(seqLoop.earlyStopped, true);
+    assert.equal(
+      seqLoop.executedCandidates.length,
+      1,
+      'Sequential early-stop must stop after Candidate 1 passes'
+    );
+    assert.equal(seqLoop.probeTrajectories[1].executed, false);
+    assert.equal(seqLoop.probeTrajectories[1].earlyStopped, true);
+    const executedCandidates = fs.readFileSync(markerFile, 'utf8').trim().split(/\r?\n/);
+    assert.equal(executedCandidates.length, 1, 'Candidate 2 must not be executed when Candidate 1 passes in sequential mode');
+    assert.equal(fs.readFileSync(path.join(wpWs, 'dist', 'staged-out.txt'), 'utf8'), 'STAGED_SOURCE_TREE_OK');
+
+    // Honest usage accounting when command executor does not report token counts
+    assert.equal(seqLoop.usage.complete, false);
+    assert.equal(seqLoop.usage.observed_subtotal, 0);
+    assert.equal(seqLoop.usage.total, null);
+    assert.equal(seqLoop.totalActualTokens, null);
+    assert.equal(seqLoop.totalUnoptimizedTokens, null);
+    assert.equal(seqLoop.tokenEfficiencyPct, null);
+
+    // --- WP4: Immutable lesson revisions, preserve active EXPERIENCE.md on failed/candidate rerun, requestId idempotency & rollback ---
+    const activeExpPath = path.join(
+      wpWs,
+      '.harness',
+      'library',
+      'software-engineering',
+      'harnesses',
+      'task-wp3-seq',
+      'EXPERIENCE.md'
+    );
+    const activePtrPath = path.join(
+      wpWs,
+      '.harness',
+      'library',
+      'software-engineering',
+      'harnesses',
+      'task-wp3-seq',
+      'active.json'
+    );
+    assert.ok(fs.existsSync(activeExpPath));
+    assert.ok(fs.existsSync(activePtrPath));
+    const activePtrBefore = JSON.parse(fs.readFileSync(activePtrPath, 'utf8'));
+    assert.ok(activePtrBefore.activeLessonRevisionId);
+    const activeContentBefore = fs.readFileSync(activeExpPath, 'utf8');
+    assert.ok(activeContentBefore.includes('status: active'));
+
+    // Now record a subsequent candidate (unverified) attempt on the same taskId -> must NOT overwrite the active EXPERIENCE.md!
+    const candAttempt = engine.recordExperience({
+      taskId: 'task-wp3-seq',
+      domain: 'software-engineering',
+      problem: 'Subsequent unverified candidate attempt on same taskId',
+      observedBehavior: 'Candidate attempt did not pass verification',
+      supportingEvidence: ['candidate-attempt-2'],
+      status: 'candidate',
+      requestId: 'req-wp4-idem-1',
+    });
+    assert.equal(candAttempt.ok, true);
+    assert.equal(candAttempt.status, 'candidate');
+    assert.equal(candAttempt.preservedActiveLessonRevisionId, activePtrBefore.activeLessonRevisionId);
+    const activeContentAfter = fs.readFileSync(activeExpPath, 'utf8');
+    assert.ok(
+      activeContentAfter.includes('status: active'),
+      'Top-level EXPERIENCE.md must remain the active verified lesson when a later candidate attempt is recorded'
+    );
+
+    // Idempotent replay with same requestId and same payload
+    const replaySame = engine.recordExperience({
+      taskId: 'task-wp3-seq',
+      domain: 'software-engineering',
+      problem: 'Subsequent unverified candidate attempt on same taskId',
+      observedBehavior: 'Candidate attempt did not pass verification',
+      supportingEvidence: ['candidate-attempt-2'],
+      status: 'candidate',
+      requestId: 'req-wp4-idem-1',
+    });
+    assert.equal(replaySame.ok, true);
+    assert.equal(replaySame.idempotentReplay, true);
+    assert.equal(replaySame.lessonRevisionId, candAttempt.lessonRevisionId);
+
+    // Conflicting payload with same requestId must fail with REQUEST_ID_PAYLOAD_CONFLICT
+    const replayConflict = engine.recordExperience({
+      taskId: 'task-wp3-seq',
+      domain: 'software-engineering',
+      problem: 'DIFFERENT PROBLEM WITH SAME REQUEST ID',
+      observedBehavior: 'Different behavior',
+      supportingEvidence: ['candidate-attempt-2'],
+      status: 'candidate',
+      requestId: 'req-wp4-idem-1',
+    });
+    assert.equal(replayConflict.ok, false);
+    assert.equal(replayConflict.error, 'REQUEST_ID_PAYLOAD_CONFLICT');
+
+    // Rollback active lesson pointer works deterministically
+    const rollbackRes = engine.rollbackActiveLesson(
+      'software-engineering',
+      'task-wp3-seq',
+      activePtrBefore.activeLessonRevisionId
+    );
+    assert.equal(rollbackRes.ok, true);
+    assert.equal(rollbackRes.activeLessonRevisionId, activePtrBefore.activeLessonRevisionId);
+
+    // --- WP5: snake_case recovery acknowledgment, executorSessionId binding, strict maxContextChars & uniform supervisor stop ---
+    ctxMgr.upsertRequirementLedger('task-wp5-ctx', {
+      objective: 'Verify snake_case recovery ack and session binding',
+      requirements: [{ id: 'REQ-WP5-1', behavior: 'Test recovery', state: 'implemented' }],
+    });
+    ctxMgr.writeCheckpoint('task-wp5-ctx', {
+      activeWorkers: [{ workerId: 'worker-wp5', ownership: ['src/svc.mjs'], openChecks: ['REQ-WP5-1'] }],
+      nextAction: 'Resume worker-wp5',
+    });
+    const restoredWp5 = ctxMgr.restoreSubagentFromCheckpoint('task-wp5-ctx', 'worker-wp5', {
+      executor_session_id: 'SES-WP5-REAL',
+    });
+    assert.equal(restoredWp5.executorSessionId, 'SES-WP5-REAL');
+
+    // Wrong executor_session_id must be rejected
+    const wrongSesAck = ctxMgr.acknowledgeRecoveryPacket('task-wp5-ctx', 'worker-wp5', {
+      executor_session_id: 'SES-WP5-IMPOSTOR',
+      checkpoint_revision: restoredWp5.checkpointRevision,
+      ledger_revision: restoredWp5.ledgerRevision,
+      packet_digest: restoredWp5.packetDigest,
+      recovery_token: restoredWp5.recoveryToken,
+    });
+    assert.equal(wrongSesAck.ok, false);
+    assert.equal(wrongSesAck.error, 'EXECUTOR_SESSION_ID_MISMATCH');
+
+    // Matching snake_case fields must succeed
+    const validSnakeAck = ctxMgr.acknowledgeRecoveryPacket('task-wp5-ctx', 'worker-wp5', {
+      executor_session_id: 'SES-WP5-REAL',
+      checkpoint_revision: restoredWp5.checkpointRevision,
+      ledger_revision: restoredWp5.ledgerRevision,
+      packet_digest: restoredWp5.packetDigest,
+      recovery_token: restoredWp5.recoveryToken,
+    });
+    assert.equal(validSnakeAck.ok, true);
+    assert.equal(validSnakeAck.status, 'RUNNING');
+
+    // storeBoundedToolOutput strict maxContextChars validation & exact bound including suffix
+    assert.throws(
+      () => ctxMgr.storeBoundedToolOutput('task-wp5-ctx', 'read_file', 'hello', { maxContextChars: 0 }),
+      /maxContextChars must be a finite positive integer/
+    );
+    assert.throws(
+      () => ctxMgr.storeBoundedToolOutput('task-wp5-ctx', 'read_file', 'hello', { maxContextChars: Number.NaN }),
+      /maxContextChars must be a finite positive integer/
+    );
+    const boundedOut = ctxMgr.storeBoundedToolOutput(
+      'task-wp5-ctx',
+      'read_file',
+      'X'.repeat(500),
+      { maxContextChars: 120 }
+    );
+    assert.ok(
+      boundedOut.boundedExcerpt.length <= 120,
+      `Expected boundedExcerpt.length <= 120, got ${boundedOut.boundedExcerpt.length}`
+    );
+
+    // --- WP6: Monitor worker telemetry honesty, estimated vs observed quality, bulk recall validation & hook deduplication ---
+    const hookScript = path.join(REPO_ROOT, 'plugin', 'harness-ide', 'scripts', 'hooks', 'post-tool-use.mjs');
+    const hookPayload = JSON.stringify({
+      session_id: 'ses-dedup-test',
+      tool_name: 'read_file',
+      step_index: 7,
+    });
+    spawnSync('node', [hookScript], {
+      cwd: wpWs,
+      input: hookPayload,
+      encoding: 'utf8',
+    });
+    spawnSync('node', [hookScript], {
+      cwd: wpWs,
+      input: hookPayload,
+      encoding: 'utf8',
+    });
+    const telAfterReplay = JSON.parse(
+      fs.readFileSync(path.join(wpWs, '.harness', 'runtime', 'telemetry.json'), 'utf8')
+    );
+    assert.equal(
+      telAfterReplay.events.length,
+      1,
+      'Replaying identical hook payload must be deduplicated'
+    );
+    assert.equal(telAfterReplay.sessions['ses-dedup-test'].toolCallCount, 1);
+
+    // Add a real subagent without token counts to telemetry.json and verify buildSwarmFormations reports null/unavailable (never 195k/$0.21)
+    telAfterReplay.subagents = [
+      {
+        id: 'real-sub-no-tokens',
+        typeName: 'research',
+        role: 'Codebase Researcher',
+        status: 'RUNNING',
+        invokedAt: new Date().toISOString(),
+      },
+    ];
+    fs.writeFileSync(
+      path.join(wpWs, '.harness', 'runtime', 'telemetry.json'),
+      JSON.stringify(telAfterReplay, null, 2),
+      'utf8'
+    );
+
+    const monitorApp = createHarnessMonitorApp({ registeredWorkspaces: [wpWs] });
+    await monitorApp.run(0);
+    try {
+      const base = `http://127.0.0.1:${monitorApp.port}`;
+      const headers = {
+        'Content-Type': 'application/json',
+        'X-Sidecar-Token': monitorApp.sessionToken,
+      };
+      const dashRes = await fetch(`${base}/api/dashboard`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ workspaceRoot: wpWs }),
+      });
+      const dash = await dashRes.json();
+      const subNode = dash.swarm.formations['live-harness2'].nodes.find(
+        (n) => n.id === 'real-sub-no-tokens'
+      );
+      assert.ok(subNode, 'Spawned subagent should appear in live-harness2 formation');
+      assert.equal(subNode.totalTokens, null);
+      assert.equal(subNode.totalTokensFormatted, 'unavailable');
+      assert.equal(subNode.contextTokens, null);
+      assert.equal(subNode.costUsd, null);
+      assert.equal(subNode.costFormatted, 'unavailable');
+      assert.equal(subNode.steps, null);
+      assert.equal(subNode.telemetryQuality, 'unavailable');
+
+      // Bulk recall with unknown target ID must return 400 UNKNOWN_OR_UNREGISTERED_WORKER
+      const badBulkRes = await fetch(`${base}/api/swarm/recall`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          workspaceRoot: wpWs,
+          action: 'recall_all',
+          nodeIds: ['real-sub-no-tokens', 'ghost-nonexistent-worker'],
+        }),
+      });
+      assert.equal(badBulkRes.status, 400);
+      const badBulkJson = await badBulkRes.json();
+      assert.equal(badBulkJson.error, 'UNKNOWN_OR_UNREGISTERED_WORKER');
+
+      // Non-demo complete without verified receipt must return 409 COMPLETION_REQUIRES_VERIFIED_RECEIPT
+      const unverifiedCompleteRes = await fetch(`${base}/api/swarm/recall`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          workspaceRoot: wpWs,
+          action: 'complete',
+          nodeId: 'real-sub-no-tokens',
+        }),
+      });
+      assert.equal(unverifiedCompleteRes.status, 409);
+      const unverifiedCompleteJson = await unverifiedCompleteRes.json();
+      assert.equal(unverifiedCompleteJson.error, 'COMPLETION_REQUIRES_VERIFIED_RECEIPT');
+    } finally {
+      await monitorApp.close();
+    }
+
+    // --- WP7 & WP8: Zero antigravity-sidecar-kit references, atomic snapshot blob/index parity & Scheduler Create/Cancel E2E ---
+    for (const relFile of [
+      'package.json',
+      'sidecars/harness-ide-monitor/package.json',
+      'sidecars/harness-ide-monitor/launch.mjs',
+      'sidecars/harness-ide-monitor/server.mjs',
+    ]) {
+      const raw = fs.readFileSync(path.join(REPO_ROOT, relFile), 'utf8');
+      assert.ok(
+        !raw.includes('antigravity-sidecar-kit'),
+        `Unexpected antigravity-sidecar-kit reference in ${relFile}`
+      );
+    }
+
+    // Snapshot lock single-byte-buffer consistency
+    const snapLock = engine.createSnapshotLock({ domain: 'software-engineering', k: 2 });
+    assert.equal(snapLock.ok, true);
+    for (const doc of snapLock.frozenDocuments) {
+      const blobFile = path.join(snapLock.blobDir, `${doc.blobHash}.md`);
+      assert.ok(fs.existsSync(blobFile), `Missing frozen blob file for ${doc.docid}`);
+      const blobBytes = fs.readFileSync(blobFile);
+      const blobSha = crypto.createHash('sha256').update(blobBytes).digest('hex');
+      assert.equal(doc.rawHash, blobSha, `Frozen rawHash must match blob file SHA-256 for ${doc.docid}`);
+    }
+    engine.releaseSnapshotLock(snapLock.snapshotId);
+
+    // End-to-End Scheduler Create/Cancel Task through the packaged plugin MCP entry
+    const { handleToolCall: pluginHandleToolCall } = await import(
+      '../plugin/harness-ide/scripts/mcp-entry.mjs'
+    );
+    const schedLoop = await pluginHandleToolCall('harness_run_loop', {
+      workspace_root: wpWs,
+      task_id: 'sched-cancel-01',
+      domain: 'software-engineering',
+      problem: 'Implement and verify job creation and cancellation with UI state update.',
+      k: 2,
+      mode: 'sequential',
+      early_stop: true,
+      executor_id: 'registered-command-or-sdk-executor',
+      verifier_id: 'registered-scheduler-acceptance-checks',
+      required_artifacts: ['src/scheduler/service.mjs', 'src/ui/schedule-controller.mjs'],
+    });
+    assert.equal(schedLoop.ok, true);
+    assert.equal(schedLoop.status, 'succeeded');
+    assert.equal(schedLoop.executionMode, 'verified');
+    assert.equal(schedLoop.synthetic, false);
+    assert.equal(schedLoop.earlyStopped, true);
+    assert.equal(schedLoop.executedCandidates.length, 1);
+    assert.ok(schedLoop.evaluationReceipt?.receiptId);
+
+    // Register & verify the scheduler requirement ledger and contract using the issued evaluation receipt
+    await pluginHandleToolCall('harness_task_ledger', {
+      workspace_root: wpWs,
+      action: 'register_contract',
+      task_id: 'sched-cancel-01',
+      contract_name: 'SchedulerCancelContract',
+      producer_file: 'src/scheduler/service.mjs',
+      consumer_file: 'src/ui/schedule-controller.mjs',
+      identifiers: ['cancelJob', 'CANCELLED'],
+      unit: 'job_status',
+      schema_version: '1.0',
+    });
+    const schedLedger = await pluginHandleToolCall('harness_task_ledger', {
+      workspace_root: wpWs,
+      action: 'upsert',
+      task_id: 'sched-cancel-01',
+      objective: 'Implement and verify job creation and cancellation with UI state update.',
+      requirements: [
+        {
+          id: 'REQ-SCHED-01',
+          behavior: 'Create a scheduled job with durable state',
+          state: 'verified',
+          acceptanceChecks: ['createJob persists ACTIVE state'],
+          evidenceRefs: [schedLoop.evaluationReceipt.receiptId],
+          consumerRefs: [{ file: 'src/scheduler/service.mjs', symbol: 'createJob' }],
+        },
+        {
+          id: 'REQ-SCHED-02',
+          behavior: 'Cancel a scheduled job and update controller state',
+          state: 'verified',
+          acceptanceChecks: ['cancelJob transitions job to CANCELLED'],
+          evidenceRefs: [schedLoop.evaluationReceipt.receiptId],
+          consumerRefs: [{ file: 'src/ui/schedule-controller.mjs', symbol: 'handleCancelScheduleClick' }],
+        },
+      ],
+    });
+    assert.ok(Array.isArray(schedLedger.requirements));
+    assert.equal(schedLedger.requirements.every((r) => r.state === 'verified'), true);
+
+    const schedContractOk = await pluginHandleToolCall('harness_task_ledger', {
+      workspace_root: wpWs,
+      action: 'validate_contracts',
+      task_id: 'sched-cancel-01',
+    });
+    assert.equal(schedContractOk.ok, true);
+
+    // Deleting the consumer file must fail validate_contracts and demote REQ-SCHED-02 to regression
+    fs.unlinkSync(path.join(wpWs, 'src', 'ui', 'schedule-controller.mjs'));
+    const schedContractBroken = await pluginHandleToolCall('harness_task_ledger', {
+      workspace_root: wpWs,
+      action: 'validate_contracts',
+      task_id: 'sched-cancel-01',
+    });
+    assert.equal(schedContractBroken.ok, false);
+    assert.ok(
+      schedContractBroken.mismatches.some((m) => m.type === 'CTX-05_MISSING_CONSUMER_FILE')
+    );
+  } finally {
+    fs.rmSync(wpWs, { recursive: true, force: true });
+  }
+});
+
 

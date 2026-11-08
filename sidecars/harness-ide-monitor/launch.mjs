@@ -1,15 +1,13 @@
+import { spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runSidecarLauncher } from 'antigravity-sidecar-kit/launcher';
 
 const __dirname = realpathSync(dirname(fileURLToPath(import.meta.url)));
 
-for (;;) {
-  const code = await runSidecarLauncher({
-    targetPath: join(__dirname, 'server.mjs'),
-    sidecarName: 'Harness² Swarm & RAG Monitor',
-    repoRoot: __dirname,
-  });
-  if (code !== 0) break;
-}
+const res = spawnSync(process.execPath, [join(__dirname, 'server.mjs')], {
+  cwd: __dirname,
+  stdio: 'inherit',
+  env: process.env,
+});
+process.exit(res.status ?? 0);

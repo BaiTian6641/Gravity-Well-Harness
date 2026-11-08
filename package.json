@@ -20,7 +20,5 @@
     "start:mcp": "node mcp/harness-rag-server.mjs",
     "test": "node --test test/harness-ide.test.mjs"
   },
-  "dependencies": {
-    "antigravity-sidecar-kit": "^1.4.0"
-  }
+  "dependencies": {}
 }
