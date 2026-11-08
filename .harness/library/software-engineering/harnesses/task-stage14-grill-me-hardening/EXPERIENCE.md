@@ -4,10 +4,11 @@ title: "Gravity Well Harness Hardening: F01-F15 Public API Repair, Immutable Sna
 collection: experiment-knowledge
 domain: software-engineering
 task_id: task-stage14-grill-me-hardening
-status: active
+status: candidate
+verification_status: disputed
 synthetic: false
 repo: Harness2-RAG-antigravity
-git_revision: c619f9d
+git_revision: 07c92b4
 created_at: "2026-11-07T21:41:07.545Z"
 cue: "When hardening an Antigravity IDE harness across multi-model swarms, RAG snapshots, and long-horizon Argon sessions, enforce content-addressed immutable snapshot blobs, CAS per-run locks, credential origin allowlists, recipient-isolated message bus locks, batched Subagents hook decoding, and durable task ledgers/checkpoints."
 tags: [harness2, experience]
@@ -36,7 +37,7 @@ evidence_links:
 - **Domain**: `software-engineering`
 
 ## 3. What Was Actually Observed?
-All 13 automated test suites (covering F01-F15, REL-01..REL-12, and CTX-01..CTX-12) and 52-file AST/grammar checks pass with 0 errors and zero API key leakage.
+In commit `07c92b4`, 13 automated test suites passed, improving direct-recipient isolation, normal frozen snapshot reads, malformed snapshot ID rejection, trusted credential origin checks, vault corruption preservation, CJK tokenization, and batched `Subagents` hook decoding. However, independent follow-up review reproduced remaining defects in execution/evaluator verification, installed plugin MCP tool parity (10 vs 16 tools), concurrent read-modify-write lock enforcement, upstream Python `Substrate`/`BenchmarkAdapter` protocol signatures, and live context recovery. Broad completion claims from `07c92b4` are therefore marked `disputed` / `candidate` pending Work Packages 1–7 verification.
 
 ## 4. Which Evidence Supports the Conclusion?
 - `.harness/library/software-engineering/harnesses/task-stage14-grill-me-hardening/harness/manifest.json`
@@ -51,5 +52,5 @@ All 13 automated test suites (covering F01-F15, REL-01..REL-12, and CTX-01..CTX-
 - `test/harness-ide.test.mjs`
 
 ## 5. Is the Conclusion Still Current?
-- **Status**: `active`
+- **Status**: `candidate` (`verification_status: disputed`)
 - **Recorded At**: `2026-11-07T21:41:07.545Z`

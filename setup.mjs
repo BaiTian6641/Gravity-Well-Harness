@@ -6,7 +6,7 @@
  * 1. Global Antigravity Plugin: `~/.gemini/config/plugins/harness-ide`
  * 2. Global Auxiliary Pane UI Sidecar: `~/.gemini/config/sidecars/harness-ide-monitor`
  * 3. Local `.harness/` Knowledge Collections & Hybrid RAG Index
- * 4. Enables both plugin and sidecar via Antigravity Language Server RPC & config.json
+ * 4. Enables both plugin and sidecar via public `~/.gemini/config/config.json`
  */
 
 import fs from 'node:fs';
@@ -21,15 +21,6 @@ import {
   updateAgySidecarConfig,
   writeJsonNoBom,
 } from 'antigravity-sidecar-kit/config';
-import {
-  callLsRpc,
-  findListeningPids,
-  getSidecars,
-  isNodeProcess,
-  killPidAndWait,
-  killSidecarProcessByPortOrPid,
-  manageSidecar,
-} from 'antigravity-sidecar-kit/rpc';
 import { HarnessKnowledgeEngine } from './src/rag-engine.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -59,7 +50,6 @@ function copyDirRecursive(src, dest) {
 }
 
 async function enablePluginLive(pluginDirName, enabled = true) {
-  // 1. Primary Public Path: atomic BOM-safe ~/.gemini/config/config.json update (F07)
   let configOk = false;
   let configError = null;
   try {
@@ -72,34 +62,13 @@ async function enablePluginLive(pluginDirName, enabled = true) {
     configError = err?.message;
   }
 
-  // 2. Optional Best-Effort Sidecar Adapter Notification (never required for correctness)
-  let rpcOk = false;
-  try {
-    await callLsRpc('JetboxWriteState', {
-      userConfig: {
-        plugins: {
-          [pluginDirName]: { enabled },
-        },
-      },
-    });
-    rpcOk = true;
-  } catch {
-    // Non-fatal: public config.json registration is authoritative
-  }
-
   return {
-    method: configOk
-      ? rpcOk
-        ? 'config.json (public) + optional LS notification'
-        : 'config.json (public atomic)'
-      : rpcOk
-        ? 'LS notification fallback'
-        : 'none',
-    ok: configOk || rpcOk,
+    method: configOk ? 'config.json (public atomic)' : 'none',
+    ok: configOk,
     stages: {
       registered: configOk,
-      enabled: configOk || rpcOk,
-      liveRpcNotified: rpcOk,
+      enabled: configOk,
+      liveRpcNotified: false,
     },
     error: configError,
   };
@@ -109,10 +78,6 @@ async function uninstallAll() {
   console.log('[harness-ide] Uninstalling plugin and UI sidecar...');
   await enablePluginLive(PLUGIN_ID, false);
   updateAgySidecarConfig(SIDECAR_ID, false);
-
-  try {
-    await manageSidecar(SIDECAR_ID, 'SIDECAR_ACTION_DISABLE');
-  } catch {}
 
   if (fs.existsSync(TARGET_PLUGIN_DIR)) {
     fs.rmSync(TARGET_PLUGIN_DIR, { recursive: true, force: true });
@@ -136,7 +101,10 @@ async function main() {
   console.log('  Harness² + Local RAG Antigravity IDE Installer (harness-ide)');
   console.log('================================================================');
 
-  // 1. Sync latest secret-vault.mjs, rag-engine.mjs, model-hub.mjs, and context-resilience.mjs into plugin and sidecar
+  // 1. Sync latest runtime modules, canonical 16-tool MCP entrypoint, and default operating contract into plugin and sidecar
+  fs.mkdirSync(path.join(SOURCE_PLUGIN_DIR, 'scripts'), { recursive: true });
+  fs.mkdirSync(path.join(SOURCE_PLUGIN_DIR, 'rules'), { recursive: true });
+
   const masterVaultPath = path.join(REPO_ROOT, 'src', 'secret-vault.mjs');
   fs.copyFileSync(masterVaultPath, path.join(SOURCE_PLUGIN_DIR, 'scripts', 'secret-vault.mjs'));
   fs.copyFileSync(masterVaultPath, path.join(SOURCE_SIDECAR_DIR, 'secret-vault.mjs'));
@@ -155,6 +123,16 @@ async function main() {
     fs.copyFileSync(masterResiliencePath, path.join(SOURCE_SIDECAR_DIR, 'context-resilience.mjs'));
   }
 
+  const canonicalMcpPath = path.join(REPO_ROOT, 'mcp', 'harness-rag-server.mjs');
+  if (fs.existsSync(canonicalMcpPath)) {
+    fs.copyFileSync(canonicalMcpPath, path.join(SOURCE_PLUGIN_DIR, 'scripts', 'mcp-entry.mjs'));
+  }
+
+  const masterContractRulePath = path.join(REPO_ROOT, '.agents', 'rules', 'gravity-well-default.md');
+  if (fs.existsSync(masterContractRulePath)) {
+    fs.copyFileSync(masterContractRulePath, path.join(SOURCE_PLUGIN_DIR, 'rules', 'gravity-well-default.md'));
+  }
+
   // 2. Build/verify local RAG index in workspace
   const engine = new HarnessKnowledgeEngine(REPO_ROOT);
   const index = engine.buildIndex({ runQmdSync: true });
@@ -166,6 +144,14 @@ async function main() {
 
   // 3. Install/Update Plugin in ~/.gemini/config/plugins/harness-ide (in-place copy avoids Windows EPERM when watched)
   copyDirRecursive(SOURCE_PLUGIN_DIR, TARGET_PLUGIN_DIR);
+  if (fs.existsSync(canonicalMcpPath)) {
+    fs.mkdirSync(path.join(TARGET_PLUGIN_DIR, 'scripts'), { recursive: true });
+    fs.copyFileSync(canonicalMcpPath, path.join(TARGET_PLUGIN_DIR, 'scripts', 'mcp-entry.mjs'));
+  }
+  if (fs.existsSync(masterContractRulePath)) {
+    fs.mkdirSync(path.join(TARGET_PLUGIN_DIR, 'rules'), { recursive: true });
+    fs.copyFileSync(masterContractRulePath, path.join(TARGET_PLUGIN_DIR, 'rules', 'gravity-well-default.md'));
+  }
   const pluginEnableRes = await enablePluginLive(PLUGIN_ID, true);
   console.log(
     `[2/4] Installed Antigravity Plugin to: ${TARGET_PLUGIN_DIR} (Enabled via ${pluginEnableRes.method}).`
@@ -180,70 +166,11 @@ async function main() {
   }
 
   updateAgySidecarConfig(SIDECAR_ID, true);
-  let sidecarReloadMethod = 'config.json';
-  try {
-    let hotReloaded = false;
-    try {
-      const scList = await getSidecars();
-      const existing = (scList?.sidecars || []).find(
-        (s) => (s.sidecarId || s.config?.id || s.id) === SIDECAR_ID
-      );
-      const livePort = Number(existing?.webPort || 0);
-      const token = existing?.baseUrl
-        ? new URL(existing.baseUrl).searchParams.get('token') || ''
-        : '';
-
-      if (livePort > 0) {
-        // 1. Try clean zero-exit reload endpoint if supported (POST per F09)
-        try {
-          const r = await fetch(`http://127.0.0.1:${livePort}/api/reload`, {
-            method: 'POST',
-            headers: {
-              Origin: `http://127.0.0.1:${livePort}`,
-              ...(token ? { 'X-Sidecar-Token': token } : {}),
-            },
-          });
-          if (r.ok) {
-            hotReloaded = true;
-            await new Promise((res) => setTimeout(res, 350));
-          }
-        } catch {}
-
-        // 2. If old process didn't have /api/reload, terminate child and trigger launcher retry
-        if (!hotReloaded) {
-          try {
-            killSidecarProcessByPortOrPid(SIDECAR_ID);
-          } catch {}
-          await new Promise((res) => setTimeout(res, 250));
-        }
-
-        // 3. Always ensure launcher is not parked on diagnostic retry screen
-        try {
-          await fetch(
-            `http://127.0.0.1:${livePort}/__launcher/retry?token=${encodeURIComponent(token)}`,
-            {
-              method: 'POST',
-              headers: { Origin: `http://127.0.0.1:${livePort}` },
-            }
-          );
-          hotReloaded = true;
-          await new Promise((res) => setTimeout(res, 400));
-        } catch {}
-      }
-    } catch {}
-
-    await manageSidecar(SIDECAR_ID, 'SIDECAR_ACTION_ENABLE');
-    sidecarReloadMethod = hotReloaded
-      ? 'LanguageServerRPC (Zero-Downtime Hot-Reload + ManageSidecar)'
-      : 'LanguageServerRPC (ManageSidecar)';
-  } catch {
-    // Will start on next Antigravity poll/restart
-  }
   console.log(
-    `[3/4] Installed Auxiliary Pane UI Sidecar to: ${TARGET_SIDECAR_DIR} (Activated via ${sidecarReloadMethod}).`
+    `[3/4] Installed Auxiliary Pane UI Sidecar to: ${TARGET_SIDECAR_DIR} (Activated via config.json).`
   );
 
-  // 5. Seed initial telemetry in global sidecar_data so UI sidecar immediately resolves this workspace
+  // 5. Seed initial telemetry in global sidecar_data if not already present so UI sidecar immediately resolves this workspace
   try {
     const globalTelDir = path.join(
       os.homedir(),
@@ -276,16 +203,15 @@ async function main() {
         },
       ],
     };
-    fs.writeFileSync(
-      path.join(globalTelDir, 'telemetry.json'),
-      JSON.stringify(seedTelemetry, null, 2),
-      'utf8'
-    );
-    fs.writeFileSync(
-      path.join(REPO_ROOT, '.harness', 'runtime', 'telemetry.json'),
-      JSON.stringify(seedTelemetry, null, 2),
-      'utf8'
-    );
+    const globalTelPath = path.join(globalTelDir, 'telemetry.json');
+    if (!fs.existsSync(globalTelPath)) {
+      fs.writeFileSync(globalTelPath, JSON.stringify(seedTelemetry, null, 2), 'utf8');
+    }
+    const localTelPath = path.join(REPO_ROOT, '.harness', 'runtime', 'telemetry.json');
+    if (!fs.existsSync(localTelPath)) {
+      fs.mkdirSync(path.dirname(localTelPath), { recursive: true });
+      fs.writeFileSync(localTelPath, JSON.stringify(seedTelemetry, null, 2), 'utf8');
+    }
   } catch {}
 
   console.log('[4/4] Verification & Links:');

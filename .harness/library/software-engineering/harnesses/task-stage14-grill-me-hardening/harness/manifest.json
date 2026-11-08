@@ -3,7 +3,8 @@
   "task_id": "task-stage14-grill-me-hardening",
   "domain": "software-engineering",
   "adopted_at": "2026-11-07T21:41:07.545Z",
-  "git_revision": "c619f9d",
-  "status": "active",
+  "git_revision": "07c92b4",
+  "status": "candidate",
+  "verification_status": "disputed",
   "synthetic": false
 }

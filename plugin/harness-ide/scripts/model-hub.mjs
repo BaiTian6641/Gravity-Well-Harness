@@ -8,6 +8,7 @@ import {
   redactSecrets,
   resolveSecretCredential,
   setSecretInVault,
+  setSecretsInVaultBatch,
   validateCredentialOrigin,
 } from './secret-vault.mjs';
 
@@ -791,6 +792,10 @@ function getHubConfigFile(workspaceRoot) {
   return path.join(workspaceRoot, '.harness', 'runtime', 'model-search-hub.json');
 }
 
+export function getHubConfigLockFile(workspaceRoot) {
+  return path.join(workspaceRoot, '.harness', 'runtime', 'model-search-hub.lock');
+}
+
 function getChatContextUsageFile(workspaceRoot) {
   return path.join(workspaceRoot, '.harness', 'runtime', 'chat-context-usage.json');
 }
@@ -799,19 +804,34 @@ function getMessageBusFile(workspaceRoot) {
   return path.join(workspaceRoot, '.harness', 'runtime', 'message-bus.json');
 }
 
-function getMessageBusLockFile(workspaceRoot) {
+export function getMessageBusLockFile(workspaceRoot) {
   return path.join(workspaceRoot, '.harness', 'runtime', 'message-bus.lock');
 }
 
 const SLEEP_ARRAY = new Int32Array(new SharedArrayBuffer(4));
 function sleepSyncMs(ms) {
+  const waitMs = Math.max(1, Math.floor(Number(ms) || 1));
   try {
-    Atomics.wait(SLEEP_ARRAY, 0, 0, Math.max(1, ms));
+    Atomics.wait(SLEEP_ARRAY, 0, 0, waitMs);
   } catch {
-    const deadline = Date.now() + Math.max(1, ms);
+    const deadline = Date.now() + waitMs;
     while (Date.now() < deadline) {
       // spin fallback
     }
+  }
+}
+
+function isProcessAlive(pid) {
+  const numPid = Number(pid);
+  if (!Number.isInteger(numPid) || numPid <= 0) return false;
+  try {
+    process.kill(numPid, 0);
+    return true;
+  } catch (err) {
+    if (err && err.code === 'ESRCH') {
+      return false;
+    }
+    return true;
   }
 }
 
@@ -821,13 +841,13 @@ function writeJsonAtomic(filePath, payload) {
   const serialized = JSON.stringify(payload, null, 2);
   fs.writeFileSync(tmpFile, serialized, { encoding: 'utf8', mode: 0o600 });
   let renamed = false;
-  for (let i = 0; i < 5; i += 1) {
+  for (let i = 0; i < 6; i += 1) {
     try {
       fs.renameSync(tmpFile, filePath);
       renamed = true;
       break;
     } catch (err) {
-      if (i < 4 && err && (err.code === 'EPERM' || err.code === 'EACCES' || err.code === 'EBUSY')) {
+      if (i < 5 && err && (err.code === 'EPERM' || err.code === 'EACCES' || err.code === 'EBUSY')) {
         sleepSyncMs(5 * (i + 1));
         continue;
       }
@@ -842,42 +862,130 @@ function writeJsonAtomic(filePath, payload) {
   }
 }
 
-function withMessageBusLock(workspaceRoot, fn, maxRetries = 250) {
-  const lockFile = getMessageBusLockFile(workspaceRoot);
+function executeWithExclusiveLock(lockFile, fn, timeoutMs = 5000, errorCode = 'MESSAGE_BUS_LOCK_TIMEOUT') {
   fs.mkdirSync(path.dirname(lockFile), { recursive: true });
-  let fd = null;
-  for (let attempt = 0; attempt < maxRetries; attempt += 1) {
+  const effectiveTimeoutMs = Math.max(1, Number(timeoutMs ?? 5000));
+  const deadline = Date.now() + effectiveTimeoutMs;
+  const ownerToken = `${process.pid}:${Date.now()}:${crypto.randomBytes(4).toString('hex')}`;
+  let acquired = false;
+
+  while (true) {
     try {
-      fd = fs.openSync(lockFile, 'wx');
-      fs.writeFileSync(fd, `${process.pid}:${Date.now()}`, 'utf8');
+      const fd = fs.openSync(lockFile, 'wx', 0o600);
+      try {
+        fs.writeFileSync(
+          fd,
+          JSON.stringify({
+            pid: process.pid,
+            acquiredAt: Date.now(),
+            token: ownerToken,
+          }),
+          'utf8'
+        );
+      } finally {
+        try {
+          fs.closeSync(fd);
+        } catch {}
+      }
+      acquired = true;
       break;
     } catch (err) {
       if (err && err.code === 'EEXIST') {
         try {
           const stat = fs.statSync(lockFile);
-          if (Date.now() - stat.mtimeMs > 5000) {
-            fs.unlinkSync(lockFile);
-            continue;
+          let lockPid = null;
+          let acquiredAt = stat.mtimeMs;
+          try {
+            const raw = fs.readFileSync(lockFile, 'utf8').trim();
+            if (raw.startsWith('{')) {
+              const parsed = JSON.parse(raw);
+              if (parsed && typeof parsed === 'object') {
+                if (parsed.pid !== undefined) lockPid = Number(parsed.pid);
+                if (Number.isFinite(Number(parsed.acquiredAt)) && Number(parsed.acquiredAt) > 0) {
+                  acquiredAt = Number(parsed.acquiredAt);
+                }
+              }
+            } else if (raw.includes(':')) {
+              const [pidPart, tsPart] = raw.split(':');
+              lockPid = Number(pidPart);
+              if (Number.isFinite(Number(tsPart)) && Number(tsPart) > 0) {
+                acquiredAt = Number(tsPart);
+              }
+            }
+          } catch {}
+
+          const ageMs = Date.now() - acquiredAt;
+          const pidDead = lockPid ? !isProcessAlive(lockPid) : false;
+          if (ageMs > 10_000 && pidDead) {
+            try {
+              fs.unlinkSync(lockFile);
+              continue;
+            } catch {}
           }
         } catch {}
-        sleepSyncMs(4);
+
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          break;
+        }
+        sleepSyncMs(Math.min(8, Math.max(1, remaining)));
         continue;
       }
-      break;
+
+      if (Date.now() >= deadline) {
+        break;
+      }
+      sleepSyncMs(4);
     }
   }
+
+  if (!acquired) {
+    const err = new Error(
+      `Timed out after ${effectiveTimeoutMs}ms waiting for exclusive lock (${lockFile}).`
+    );
+    err.code = errorCode;
+    throw err;
+  }
+
+  const releaseLock = () => {
+    try {
+      if (fs.existsSync(lockFile)) {
+        fs.unlinkSync(lockFile);
+      }
+    } catch {}
+  };
+
+  let isAsync = false;
   try {
-    return fn();
+    const result = fn();
+    if (result && typeof result.then === 'function') {
+      isAsync = true;
+      return result.finally(releaseLock);
+    }
+    return result;
   } finally {
-    if (fd !== null) {
-      try {
-        fs.closeSync(fd);
-      } catch {}
-      try {
-        if (fs.existsSync(lockFile)) fs.unlinkSync(lockFile);
-      } catch {}
+    if (!isAsync) {
+      releaseLock();
     }
   }
+}
+
+export function withMessageBusLock(workspaceRoot, fn, timeoutMs = 5000) {
+  return executeWithExclusiveLock(
+    getMessageBusLockFile(workspaceRoot),
+    fn,
+    timeoutMs,
+    'MESSAGE_BUS_LOCK_TIMEOUT'
+  );
+}
+
+export function withHubConfigLock(workspaceRoot, fn, timeoutMs = 5000) {
+  return executeWithExclusiveLock(
+    getHubConfigLockFile(workspaceRoot),
+    fn,
+    timeoutMs,
+    'HUB_CONFIG_LOCK_TIMEOUT'
+  );
 }
 
 function maskKey(raw) {
@@ -1201,59 +1309,63 @@ export function loadHubConfig(workspaceRoot) {
   }
   const ideSettings = loadIdeSettings(workspaceRoot);
 
-  // Transactional plaintext key migration (F13): encrypt into vault and immediately scrub from disk
+  // Transactional plaintext key migration (F13): encrypt into vault in a single atomic batch and immediately scrub from disk
   let migratedFromHubFile = false;
+  const migratedBatch = {};
   if (saved.providers?.deepseek?.apiKey) {
-    setSecretInVault('DEEPSEEK_API_KEY', saved.providers.deepseek.apiKey);
+    migratedBatch.DEEPSEEK_API_KEY = saved.providers.deepseek.apiKey;
     delete saved.providers.deepseek.apiKey;
     migratedFromHubFile = true;
   }
   if (saved.providers?.['deepseek-official']?.apiKey) {
-    setSecretInVault('DEEPSEEK_API_KEY', saved.providers['deepseek-official'].apiKey);
+    migratedBatch.DEEPSEEK_API_KEY = saved.providers['deepseek-official'].apiKey;
     delete saved.providers['deepseek-official'].apiKey;
     migratedFromHubFile = true;
   }
   if (saved.providers?.opencodeGo?.apiKey) {
-    setSecretInVault('OPENCODE_API_KEY', saved.providers.opencodeGo.apiKey);
+    migratedBatch.OPENCODE_API_KEY = saved.providers.opencodeGo.apiKey;
     delete saved.providers.opencodeGo.apiKey;
     migratedFromHubFile = true;
   }
   if (saved.providers?.['opencode-go']?.apiKey) {
-    setSecretInVault('OPENCODE_API_KEY', saved.providers['opencode-go'].apiKey);
+    migratedBatch.OPENCODE_API_KEY = saved.providers['opencode-go'].apiKey;
     delete saved.providers['opencode-go'].apiKey;
     migratedFromHubFile = true;
   }
   if (saved.search?.tavilyApiKey) {
-    setSecretInVault('TAVILY_API_KEY', saved.search.tavilyApiKey);
+    migratedBatch.TAVILY_API_KEY = saved.search.tavilyApiKey;
     delete saved.search.tavilyApiKey;
     migratedFromHubFile = true;
   }
   if (saved.searchEngines?.tavily?.apiKey) {
-    setSecretInVault('TAVILY_API_KEY', saved.searchEngines.tavily.apiKey);
+    migratedBatch.TAVILY_API_KEY = saved.searchEngines.tavily.apiKey;
     delete saved.searchEngines.tavily.apiKey;
     migratedFromHubFile = true;
   }
   if (saved.search?.parallelApiKey) {
-    setSecretInVault('PARALLEL_API_KEY', saved.search.parallelApiKey);
+    migratedBatch.PARALLEL_API_KEY = saved.search.parallelApiKey;
     delete saved.search.parallelApiKey;
     migratedFromHubFile = true;
   }
   if (saved.searchEngines?.parallel?.apiKey) {
-    setSecretInVault('PARALLEL_API_KEY', saved.searchEngines.parallel.apiKey);
+    migratedBatch.PARALLEL_API_KEY = saved.searchEngines.parallel.apiKey;
     delete saved.searchEngines.parallel.apiKey;
     migratedFromHubFile = true;
   }
   if (saved.search?.jinaApiKey) {
-    setSecretInVault('JINA_API_KEY', saved.search.jinaApiKey);
+    migratedBatch.JINA_API_KEY = saved.search.jinaApiKey;
     delete saved.search.jinaApiKey;
     migratedFromHubFile = true;
   }
   if (saved.searchEngines?.jina?.apiKey) {
-    setSecretInVault('JINA_API_KEY', saved.searchEngines.jina.apiKey);
+    migratedBatch.JINA_API_KEY = saved.searchEngines.jina.apiKey;
     delete saved.searchEngines.jina.apiKey;
     migratedFromHubFile = true;
   }
 
+  if (Object.keys(migratedBatch).length > 0) {
+    setSecretsInVaultBatch(migratedBatch);
+  }
   if (migratedFromHubFile && fs.existsSync(file)) {
     writeJsonAtomic(file, saved);
   }
@@ -1464,109 +1576,116 @@ export function loadHubConfig(workspaceRoot) {
  * `~/.gemini/config/.secrets.vault.enc` (AES-256-GCM) and stripped from plaintext JSON files.
  */
 export function saveHubConfig(workspaceRoot, patch = {}) {
-  const current = loadHubConfig(workspaceRoot);
+  return withHubConfigLock(workspaceRoot, () => {
+    const current = loadHubConfig(workspaceRoot);
 
-  // Route any secret keys directly into the AES-256-GCM encrypted vault (never saved to workspace JSON)
-  const dsKey =
-    patch.providers?.deepseek?.apiKey || patch.providers?.['deepseek-official']?.apiKey;
-  if (dsKey) setSecretInVault('DEEPSEEK_API_KEY', dsKey);
+    // Route any secret keys directly into the AES-256-GCM encrypted vault in one atomic batch (never saved to workspace JSON)
+    const secretBatch = {};
+    const dsKey =
+      patch.providers?.deepseek?.apiKey || patch.providers?.['deepseek-official']?.apiKey;
+    if (dsKey) secretBatch.DEEPSEEK_API_KEY = dsKey;
 
-  const ocKey =
-    patch.providers?.opencodeGo?.apiKey || patch.providers?.['opencode-go']?.apiKey;
-  if (ocKey) setSecretInVault('OPENCODE_API_KEY', ocKey);
+    const ocKey =
+      patch.providers?.opencodeGo?.apiKey || patch.providers?.['opencode-go']?.apiKey;
+    if (ocKey) secretBatch.OPENCODE_API_KEY = ocKey;
 
-  const tvKey = patch.search?.tavilyApiKey || patch.searchEngines?.tavily?.apiKey;
-  if (tvKey) setSecretInVault('TAVILY_API_KEY', tvKey);
+    const tvKey = patch.search?.tavilyApiKey || patch.searchEngines?.tavily?.apiKey;
+    if (tvKey) secretBatch.TAVILY_API_KEY = tvKey;
 
-  const plKey = patch.search?.parallelApiKey || patch.searchEngines?.parallel?.apiKey;
-  if (plKey) setSecretInVault('PARALLEL_API_KEY', plKey);
+    const plKey = patch.search?.parallelApiKey || patch.searchEngines?.parallel?.apiKey;
+    if (plKey) secretBatch.PARALLEL_API_KEY = plKey;
 
-  const jnKey = patch.search?.jinaApiKey || patch.searchEngines?.jina?.apiKey;
-  if (jnKey) setSecretInVault('JINA_API_KEY', jnKey);
+    const jnKey = patch.search?.jinaApiKey || patch.searchEngines?.jina?.apiKey;
+    if (jnKey) secretBatch.JINA_API_KEY = jnKey;
 
-  const cleanDeepseekPatch = {
-    ...(patch.providers?.deepseek || {}),
-    ...(patch.providers?.['deepseek-official'] || {}),
-  };
-  delete cleanDeepseekPatch.apiKey;
+    if (Object.keys(secretBatch).length > 0) {
+      setSecretsInVaultBatch(secretBatch);
+    }
 
-  const cleanOpencodePatch = {
-    ...(patch.providers?.opencodeGo || {}),
-    ...(patch.providers?.['opencode-go'] || {}),
-  };
-  delete cleanOpencodePatch.apiKey;
-
-  const cleanSearchPatch = { ...(patch.search || {}) };
-  delete cleanSearchPatch.tavilyApiKey;
-  delete cleanSearchPatch.parallelApiKey;
-  delete cleanSearchPatch.jinaApiKey;
-
-  const next = {
-    ...current,
-    activeModelId: patch.activeModelId || current.activeModelId,
-    chatBoxNativeModel: patch.chatBoxNativeModel || current.chatBoxNativeModel,
-    userPinnedModelOverride:
-      patch.userPinnedModelOverride !== undefined
-        ? Boolean(patch.userPinnedModelOverride)
-        : current.userPinnedModelOverride,
-    activeReasoningDepth: patch.activeReasoningDepth || current.activeReasoningDepth,
-    activeReasoningEffort: patch.activeReasoningEffort || current.activeReasoningEffort,
-    subagentModelRouting: {
-      ...current.subagentModelRouting,
-      ...(patch.subagentModelRouting || {}),
-    },
-    modelReasoningDepths: {
-      ...current.modelReasoningDepths,
-      ...(patch.modelReasoningDepths || {}),
-      ...(patch.modelReasoningOverrides || {}),
-    },
-    providers: {
-      deepseek: {
-        ...current.providers.deepseek,
-        ...cleanDeepseekPatch,
-      },
-      opencodeGo: {
-        ...current.providers.opencodeGo,
-        ...cleanOpencodePatch,
-      },
-    },
-    search: {
-      ...current.search,
-      ...cleanSearchPatch,
-    },
-    selfImprovement: {
-      ...current.selfImprovement,
-      ...(patch.selfImprovement || {}),
-    },
-    updatedAt: new Date().toISOString(),
-  };
-  delete next.secretVault;
-
-  const file = getHubConfigFile(workspaceRoot);
-  writeJsonAtomic(file, next);
-
-  // Sync non-secret preferences to Antigravity IDE Settings (.vscode/settings.json)
-  try {
-    const vsFile = getVscodeSettingsFile(workspaceRoot);
-    const existingVs = loadIdeSettings(workspaceRoot);
-    const updatedVs = {
-      $schema: '../schemas/antigravity-settings.schema.json',
-      ...existingVs,
-      'antigravity.harness.activeModel': next.activeModelId,
-      'antigravity.harness.chatBoxNativeModel': next.chatBoxNativeModel,
-      'antigravity.harness.reasoningDepth': next.activeReasoningDepth,
-      'antigravity.harness.reasoningEffort': next.activeReasoningEffort,
-      'antigravity.harness.deepseek.baseUrl': next.providers.deepseek.baseUrl,
-      'antigravity.harness.opencodeGo.baseUrl': next.providers.opencodeGo.baseUrl,
-      'antigravity.harness.search.defaultEngine': next.search.defaultEngine,
-      'antigravity.harness.swarmRoleModels': next.subagentModelRouting,
+    const cleanDeepseekPatch = {
+      ...(patch.providers?.deepseek || {}),
+      ...(patch.providers?.['deepseek-official'] || {}),
     };
-    writeJsonAtomic(vsFile, updatedVs);
-  } catch {
-    // ignore if workspace is read-only
-  }
+    delete cleanDeepseekPatch.apiKey;
 
-  return loadHubConfig(workspaceRoot);
+    const cleanOpencodePatch = {
+      ...(patch.providers?.opencodeGo || {}),
+      ...(patch.providers?.['opencode-go'] || {}),
+    };
+    delete cleanOpencodePatch.apiKey;
+
+    const cleanSearchPatch = { ...(patch.search || {}) };
+    delete cleanSearchPatch.tavilyApiKey;
+    delete cleanSearchPatch.parallelApiKey;
+    delete cleanSearchPatch.jinaApiKey;
+
+    const next = {
+      ...current,
+      activeModelId: patch.activeModelId || current.activeModelId,
+      chatBoxNativeModel: patch.chatBoxNativeModel || current.chatBoxNativeModel,
+      userPinnedModelOverride:
+        patch.userPinnedModelOverride !== undefined
+          ? Boolean(patch.userPinnedModelOverride)
+          : current.userPinnedModelOverride,
+      activeReasoningDepth: patch.activeReasoningDepth || current.activeReasoningDepth,
+      activeReasoningEffort: patch.activeReasoningEffort || current.activeReasoningEffort,
+      subagentModelRouting: {
+        ...current.subagentModelRouting,
+        ...(patch.subagentModelRouting || {}),
+      },
+      modelReasoningDepths: {
+        ...current.modelReasoningDepths,
+        ...(patch.modelReasoningDepths || {}),
+        ...(patch.modelReasoningOverrides || {}),
+      },
+      providers: {
+        deepseek: {
+          ...current.providers.deepseek,
+          ...cleanDeepseekPatch,
+        },
+        opencodeGo: {
+          ...current.providers.opencodeGo,
+          ...cleanOpencodePatch,
+        },
+      },
+      search: {
+        ...current.search,
+        ...cleanSearchPatch,
+      },
+      selfImprovement: {
+        ...current.selfImprovement,
+        ...(patch.selfImprovement || {}),
+      },
+      updatedAt: new Date().toISOString(),
+    };
+    delete next.secretVault;
+
+    const file = getHubConfigFile(workspaceRoot);
+    writeJsonAtomic(file, next);
+
+    // Sync non-secret preferences to Antigravity IDE Settings (.vscode/settings.json)
+    try {
+      const vsFile = getVscodeSettingsFile(workspaceRoot);
+      const existingVs = loadIdeSettings(workspaceRoot);
+      const updatedVs = {
+        $schema: '../schemas/antigravity-settings.schema.json',
+        ...existingVs,
+        'antigravity.harness.activeModel': next.activeModelId,
+        'antigravity.harness.chatBoxNativeModel': next.chatBoxNativeModel,
+        'antigravity.harness.reasoningDepth': next.activeReasoningDepth,
+        'antigravity.harness.reasoningEffort': next.activeReasoningEffort,
+        'antigravity.harness.deepseek.baseUrl': next.providers.deepseek.baseUrl,
+        'antigravity.harness.opencodeGo.baseUrl': next.providers.opencodeGo.baseUrl,
+        'antigravity.harness.search.defaultEngine': next.search.defaultEngine,
+        'antigravity.harness.swarmRoleModels': next.subagentModelRouting,
+      };
+      writeJsonAtomic(vsFile, updatedVs);
+    } catch {
+      // ignore if workspace is read-only
+    }
+
+    return loadHubConfig(workspaceRoot);
+  });
 }
 
 function resolveTelemetryFallbackUsedTokens(workspaceRoot) {
@@ -1654,6 +1773,55 @@ export function getEnrichedModelCatalog(workspaceRoot, contextAnalytics = null) 
   });
 }
 
+const NATIVE_FETCH = typeof globalThis.fetch === 'function' ? globalThis.fetch : null;
+
+export function isDemoOrSimulationMode(options = {}, cfg = null) {
+  if (
+    options.allowSimulation === true ||
+    options.allow_simulation === true ||
+    options.executionMode === 'demo' ||
+    options.execution_mode === 'demo' ||
+    options.demoMode === true ||
+    options.demo_mode === true ||
+    options.strictExecution === false ||
+    options.strict_execution === false ||
+    cfg?.executionMode === 'demo' ||
+    cfg?.allowSimulation === true ||
+    process.env.HARNESS_DEFAULT_DEMO_MODE === '1'
+  ) {
+    return true;
+  }
+  return false;
+}
+
+export function isExplicitStrictMode(options = {}, cfg = null) {
+  if (
+    options.strictExecution === true ||
+    options.strict_execution === true ||
+    options.allowSimulation === false ||
+    options.allow_simulation === false ||
+    options.executionMode === 'strict' ||
+    options.execution_mode === 'strict' ||
+    options.executionMode === 'production' ||
+    options.execution_mode === 'production' ||
+    options.demoMode === false ||
+    options.demo_mode === false ||
+    cfg?.strictExecutionDefault === true ||
+    process.env.HARNESS_STRICT_EXECUTION === '1'
+  ) {
+    return true;
+  }
+  return false;
+}
+
+export function isStrictExecution(options = {}, cfg = null) {
+  if (isExplicitStrictMode(options, cfg)) return true;
+  if (isDemoOrSimulationMode(options, cfg)) return false;
+  return false;
+}
+
+export const resolveStrictMode = isStrictExecution;
+
 /**
  * Loads the Inter-Agent Message Injection & Convey Bus state.
  */
@@ -1663,6 +1831,7 @@ export function loadMessageBus(workspaceRoot) {
     return {
       revision: 1,
       messages: [],
+      consumedIds: [],
     };
   }
   try {
@@ -1670,54 +1839,76 @@ export function loadMessageBus(workspaceRoot) {
     return {
       revision: Number(parsed.revision || 1),
       messages: Array.isArray(parsed.messages) ? parsed.messages : [],
+      consumedIds: Array.isArray(parsed.consumedIds) ? parsed.consumedIds : [],
     };
   } catch {
-    return { revision: 1, messages: [] };
+    return { revision: 1, messages: [], consumedIds: [] };
   }
 }
 
 /**
  * Saves the Inter-Agent Message Injection & Convey Bus state atomically.
- * Never drops unconsumed messages (`!m.consumed`) during retention pruning (F04).
+ * Never drops unconsumed messages (`!m.consumed`) during retention pruning (F04),
+ * and retains durable `consumedIds` so consumed message IDs cannot be redelivered.
  */
 export function saveMessageBus(workspaceRoot, bus) {
   const file = getMessageBusFile(workspaceRoot);
   const allMessages = Array.isArray(bus.messages) ? bus.messages : [];
+  const consumedIdsSet = new Set(Array.isArray(bus.consumedIds) ? bus.consumedIds : []);
   let consumedCount = 0;
   const retainedMessages = allMessages.filter((m) => {
     if (!m || typeof m !== 'object') return false;
+    if (m.consumed && m.id) {
+      consumedIdsSet.add(m.id);
+    }
     if (!m.consumed) return true;
     consumedCount += 1;
-    return consumedCount <= 80;
+    return consumedCount <= 500;
   });
 
+  const consumedIds = Array.from(consumedIdsSet).slice(-2000);
   const payload = {
     revision: Number(bus.revision || 1),
     updatedAt: new Date().toISOString(),
     messages: retainedMessages,
+    consumedIds,
   };
   writeJsonAtomic(file, payload);
   return payload;
 }
 
 /**
- * Injects or conveys a message across agents/models in the swarm with file locking
- * and atomic persistence (F04).
+ * Injects or conveys a message across agents/models in the swarm with fail-closed file locking,
+ * durable idempotency, and honest delivery state transitions (F04).
  */
 export async function injectOrConveySwarmMessage(workspaceRoot, input = {}) {
   const cfg = loadHubConfig(workspaceRoot);
+  const lockTimeoutMs = Number(input.lockTimeoutMs || 5000);
 
-  const fromAgent = input.fromAgent || 'main-orchestrator';
-  const toAgent = input.toAgent || 'harness-proposer';
-  const fromModel = input.fromModel || cfg.activeModelId || 'deepseek-v4-pro';
-  const resolvedToModel = resolveModelMeta(
-    input.toModel || cfg.subagentModelRouting?.proposerModelId || 'deepseek-v4-pro'
-  );
-  const toModel = resolvedToModel.id;
-  const messageType = input.type || 'INJECT_DIRECTIVE';
+  const fromAgent = input.fromAgent || input.from_agent || 'main-orchestrator';
+  const toAgent = input.toAgent || input.to_agent || 'harness-proposer';
+  const fromModel = input.fromModel || input.from_model || cfg.activeModelId || 'deepseek-v4-pro';
+  const explicitToModel = input.toModel ?? input.to_model;
+  const matchedExplicitToModel =
+    explicitToModel !== undefined && explicitToModel !== null && String(explicitToModel).trim() !== ''
+      ? findModelInCatalog(explicitToModel)
+      : null;
+  const resolvedToModel =
+    matchedExplicitToModel ||
+    resolveModelMeta(cfg.subagentModelRouting?.proposerModelId || 'deepseek-v4-pro');
+  const toModel =
+    explicitToModel !== undefined &&
+    explicitToModel !== null &&
+    String(explicitToModel).trim() !== '' &&
+    !matchedExplicitToModel
+      ? String(explicitToModel).trim()
+      : resolvedToModel.id;
+
+  const messageType = input.type || input.messageType || input.message_type || 'INJECT_DIRECTIVE';
   const priority = input.priority || 'high';
   const reasoningDepth =
     input.reasoningDepth ||
+    input.reasoning_depth ||
     cfg.modelReasoningDepths?.[toModel] ||
     cfg.activeReasoningDepth ||
     'balanced';
@@ -1727,11 +1918,69 @@ export async function injectOrConveySwarmMessage(workspaceRoot, input = {}) {
     throw new Error('Message content is required for swarm message injection/convey.');
   }
 
-  const nowIso = new Date().toISOString();
+  const requestedId = String(input.id || input.messageId || input.message_id || '').trim();
   const msgId =
-    input.id ||
-    `msg-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
+    requestedId || `msg-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
 
+  // 1. Check durable idempotency under exclusive message bus lock BEFORE dispatching any model call
+  const idempotencyCheck = withMessageBusLock(
+    workspaceRoot,
+    () => {
+      const bus = loadMessageBus(workspaceRoot);
+      if (requestedId) {
+        const existing = bus.messages.find((m) => m && m.id === requestedId);
+        if (existing) {
+          return {
+            duplicate: true,
+            ok: existing.status !== 'DELIVERY_FAILED',
+            idempotentDuplicate: true,
+            status: existing.status,
+            ...(existing.error ? { error: existing.error } : {}),
+            message: existing,
+            busRevision: bus.revision,
+          };
+        }
+        if (Array.isArray(bus.consumedIds) && bus.consumedIds.includes(requestedId)) {
+          const tombstoned = {
+            id: requestedId,
+            fromAgent,
+            toAgent,
+            fromModel,
+            toModel,
+            direction: messageType,
+            priority,
+            reasoningDepth,
+            content,
+            workspaceRoot: path.resolve(workspaceRoot || process.cwd()),
+            status: 'DELIVERED',
+            dispatchState: 'recipient_acknowledged',
+            consumed: true,
+            deliveries: {
+              [toAgent]: { state: 'consumed', ackedAt: new Date().toISOString() },
+            },
+            pendingForPreInvocation: false,
+          };
+          return {
+            duplicate: true,
+            ok: true,
+            idempotentDuplicate: true,
+            status: 'DELIVERED',
+            message: tombstoned,
+            busRevision: bus.revision,
+          };
+        }
+      }
+      return { duplicate: false, busRevision: bus.revision };
+    },
+    lockTimeoutMs
+  );
+
+  if (idempotencyCheck.duplicate) {
+    const { duplicate, ...dupResponse } = idempotencyCheck;
+    return dupResponse;
+  }
+
+  const nowIso = new Date().toISOString();
   const entry = {
     id: msgId,
     fromAgent,
@@ -1743,9 +1992,11 @@ export async function injectOrConveySwarmMessage(workspaceRoot, input = {}) {
     reasoningDepth,
     content,
     workspaceRoot: path.resolve(workspaceRoot || process.cwd()),
-    runId: input.runId || null,
-    candidateId: input.candidateId || null,
-    status: 'INJECTED',
+    runId: input.runId || input.run_id || null,
+    candidateId: input.candidateId || input.candidate_id || null,
+    status: 'QUEUED',
+    dispatchState: 'accepted_queued',
+    executorCompleted: false,
     consumed: false,
     deliveries: {},
     pendingForPreInvocation: true,
@@ -1754,37 +2005,164 @@ export async function injectOrConveySwarmMessage(workspaceRoot, input = {}) {
     replySummary: null,
   };
 
-  if (input.executeTargetModel !== false && toAgent !== 'main-orchestrator') {
+  // Enforce provider enablement even when executeTargetModel is false if a specific provider model was targeted
+  const targetProvider = matchedExplicitToModel?.provider || resolvedToModel?.provider;
+  const targetProviderDisabled =
+    toAgent !== 'all' &&
+    ((targetProvider === 'deepseek-official' && cfg.providers?.deepseek?.enabled === false) ||
+      (targetProvider === 'opencode-go' && cfg.providers?.opencodeGo?.enabled === false));
+
+  if (input.executeTargetModel !== false && toAgent !== 'main-orchestrator' && toAgent !== 'all') {
     const modelReply = await invokeUnifiedModel(workspaceRoot, {
       modelId: toModel,
       reasoningDepth,
       systemPrompt: `You are ${toAgent} running on model ${toModel} (reasoningDepth=${reasoningDepth}) inside Gravity Well Harness. Receive the ${messageType} from ${fromAgent} (${fromModel}) and respond with a concise, high-signal action report or peer critique.`,
       prompt: content,
+      strictExecution: input.strictExecution ?? input.strict_execution,
+      allowSimulation: input.allowSimulation ?? input.allow_simulation,
+      executionMode: input.executionMode ?? input.execution_mode,
+      demoMode: input.demoMode ?? input.demo_mode,
+      timeoutMs: input.timeoutMs ?? input.timeout_ms,
+      endpoint: input.endpoint,
+      baseUrl: input.baseUrl ?? input.base_url,
     });
+
+    if (!modelReply || modelReply.ok !== true) {
+      entry.status = 'DELIVERY_FAILED';
+      entry.dispatchState = 'delivery_failed';
+      entry.executorCompleted = false;
+      entry.error = modelReply?.error || 'Target model execution failed';
+      entry.failureStatus = modelReply?.status || 'failed';
+      entry.deliveredAt = null;
+      entry.pendingForPreInvocation = false;
+      entry.replySummary = null;
+      entry.reasoningPreview = null;
+      entry.providerUsed = modelReply?.provider || targetProvider || 'unknown';
+      entry.executionMode = modelReply?.mode || 'failed';
+
+      const failedSave = withMessageBusLock(
+        workspaceRoot,
+        () => {
+          const bus = loadMessageBus(workspaceRoot);
+          const existing = bus.messages.find((m) => m && m.id === entry.id);
+          if (existing) {
+            return { existing, busRevision: bus.revision };
+          }
+          bus.messages.unshift(entry);
+          bus.revision = (bus.revision || 1) + 1;
+          const saved = saveMessageBus(workspaceRoot, bus);
+          return { existing: null, busRevision: saved.revision };
+        },
+        lockTimeoutMs
+      );
+
+      if (failedSave.existing) {
+        return {
+          ok: failedSave.existing.status !== 'DELIVERY_FAILED',
+          idempotentDuplicate: true,
+          status: failedSave.existing.status,
+          ...(failedSave.existing.error ? { error: failedSave.existing.error } : {}),
+          message: failedSave.existing,
+          busRevision: failedSave.busRevision,
+        };
+      }
+
+      return {
+        ok: false,
+        status: modelReply?.status || 'delivery_failed',
+        error: entry.error,
+        message: entry,
+        busRevision: failedSave.busRevision,
+      };
+    }
+
     entry.status = 'DELIVERED';
+    entry.dispatchState = 'executor_completed';
+    entry.executorCompleted = true;
     entry.deliveredAt = new Date().toISOString();
     entry.replySummary = modelReply.content?.slice(0, 360) || '';
     entry.reasoningPreview = modelReply.reasoningContent?.slice(0, 280) || '';
     entry.providerUsed = modelReply.provider;
     entry.executionMode = modelReply.mode;
+  } else if (
+    targetProviderDisabled &&
+    explicitToModel !== undefined &&
+    explicitToModel !== null &&
+    String(explicitToModel).trim() !== ''
+  ) {
+    entry.status = 'DELIVERY_FAILED';
+    entry.dispatchState = 'delivery_failed';
+    entry.executorCompleted = false;
+    entry.error = `Provider ${targetProvider} is disabled`;
+    entry.failureStatus = 'disabled';
+    entry.deliveredAt = null;
+    entry.pendingForPreInvocation = false;
+
+    const disabledSave = withMessageBusLock(
+      workspaceRoot,
+      () => {
+        const bus = loadMessageBus(workspaceRoot);
+        const existing = bus.messages.find((m) => m && m.id === entry.id);
+        if (existing) {
+          return { existing, busRevision: bus.revision };
+        }
+        bus.messages.unshift(entry);
+        bus.revision = (bus.revision || 1) + 1;
+        const saved = saveMessageBus(workspaceRoot, bus);
+        return { existing: null, busRevision: saved.revision };
+      },
+      lockTimeoutMs
+    );
+
+    return {
+      ok: false,
+      status: 'disabled',
+      error: entry.error,
+      message: entry,
+      busRevision: disabledSave.busRevision,
+    };
   }
 
-  const savedBus = withMessageBusLock(workspaceRoot, () => {
-    const bus = loadMessageBus(workspaceRoot);
-    const existingIdx = bus.messages.findIndex((m) => m && m.id === entry.id);
-    if (existingIdx >= 0) {
-      bus.messages[existingIdx] = entry;
-    } else {
+  const savedResult = withMessageBusLock(
+    workspaceRoot,
+    () => {
+      const bus = loadMessageBus(workspaceRoot);
+      const existing = bus.messages.find((m) => m && m.id === entry.id);
+      if (existing) {
+        return {
+          duplicate: true,
+          existing,
+          busRevision: bus.revision,
+        };
+      }
       bus.messages.unshift(entry);
-    }
-    bus.revision = (bus.revision || 1) + 1;
-    return saveMessageBus(workspaceRoot, bus);
-  });
+      bus.revision = (bus.revision || 1) + 1;
+      const saved = saveMessageBus(workspaceRoot, bus);
+      return {
+        duplicate: false,
+        existing: entry,
+        busRevision: saved.revision,
+      };
+    },
+    lockTimeoutMs
+  );
+
+  if (savedResult.duplicate) {
+    return {
+      ok: savedResult.existing.status !== 'DELIVERY_FAILED',
+      idempotentDuplicate: true,
+      status: savedResult.existing.status,
+      ...(savedResult.existing.error ? { error: savedResult.existing.error } : {}),
+      message: savedResult.existing,
+      busRevision: savedResult.busRevision,
+    };
+  }
 
   return {
     ok: true,
+    status: entry.status,
     message: entry,
-    busRevision: savedBus.revision,
+    busRevision: savedResult.busRevision,
   };
 }
 
@@ -1796,86 +2174,122 @@ export async function injectOrConveySwarmMessage(workspaceRoot, input = {}) {
  * - `m.toAgent === 'all'` (broadcast).
  */
 export function consumePendingSwarmMessages(workspaceRoot, targetAgent, options = {}) {
-  return withMessageBusLock(workspaceRoot, () => {
-    const bus = loadMessageBus(workspaceRoot);
-    const pending = [];
-    let changed = false;
-    const nowIso = new Date().toISOString();
-    const reqTarget = targetAgent ? String(targetAgent).trim() : '';
-    const isAllRequest = !reqTarget || reqTarget === 'all';
+  let resolvedTarget = targetAgent;
+  let resolvedOptions = options || {};
+  if (targetAgent && typeof targetAgent === 'object' && !Array.isArray(targetAgent)) {
+    resolvedOptions = { ...targetAgent, ...(options || {}) };
+    resolvedTarget =
+      targetAgent.recipient ||
+      targetAgent.targetAgent ||
+      targetAgent.target_agent ||
+      targetAgent.toAgent ||
+      targetAgent.to_agent ||
+      '';
+  }
+  const lockTimeoutMs = Number(resolvedOptions.lockTimeoutMs || 5000);
+  return withMessageBusLock(
+    workspaceRoot,
+    () => {
+      const bus = loadMessageBus(workspaceRoot);
+      bus.consumedIds = Array.isArray(bus.consumedIds) ? bus.consumedIds : [];
+      const pending = [];
+      let changed = false;
+      const nowIso = new Date().toISOString();
+      const reqTarget = resolvedTarget ? String(resolvedTarget).trim() : '';
+      const isAllRequest = !reqTarget || reqTarget === 'all';
 
-    for (const m of bus.messages) {
-      if (!m || typeof m !== 'object') continue;
-      if (options.runId && m.runId && m.runId !== options.runId) continue;
-      if (options.candidateId && m.candidateId && m.candidateId !== options.candidateId) continue;
-
-      m.deliveries = m.deliveries && typeof m.deliveries === 'object' ? m.deliveries : {};
-
-      const isBroadcast = m.toAgent === 'all';
-      const matchesRecipient =
-        isAllRequest || m.toAgent === reqTarget || isBroadcast;
-
-      if (!matchesRecipient) {
-        continue;
-      }
-
-      if (isBroadcast && !isAllRequest) {
-        if (m.deliveries[reqTarget]?.state === 'consumed') {
+      for (const m of bus.messages) {
+        if (!m || typeof m !== 'object') continue;
+        if (m.status === 'DELIVERY_FAILED') continue;
+        if (resolvedOptions.runId && m.runId && m.runId !== resolvedOptions.runId) continue;
+        if (
+          resolvedOptions.candidateId &&
+          m.candidateId &&
+          m.candidateId !== resolvedOptions.candidateId
+        ) {
           continue;
         }
-        m.deliveries[reqTarget] = {
-          state: 'consumed',
-          ackedAt: nowIso,
-        };
-        m.status = 'DELIVERED';
-        m.deliveredAt = m.deliveredAt || nowIso;
-        pending.push(m);
-        changed = true;
-        continue;
-      }
 
-      if (m.toAgent === reqTarget && !isAllRequest) {
-        if (m.consumed === true || m.deliveries[reqTarget]?.state === 'consumed') {
+        m.deliveries = m.deliveries && typeof m.deliveries === 'object' ? m.deliveries : {};
+
+        const isBroadcast = m.toAgent === 'all';
+        const matchesRecipient =
+          isAllRequest || m.toAgent === reqTarget || isBroadcast;
+
+        if (!matchesRecipient) {
           continue;
         }
-        m.deliveries[reqTarget] = {
-          state: 'consumed',
-          ackedAt: nowIso,
-        };
-        m.consumed = true;
-        m.pendingForPreInvocation = false;
-        m.status = 'DELIVERED';
-        m.deliveredAt = m.deliveredAt || nowIso;
-        pending.push(m);
-        changed = true;
-        continue;
-      }
 
-      if (isAllRequest) {
-        if (m.consumed === true) {
+        if (isBroadcast && !isAllRequest) {
+          if (m.deliveries[reqTarget]?.state === 'consumed') {
+            continue;
+          }
+          m.deliveries[reqTarget] = {
+            state: 'consumed',
+            ackedAt: nowIso,
+          };
+          m.status = 'CONSUMED';
+          m.dispatchState = 'recipient_acknowledged';
+          m.deliveredAt = m.deliveredAt || nowIso;
+          pending.push(m);
+          changed = true;
           continue;
         }
-        const key = m.toAgent || 'all';
-        m.deliveries[key] = {
-          state: 'consumed',
-          ackedAt: nowIso,
-        };
-        m.consumed = true;
-        m.pendingForPreInvocation = false;
-        m.status = 'DELIVERED';
-        m.deliveredAt = m.deliveredAt || nowIso;
-        pending.push(m);
-        changed = true;
+
+        if (m.toAgent === reqTarget && !isAllRequest) {
+          if (m.consumed === true || m.deliveries[reqTarget]?.state === 'consumed') {
+            continue;
+          }
+          m.deliveries[reqTarget] = {
+            state: 'consumed',
+            ackedAt: nowIso,
+          };
+          m.consumed = true;
+          m.consumedAt = nowIso;
+          m.pendingForPreInvocation = false;
+          m.status = 'CONSUMED';
+          m.dispatchState = 'recipient_acknowledged';
+          m.deliveredAt = m.deliveredAt || nowIso;
+          if (m.id && !bus.consumedIds.includes(m.id)) {
+            bus.consumedIds.push(m.id);
+          }
+          pending.push(m);
+          changed = true;
+          continue;
+        }
+
+        if (isAllRequest) {
+          if (m.consumed === true) {
+            continue;
+          }
+          const key = m.toAgent || 'all';
+          m.deliveries[key] = {
+            state: 'consumed',
+            ackedAt: nowIso,
+          };
+          m.consumed = true;
+          m.consumedAt = nowIso;
+          m.pendingForPreInvocation = false;
+          m.status = 'CONSUMED';
+          m.dispatchState = 'recipient_acknowledged';
+          m.deliveredAt = m.deliveredAt || nowIso;
+          if (m.id && !bus.consumedIds.includes(m.id)) {
+            bus.consumedIds.push(m.id);
+          }
+          pending.push(m);
+          changed = true;
+        }
       }
-    }
 
-    if (changed) {
-      bus.revision = (bus.revision || 1) + 1;
-      saveMessageBus(workspaceRoot, bus);
-    }
+      if (changed) {
+        bus.revision = (bus.revision || 1) + 1;
+        saveMessageBus(workspaceRoot, bus);
+      }
 
-    return pending;
-  });
+      return pending;
+    },
+    lockTimeoutMs
+  );
 }
 
 /**
@@ -1893,35 +2307,41 @@ export function consumePendingInjectedMessages(
     return direct;
   }
 
-  return withMessageBusLock(workspaceRoot, () => {
-    const bus = loadMessageBus(workspaceRoot);
-    const pending = [];
-    let changed = false;
-    const nowIso = new Date().toISOString();
+  const lockTimeoutMs = Number(options.lockTimeoutMs || 5000);
+  return withMessageBusLock(
+    workspaceRoot,
+    () => {
+      const bus = loadMessageBus(workspaceRoot);
+      const pending = [];
+      let changed = false;
+      const nowIso = new Date().toISOString();
 
-    for (const m of bus.messages) {
-      if (!m || typeof m !== 'object') continue;
-      if (
-        m.fromAgent === 'main-orchestrator' &&
-        Boolean(m.replySummary) &&
-        m.pendingForPreInvocation !== false &&
-        !m.preInvocationNotified
-      ) {
-        m.preInvocationNotified = true;
-        m.pendingForPreInvocation = false;
-        m.deliveredAt = m.deliveredAt || nowIso;
-        pending.push(m);
-        changed = true;
+      for (const m of bus.messages) {
+        if (!m || typeof m !== 'object') continue;
+        if (m.status === 'DELIVERY_FAILED') continue;
+        if (
+          m.fromAgent === 'main-orchestrator' &&
+          Boolean(m.replySummary) &&
+          m.pendingForPreInvocation !== false &&
+          !m.preInvocationNotified
+        ) {
+          m.preInvocationNotified = true;
+          m.pendingForPreInvocation = false;
+          m.deliveredAt = m.deliveredAt || nowIso;
+          pending.push(m);
+          changed = true;
+        }
       }
-    }
 
-    if (changed) {
-      bus.revision = (bus.revision || 1) + 1;
-      saveMessageBus(workspaceRoot, bus);
-    }
+      if (changed) {
+        bus.revision = (bus.revision || 1) + 1;
+        saveMessageBus(workspaceRoot, bus);
+      }
 
-    return pending;
-  });
+      return pending;
+    },
+    lockTimeoutMs
+  );
 }
 
 function classifyHttpFailureStatus(httpStatus) {
@@ -1997,11 +2417,13 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
     };
   }
 
-  const isStrict =
-    options.strictExecution === true ||
-    options.strict_execution === true ||
-    options.allowSimulation === false ||
-    options.allow_simulation === false;
+  const isStrict = isStrictExecution(options, cfg);
+  const isDemoMode = isDemoOrSimulationMode(options, cfg);
+  const fetchFn =
+    typeof options.fetchImpl === 'function' ? options.fetchImpl : globalThis.fetch;
+  const isCustomOrMockedFetch =
+    typeof options.fetchImpl === 'function' ||
+    (typeof fetchFn === 'function' && NATIVE_FETCH && fetchFn !== NATIVE_FETCH);
 
   if (modelMeta.provider === 'antigravity-native' && isStrict) {
     return {
@@ -2015,6 +2437,7 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
 
   const reasoningDepth =
     options.reasoningDepth ||
+    options.reasoning_depth ||
     cfg.modelReasoningDepths?.[modelMeta.id] ||
     modelMeta.defaultReasoningDepth ||
     'balanced';
@@ -2023,56 +2446,67 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
   const effortMeta = REASONING_EFFORT_MAP[reasoningDepth] || REASONING_EFFORT_MAP.balanced;
   const reasoningEffort =
     options.reasoningEffort ||
+    options.reasoning_effort ||
     (modelMeta.supportsThinking ? effortMeta.deepseekEffort : 'none');
 
   const prompt = String(options.prompt || '').trim();
   const systemPrompt =
     options.systemPrompt ||
+    options.system_prompt ||
     `You are an autonomous agent node in Gravity Well Harness running on ${modelMeta.name} (${modelMeta.providerLabel}) with reasoningDepth=${reasoningDepth.toUpperCase()} (reasoning_effort=${reasoningEffort}, thinkingBudget=${depthProfile.thinkingBudgetTokens} tokens).`;
 
   const runCoordinatorPeerDelegation = async () => {
-    if (!options.delegateToPeerModel) return null;
+    const peerTarget = options.delegateToPeerModel || options.delegate_to_peer_model;
+    if (!peerTarget) return null;
     return invokeUnifiedModel(workspaceRoot, {
-      modelId: options.delegateToPeerModel,
+      modelId: peerTarget,
       reasoningDepth: 'eco',
       prompt: `[Sub-task delegated by ${modelMeta.id}]: ${prompt}`,
       delegateToPeerModel: null,
-      strictExecution: options.strictExecution,
-      allowSimulation: options.allowSimulation,
+      strictExecution: options.strictExecution ?? options.strict_execution,
+      allowSimulation: options.allowSimulation ?? options.allow_simulation,
+      executionMode: options.executionMode ?? options.execution_mode,
+      demoMode: options.demoMode ?? options.demo_mode,
+      fetchImpl: options.fetchImpl,
     });
   };
 
   // 1. Live DeepSeek Official API call
   if (modelMeta.provider === 'deepseek-official') {
-    const baseUrl = String(cfg.providers.deepseek.baseUrl || 'https://api.deepseek.com').replace(
-      /\/+$/,
-      ''
-    );
-    const url = `${baseUrl}/chat/completions`;
+    const baseUrl = String(
+      options.baseUrl ||
+        options.base_url ||
+        cfg.providers.deepseek.baseUrl ||
+        'https://api.deepseek.com'
+    ).replace(/\/+$/, '');
+    const url = String(options.endpoint || `${baseUrl}/chat/completions`);
+    const baseOriginCheck = validateCredentialOrigin('DEEPSEEK_API_KEY', baseUrl);
     const originCheck = validateCredentialOrigin('DEEPSEEK_API_KEY', url);
-    if (!originCheck.allowed) {
+    if (!baseOriginCheck.allowed || !originCheck.allowed) {
+      const failedOrigin = !originCheck.allowed ? originCheck : baseOriginCheck;
       return {
         ok: false,
         status: 'unauthorized_origin',
-        error: originCheck.reason,
-        origin: originCheck.origin,
+        error: failedOrigin.reason,
+        origin: failedOrigin.origin,
         modelId: modelMeta.id,
         provider: modelMeta.provider,
       };
     }
 
     const deepseekSecret = resolveSecretCredential('DEEPSEEK_API_KEY');
-    if (!deepseekSecret.hasKey) {
-      if (isStrict) {
-        return {
-          ok: false,
-          status: 'unauthorized',
-          error: 'Missing required DEEPSEEK_API_KEY credential for deepseek-official provider',
-          modelId: modelMeta.id,
-          provider: modelMeta.provider,
-        };
-      }
-    } else {
+    if (!deepseekSecret.hasKey && isStrict) {
+      return {
+        ok: false,
+        status: 'unauthorized',
+        error: 'Missing required DEEPSEEK_API_KEY credential for deepseek-official provider',
+        modelId: modelMeta.id,
+        provider: modelMeta.provider,
+      };
+    }
+
+    if (deepseekSecret.hasKey || (isCustomOrMockedFetch && !isDemoMode)) {
+      const failClosedOnLiveAttempt = isStrict || !isDemoMode;
       try {
         const apiModelName =
           modelMeta.id === 'deepseek-chat'
@@ -2094,11 +2528,11 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
           max_tokens: Math.min(8192, Math.max(512, depthProfile.thinkingBudgetTokens * 2)),
         };
 
-        const res = await fetch(url, {
+        const res = await fetchFn(url, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            Authorization: `Bearer ${deepseekSecret.value}`,
+            Authorization: `Bearer ${deepseekSecret.value || 'mock-session'}`,
           },
           body: JSON.stringify(body),
           redirect: 'manual',
@@ -2126,7 +2560,7 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
             !Array.isArray(data.choices) ||
             data.choices.length === 0
           ) {
-            if (isStrict) {
+            if (failClosedOnLiveAttempt) {
               return {
                 ok: false,
                 status: 'failed',
@@ -2137,7 +2571,40 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
             }
           } else {
             const msg = data.choices[0]?.message || {};
+            const contentText =
+              typeof msg.content === 'string'
+                ? msg.content
+                : Array.isArray(msg.content)
+                  ? msg.content.map((c) => c?.text || '').join('\n')
+                  : '';
+            const reasoningText =
+              typeof msg.reasoning_content === 'string' ? msg.reasoning_content : '';
+            const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+
+            const hasUsableContent = String(contentText || '').trim().length > 0;
+            const hasUsableToolCalls = toolCalls.length > 0;
+            if (!hasUsableContent && !hasUsableToolCalls) {
+              return {
+                ok: false,
+                status: 'failed',
+                error: 'EMPTY_MODEL_RESPONSE',
+                modelId: modelMeta.id,
+                provider: modelMeta.provider,
+              };
+            }
+
             const peerDelegationResult = await runCoordinatorPeerDelegation();
+            if (peerDelegationResult && peerDelegationResult.ok === false && failClosedOnLiveAttempt) {
+              return {
+                ok: false,
+                status: peerDelegationResult.status || 'failed',
+                error: peerDelegationResult.error || 'Peer delegation failed',
+                modelId: modelMeta.id,
+                provider: modelMeta.provider,
+                peerDelegationResult,
+              };
+            }
+
             return {
               ok: true,
               status: 'succeeded',
@@ -2150,20 +2617,22 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
               reasoningDepth,
               reasoningEffort,
               thinkingBudgetTokens: depthProfile.thinkingBudgetTokens,
-              reasoningContent: msg.reasoning_content || '',
-              reasoning_content: msg.reasoning_content || '',
-              content: msg.content || '',
+              reasoningContent: reasoningText,
+              reasoning_content: reasoningText,
+              content: contentText,
+              ...(hasUsableToolCalls ? { toolCalls, tool_calls: toolCalls } : {}),
               peerDelegationResult,
               peerDelegation: peerDelegationResult,
               preserveHistoryMessage: {
                 role: 'assistant',
-                content: msg.content || '',
-                ...(msg.reasoning_content ? { reasoning_content: msg.reasoning_content } : {}),
+                content: contentText,
+                ...(reasoningText ? { reasoning_content: reasoningText } : {}),
+                ...(hasUsableToolCalls ? { tool_calls: toolCalls } : {}),
               },
               usage: data.usage || null,
             };
           }
-        } else if (isStrict) {
+        } else if (failClosedOnLiveAttempt) {
           let errDetail = '';
           try {
             errDetail = await res.text();
@@ -2182,7 +2651,7 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
           };
         }
       } catch (err) {
-        if (isStrict) {
+        if (failClosedOnLiveAttempt) {
           return {
             ok: false,
             status: classifyExceptionStatus(err),
@@ -2199,14 +2668,14 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
   if (modelMeta.provider === 'opencode-go') {
     const strippedModelId = modelMeta.id.replace(/^opencode-go\//, '');
     const isAnthropicWire = modelMeta.wireFormat === 'opencode-go-anthropic';
-    const url = isAnthropicWire
+    const defaultUrl = isAnthropicWire
       ? cfg.providers.opencodeGo.anthropicEndpoint
       : cfg.providers.opencodeGo.openaiEndpoint;
+    const effectiveBaseUrl =
+      options.baseUrl || options.base_url || cfg.providers.opencodeGo.baseUrl || defaultUrl;
+    const url = String(options.endpoint || defaultUrl);
 
-    const baseCheck = validateCredentialOrigin(
-      'OPENCODE_API_KEY',
-      cfg.providers.opencodeGo.baseUrl || url
-    );
+    const baseCheck = validateCredentialOrigin('OPENCODE_API_KEY', effectiveBaseUrl);
     const urlCheck = validateCredentialOrigin('OPENCODE_API_KEY', url);
     if (!baseCheck.allowed || !urlCheck.allowed) {
       const failedCheck = !urlCheck.allowed ? urlCheck : baseCheck;
@@ -2225,17 +2694,18 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
       'OPENCODE_API_KEY',
       'OPENCODE_ZEN_API_KEY',
     ]);
-    if (!opencodeSecret.hasKey) {
-      if (isStrict) {
-        return {
-          ok: false,
-          status: 'unauthorized',
-          error: 'Missing required OPENCODE_API_KEY credential for opencode-go provider',
-          modelId: modelMeta.id,
-          provider: modelMeta.provider,
-        };
-      }
-    } else {
+    if (!opencodeSecret.hasKey && isStrict) {
+      return {
+        ok: false,
+        status: 'unauthorized',
+        error: 'Missing required OPENCODE_API_KEY credential for opencode-go provider',
+        modelId: modelMeta.id,
+        provider: modelMeta.provider,
+      };
+    }
+
+    if (opencodeSecret.hasKey || (isCustomOrMockedFetch && !isDemoMode)) {
+      const failClosedOnLiveAttempt = isStrict || !isDemoMode;
       try {
         const headers = {
           'Content-Type': 'application/json',
@@ -2243,7 +2713,7 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
         };
         let body;
         if (isAnthropicWire) {
-          headers['x-api-key'] = opencodeSecret.value;
+          headers['x-api-key'] = opencodeSecret.value || 'mock-session';
           headers['anthropic-version'] = '2023-06-01';
           body = {
             model: strippedModelId,
@@ -2252,7 +2722,7 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
             messages: [{ role: 'user', content: prompt }],
           };
         } else {
-          headers.Authorization = `Bearer ${opencodeSecret.value}`;
+          headers.Authorization = `Bearer ${opencodeSecret.value || 'mock-session'}`;
           body = {
             model: strippedModelId,
             messages: [
@@ -2264,7 +2734,7 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
           };
         }
 
-        const res = await fetch(url, {
+        const res = await fetchFn(url, {
           method: 'POST',
           headers,
           body: JSON.stringify(body),
@@ -2291,7 +2761,7 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
             ? Array.isArray(data?.content) && data.content.length > 0
             : Array.isArray(data?.choices) && data.choices.length > 0;
           if (!validPayload) {
-            if (isStrict) {
+            if (failClosedOnLiveAttempt) {
               return {
                 ok: false,
                 status: 'failed',
@@ -2302,12 +2772,50 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
             }
           } else {
             const contentText = isAnthropicWire
-              ? (data.content || []).map((c) => c.text || '').join('\n')
-              : data.choices?.[0]?.message?.content || '';
+              ? (data.content || [])
+                  .filter((c) => c && (c.type === 'text' || typeof c.text === 'string'))
+                  .map((c) => c.text || '')
+                  .join('\n')
+              : typeof data.choices?.[0]?.message?.content === 'string'
+                ? data.choices[0].message.content
+                : Array.isArray(data.choices?.[0]?.message?.content)
+                  ? data.choices[0].message.content.map((c) => c?.text || '').join('\n')
+                  : '';
             const reasoningText = isAnthropicWire
-              ? (data.content || []).find((c) => c.type === 'thinking')?.thinking || ''
+              ? (data.content || []).find((c) => c && c.type === 'thinking')?.thinking || ''
               : data.choices?.[0]?.message?.reasoning_content || '';
+            const toolCalls = isAnthropicWire
+              ? (data.content || []).filter(
+                  (c) => c && (c.type === 'tool_use' || c.type === 'tool_call')
+                )
+              : Array.isArray(data.choices?.[0]?.message?.tool_calls)
+                ? data.choices[0].message.tool_calls
+                : [];
+
+            const hasUsableContent = String(contentText || '').trim().length > 0;
+            const hasUsableToolCalls = toolCalls.length > 0;
+            if (!hasUsableContent && !hasUsableToolCalls) {
+              return {
+                ok: false,
+                status: 'failed',
+                error: 'EMPTY_MODEL_RESPONSE',
+                modelId: modelMeta.id,
+                provider: modelMeta.provider,
+              };
+            }
+
             const peerDelegationResult = await runCoordinatorPeerDelegation();
+            if (peerDelegationResult && peerDelegationResult.ok === false && failClosedOnLiveAttempt) {
+              return {
+                ok: false,
+                status: peerDelegationResult.status || 'failed',
+                error: peerDelegationResult.error || 'Peer delegation failed',
+                modelId: modelMeta.id,
+                provider: modelMeta.provider,
+                peerDelegationResult,
+              };
+            }
+
             return {
               ok: true,
               status: 'succeeded',
@@ -2323,12 +2831,13 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
               reasoningContent: reasoningText,
               reasoning_content: reasoningText,
               content: contentText,
+              ...(hasUsableToolCalls ? { toolCalls, tool_calls: toolCalls } : {}),
               peerDelegationResult,
               peerDelegation: peerDelegationResult,
               usage: data.usage || null,
             };
           }
-        } else if (isStrict) {
+        } else if (failClosedOnLiveAttempt) {
           let errDetail = '';
           try {
             errDetail = await res.text();
@@ -2347,7 +2856,7 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
           };
         }
       } catch (err) {
-        if (isStrict) {
+        if (failClosedOnLiveAttempt) {
           return {
             ok: false,
             status: classifyExceptionStatus(err),
@@ -2366,6 +2875,16 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
     : '';
 
   const peerDelegationResult = await runCoordinatorPeerDelegation();
+  if (peerDelegationResult && peerDelegationResult.ok === false) {
+    return {
+      ok: false,
+      status: peerDelegationResult.status || 'failed',
+      error: peerDelegationResult.error || 'Peer delegation failed',
+      modelId: modelMeta.id,
+      provider: modelMeta.provider,
+      peerDelegationResult,
+    };
+  }
 
   const synthesizedContent = peerDelegationResult
     ? `[${modelMeta.name} (${modelMeta.providerLabel}) · ${reasoningDepth.toUpperCase()} / effort=${reasoningEffort}] Completed primary analysis for "${prompt.slice(0, 90)}" and delegated sub-verification to peer model ${peerDelegationResult.modelName} -> ${peerDelegationResult.content}`
@@ -2403,6 +2922,7 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
  * Queries DeepSeek Official Search API (`/v1/tools/search`), Parallel AI Search, Tavily AI Search,
  * Jina AI Search, DuckDuckGo Instant Answer, Wikipedia Action API, and HackerNews Algolia, fusing results with RRF.
  * Enforces `validateCredentialOrigin` + `redirect: 'manual'` before attaching any secret credential (F05).
+ * Never fabricates synthetic search results unless `allowSimulation: true` / `executionMode: 'demo'` is explicitly passed.
  */
 export async function searchWebMultiEngine(workspaceRoot, options = {}) {
   const cfg = loadHubConfig(workspaceRoot);
@@ -2411,11 +2931,13 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
     throw new Error('query is required for searchWebMultiEngine');
   }
 
-  const isStrict =
-    options.strictExecution === true ||
-    options.strict_execution === true ||
-    options.allowSimulation === false ||
-    options.allow_simulation === false;
+  const isDemoMode = isDemoOrSimulationMode(options, cfg);
+  const isStrict = isStrictExecution(options, cfg);
+  const fetchFn =
+    typeof options.fetchImpl === 'function' ? options.fetchImpl : globalThis.fetch;
+  const isCustomOrMockedFetch =
+    typeof options.fetchImpl === 'function' ||
+    (typeof fetchFn === 'function' && NATIVE_FETCH && fetchFn !== NATIVE_FETCH);
 
   const requestedEngine = options.engine || cfg.search.defaultEngine || 'multi-fusion';
   const limit = Math.max(1, Math.min(15, Number(options.limit || options.maxResults || 6)));
@@ -2424,10 +2946,33 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
       ? cfg.search.enabledEngines
       : [requestedEngine];
 
+  if (requestedEngine === 'deepseek-search' && cfg.providers?.deepseek?.enabled === false) {
+    return {
+      ok: false,
+      status: 'disabled',
+      error: 'Provider deepseek-official is disabled',
+      query,
+      requestedEngine,
+      enginesQueried: ['deepseek-search'],
+      totalResults: 0,
+      results: [],
+    };
+  }
+
   const perEngineResults = {};
   const engineErrors = {};
   let unauthorizedOriginFailure = null;
   const tasks = [];
+
+  const filterUsableHits = (items = []) =>
+    (Array.isArray(items) ? items : []).filter(
+      (item) =>
+        item &&
+        typeof item === 'object' &&
+        typeof item.url === 'string' &&
+        item.url.trim().length > 0 &&
+        (String(item.title || '').trim().length > 0 || String(item.snippet || '').trim().length > 0)
+    );
 
   // 1. DeepSeek Official Search API (`POST https://api.deepseek.com/v1/tools/search`)
   if (enginesToRun.includes('deepseek-search')) {
@@ -2452,7 +2997,7 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
         const dsSec = resolveSecretCredential('DEEPSEEK_API_KEY');
         if (dsSec.hasKey) {
           try {
-            const res = await fetch(searchUrl, {
+            const res = await fetchFn(searchUrl, {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
@@ -2469,12 +3014,14 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
             if (res.ok) {
               const data = await res.json();
               const list = data.results || data.data || [];
-              perEngineResults['deepseek-search'] = list.map((r) => ({
-                title: r.title || r.url,
-                url: r.url,
-                snippet: r.snippet || r.content?.slice(0, 320) || '',
-                engine: 'deepseek-search',
-              }));
+              perEngineResults['deepseek-search'] = filterUsableHits(
+                list.map((r) => ({
+                  title: r.title || r.url,
+                  url: r.url,
+                  snippet: r.snippet || r.content?.slice(0, 320) || '',
+                  engine: 'deepseek-search',
+                }))
+              );
               return;
             }
           } catch {}
@@ -2503,7 +3050,7 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
         const plSec = resolveSecretCredential('PARALLEL_API_KEY');
         if (plSec.hasKey) {
           try {
-            const res = await fetch(parallelUrl, {
+            const res = await fetchFn(parallelUrl, {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
@@ -2519,12 +3066,14 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
             });
             if (res.ok) {
               const data = await res.json();
-              perEngineResults.parallel = (data.results || []).map((r) => ({
-                title: r.title || r.url,
-                url: r.url,
-                snippet: Array.isArray(r.excerpts) ? r.excerpts.join(' ') : r.snippet || '',
-                engine: 'parallel',
-              }));
+              perEngineResults.parallel = filterUsableHits(
+                (data.results || []).map((r) => ({
+                  title: r.title || r.url,
+                  url: r.url,
+                  snippet: Array.isArray(r.excerpts) ? r.excerpts.join(' ') : r.snippet || '',
+                  engine: 'parallel',
+                }))
+              );
               return;
             }
           } catch {}
@@ -2553,7 +3102,7 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
         const tvSec = resolveSecretCredential('TAVILY_API_KEY');
         if (tvSec.hasKey) {
           try {
-            const res = await fetch(tavilyUrl, {
+            const res = await fetchFn(tavilyUrl, {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
@@ -2570,12 +3119,14 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
             });
             if (res.ok) {
               const data = await res.json();
-              perEngineResults.tavily = (data.results || []).map((r) => ({
-                title: r.title,
-                url: r.url,
-                snippet: r.content || '',
-                engine: 'tavily',
-              }));
+              perEngineResults.tavily = filterUsableHits(
+                (data.results || []).map((r) => ({
+                  title: r.title,
+                  url: r.url,
+                  snippet: r.content || '',
+                  engine: 'tavily',
+                }))
+              );
               return;
             }
           } catch {}
@@ -2605,7 +3156,7 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
         if (jinaSec.hasKey) {
           try {
             const jinaUrl = `${String(jinaBase).replace(/\/+$/, '')}/${encodeURIComponent(query)}`;
-            const res = await fetch(jinaUrl, {
+            const res = await fetchFn(jinaUrl, {
               method: 'GET',
               headers: {
                 Accept: 'application/json',
@@ -2617,12 +3168,14 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
             if (res.ok) {
               const data = await res.json();
               const list = Array.isArray(data?.data) ? data.data : [];
-              perEngineResults.jina = list.slice(0, limit).map((r) => ({
-                title: r.title || r.url || query,
-                url: r.url || 'https://s.jina.ai/',
-                snippet: r.description || r.content?.slice(0, 320) || '',
-                engine: 'jina',
-              }));
+              perEngineResults.jina = filterUsableHits(
+                list.slice(0, limit).map((r) => ({
+                  title: r.title || r.url || query,
+                  url: r.url || 'https://s.jina.ai/',
+                  snippet: r.description || r.content?.slice(0, 320) || '',
+                  engine: 'jina',
+                }))
+              );
               return;
             }
           } catch {}
@@ -2637,26 +3190,42 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
     tasks.push(
       (async () => {
         try {
-          const url = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(
-            query
-          )}&utf8=&format=json&srlimit=${Math.min(4, limit)}`;
-          const res = await fetch(url, {
-            headers: { 'User-Agent': 'GravityWellHarness/1.2 (Antigravity-IDE)' },
-            signal: AbortSignal.timeout(4_500),
-          });
-          if (res.ok) {
+          const fetchWikiHits = async (srsearch) => {
+            const url = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(
+              srsearch
+            )}&utf8=&format=json&srlimit=${Math.min(4, limit)}`;
+            const res = await fetchFn(url, {
+              headers: { 'User-Agent': 'GravityWellHarness/1.2 (Antigravity-IDE)' },
+              signal: AbortSignal.timeout(4_500),
+            });
+            if (!res.ok) return [];
             const data = await res.json();
-            const hits = data?.query?.search || [];
-            perEngineResults.wikipedia = hits.map((h) => ({
-              title: `${h.title} (Wikipedia)`,
-              url: `https://en.wikipedia.org/wiki/${encodeURIComponent(
-                h.title.replace(/\s+/g, '_')
-              )}`,
-              snippet: String(h.snippet || '').replace(/<[^>]+>/g, ''),
-              engine: 'wikipedia',
-            }));
-            return;
+            return Array.isArray(data?.query?.search) ? data.query.search : [];
+          };
+
+          let hits = await fetchWikiHits(query);
+          if (hits.length === 0 && !isCustomOrMockedFetch) {
+            const significantWords = query
+              .split(/\s+/)
+              .map((w) => w.replace(/[^a-zA-Z0-9_-]/g, ''))
+              .filter((w) => w.length >= 3);
+            if (significantWords.length >= 2) {
+              hits = await fetchWikiHits(significantWords.slice(0, 6).join(' OR '));
+            }
           }
+          perEngineResults.wikipedia = filterUsableHits(
+            hits
+              .filter((h) => h && h.title)
+              .map((h) => ({
+                title: `${h.title} (Wikipedia)`,
+                url: `https://en.wikipedia.org/wiki/${encodeURIComponent(
+                  String(h.title).replace(/\s+/g, '_')
+                )}`,
+                snippet: String(h.snippet || '').replace(/<[^>]+>/g, ''),
+                engine: 'wikipedia',
+              }))
+          );
+          return;
         } catch {}
         perEngineResults.wikipedia = [];
       })()
@@ -2671,7 +3240,7 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
           const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(
             query
           )}&format=json&no_html=1&skip_disambig=1`;
-          const res = await fetch(url, {
+          const res = await fetchFn(url, {
             headers: { 'User-Agent': 'GravityWellHarness/1.2' },
             signal: AbortSignal.timeout(4_500),
           });
@@ -2696,7 +3265,7 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
                 });
               }
             }
-            perEngineResults.duckduckgo = items;
+            perEngineResults.duckduckgo = filterUsableHits(items);
             return;
           }
         } catch {}
@@ -2713,21 +3282,23 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
           const url = `https://hn.algolia.com/api/v1/search?query=${encodeURIComponent(
             query
           )}&hitsPerPage=${Math.min(4, limit)}`;
-          const res = await fetch(url, {
+          const res = await fetchFn(url, {
             signal: AbortSignal.timeout(4_500),
           });
           if (res.ok) {
             const data = await res.json();
-            perEngineResults['hn-algolia'] = (data.hits || [])
-              .filter((h) => h.title || h.story_title)
-              .map((h) => ({
-                title: h.title || h.story_title,
-                url: h.url || `https://news.ycombinator.com/item?id=${h.objectID}`,
-                snippet: `HN Points: ${h.points || 0} · Comments: ${
-                  h.num_comments || 0
-                } · Author: ${h.author || 'hn'}`,
-                engine: 'hn-algolia',
-              }));
+            perEngineResults['hn-algolia'] = filterUsableHits(
+              (data.hits || [])
+                .filter((h) => h && (h.title || h.story_title))
+                .map((h) => ({
+                  title: h.title || h.story_title,
+                  url: h.url || `https://news.ycombinator.com/item?id=${h.objectID}`,
+                  snippet: `HN Points: ${h.points || 0} · Comments: ${
+                    h.num_comments || 0
+                  } · Author: ${h.author || 'hn'}`,
+                  engine: 'hn-algolia',
+                }))
+            );
             return;
           }
         } catch {}
@@ -2778,7 +3349,8 @@ export async function searchWebMultiEngine(workspaceRoot, options = {}) {
 
   let fused = Array.from(rrfMap.values()).sort((a, b) => b.rrfScore - a.rrfScore);
 
-  if (fused.length === 0 && !isStrict) {
+  // Only emit synthetic demo search results when simulation/demo mode is explicitly requested
+  if (fused.length === 0 && isDemoMode && !isStrict) {
     fused = [
       {
         title: `Multi-Engine Search Reference (DeepSeek / Parallel / Tavily / Free): ${query}`,
@@ -2859,6 +3431,9 @@ export async function runSelfImprovementCoopCycle(
     type: 'PEER_CRITIQUE',
     priority: 'high',
     reasoningDepth,
+    strictExecution: options.strictExecution ?? options.strict_execution,
+    allowSimulation: options.allowSimulation ?? options.allow_simulation,
+    executionMode: options.executionMode ?? options.execution_mode,
     content: `[Self-Improvement Proposal from ${proposerModel}] Enforce Cue-First RAG retrieval before code edits, control DeepSeek reasoning_effort (none/low/high/max), and route branched probes across OpenCode Go (${proberAModel}, ${proberBModel}) under frozen Snapshot Isolation.`,
   });
 
@@ -2870,11 +3445,14 @@ export async function runSelfImprovementCoopCycle(
     type: 'PEER_CRITIQUE',
     priority: 'high',
     reasoningDepth,
+    strictExecution: options.strictExecution ?? options.strict_execution,
+    allowSimulation: options.allowSimulation ?? options.allow_simulation,
+    executionMode: options.executionMode ?? options.execution_mode,
     content: `[Peer Cross-Verification from ${proberAModel} to ${proberBModel}] Verified isolated branch probe and token guardrail compliance.`,
   });
 
   // Step 2: Execute the Google Harness² Propose -> Probe -> Compose Loop
-  const loopResult = ragEngine.runHarness2Loop({
+  const loopResult = await ragEngine.runHarness2Loop({
     taskId,
     problem: taskDescription,
     domain,
@@ -2883,6 +3461,10 @@ export async function runSelfImprovementCoopCycle(
     mode: 'sequential',
     earlyStopOnFirstPass: true,
     adoptWinner: recordToLibrary,
+    strictExecution: options.strictExecution ?? options.strict_execution,
+    allowSimulation: options.allowSimulation ?? options.allow_simulation,
+    evaluator: options.evaluator,
+    requiredArtifacts: options.requiredArtifacts ?? options.required_artifacts,
   });
 
   // Step 3: Broadcast the newly adopted Self-Improvement Cue to all swarm agents
@@ -2894,7 +3476,7 @@ export async function runSelfImprovementCoopCycle(
     type: 'SELF_IMPROVE_CUE',
     priority: 'high',
     reasoningDepth,
-    content: `[Adopted Self-Improvement Lesson ${loopResult.adoptedExperience?.docid || 'EXP-RSI'}] Winner: ${loopResult.winner.candidateId} (score=${loopResult.winner.score}, saved=${loopResult.tokenEfficiency.totalTokensSavedPct}% tokens). Cue: ${loopResult.winner.cue || loopResult.winner.distilledCue || ''}`,
+    content: `[Adopted Self-Improvement Lesson ${loopResult.adoptedExperience?.docid || 'EXP-RSI'}] Winner: ${loopResult.winner?.candidateId || 'none'} (score=${loopResult.winner?.score || 0}, saved=${loopResult.tokenEfficiency?.totalTokensSavedPct || 0}% tokens). Cue: ${loopResult.winner?.cue || loopResult.winner?.distilledCue || ''}`,
     executeTargetModel: false,
   });
 
@@ -2907,7 +3489,7 @@ export async function runSelfImprovementCoopCycle(
   });
 
   return {
-    ok: true,
+    ok: loopResult.ok !== false && critiqueMsgA.ok !== false && critiqueMsgB.ok !== false,
     cycleNumber: updatedCfg.selfImprovement.completedCycles,
     taskId,
     task: taskDescription,
@@ -2930,7 +3512,7 @@ export async function runSelfImprovementCoopCycle(
     critiqueMessage: critiqueMsgA.message,
     cueBroadcast: cueBroadcast.message,
     winner: {
-      ...loopResult.winner,
+      ...(loopResult.winner || {}),
       modelId: proberAModel,
     },
     harness2Run: loopResult,

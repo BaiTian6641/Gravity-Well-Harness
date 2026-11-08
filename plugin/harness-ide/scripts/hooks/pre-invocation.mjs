@@ -7,6 +7,8 @@ import { HarnessKnowledgeEngine } from '../rag-engine.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoModelHubPath = path.resolve(__dirname, '../../../../src/model-hub.mjs');
 const pluginModelHubPath = path.resolve(__dirname, '../model-hub.mjs');
+const repoResiliencePath = path.resolve(__dirname, '../../../../src/context-resilience.mjs');
+const pluginResiliencePath = path.resolve(__dirname, '../context-resilience.mjs');
 const {
   consumePendingInjectedMessages,
   getEnrichedModelCatalog,
@@ -17,6 +19,9 @@ const {
   syncChatBoxModelAndTranscript,
 } = await import(
   pathToFileURL(fs.existsSync(repoModelHubPath) ? repoModelHubPath : pluginModelHubPath).href
+);
+const { ContextResilienceManager } = await import(
+  pathToFileURL(fs.existsSync(repoResiliencePath) ? repoResiliencePath : pluginResiliencePath).href
 );
 
 function readStdinJson() {
@@ -224,6 +229,17 @@ async function main() {
         ephemeralMessage: `[Swarm Message Injection · ${msg.direction}] From ${msg.fromAgent} (${msg.fromModel}) → ${msg.toAgent} (${msg.toModel}, depth=${msg.reasoningDepth}): ${msg.content}`
       });
     }
+
+    // 6. Active Task Context Resilience & Compaction Recovery Packet (WP5)
+    try {
+      const resilience = new ContextResilienceManager(workspaceRoot);
+      const taskPacket = resilience.buildActiveTasksHookPacket();
+      if (taskPacket) {
+        injectSteps.push({
+          ephemeralMessage: taskPacket,
+        });
+      }
+    } catch {}
 
     if (injectSteps.length > 0) {
       process.stdout.write(JSON.stringify({ injectSteps }) + '\n');

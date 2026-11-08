@@ -107,8 +107,168 @@ function getVaultKeyFilePath() {
   return path.join(getGlobalConfigDir(), '.vault.key');
 }
 
+export function getVaultLockFilePath() {
+  return path.join(getGlobalConfigDir(), '.vault.lock');
+}
+
 function getHomeEnvFilePath() {
   return path.join(os.homedir(), '.env');
+}
+
+const VAULT_SLEEP_ARRAY = new Int32Array(new SharedArrayBuffer(4));
+function sleepSyncMs(ms) {
+  const waitMs = Math.max(1, Math.floor(Number(ms) || 1));
+  try {
+    Atomics.wait(VAULT_SLEEP_ARRAY, 0, 0, waitMs);
+  } catch {
+    const deadline = Date.now() + waitMs;
+    while (Date.now() < deadline) {
+      // spin fallback
+    }
+  }
+}
+
+function isProcessAlive(pid) {
+  const numPid = Number(pid);
+  if (!Number.isInteger(numPid) || numPid <= 0) return false;
+  try {
+    process.kill(numPid, 0);
+    return true;
+  } catch (err) {
+    if (err && err.code === 'ESRCH') {
+      return false;
+    }
+    return true;
+  }
+}
+
+function renameFileAtomicWithRetry(tmpFile, targetFile) {
+  for (let i = 0; i < 6; i += 1) {
+    try {
+      fs.renameSync(tmpFile, targetFile);
+      return;
+    } catch (err) {
+      if (i < 5 && err && (err.code === 'EPERM' || err.code === 'EACCES' || err.code === 'EBUSY')) {
+        sleepSyncMs(5 * (i + 1));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+/**
+ * Executes `fn` while holding an exclusive file lock at `~/.gemini/config/.vault.lock`.
+ * Retries with short backoff; only breaks an existing lock if its holder PID is dead (`ESRCH`)
+ * AND its age exceeds 10,000ms.
+ * Fails closed by throwing `err.code = 'VAULT_LOCK_TIMEOUT'` if the lock cannot be acquired
+ * within `timeoutMs` — never executes `fn` unlocked.
+ */
+export function withVaultLock(fn, timeoutMs = 5000) {
+  const dir = getGlobalConfigDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const lockPath = getVaultLockFilePath();
+  const effectiveTimeoutMs = Math.max(1, Number(timeoutMs ?? 5000));
+  const deadline = Date.now() + effectiveTimeoutMs;
+  const ownerToken = `${process.pid}:${Date.now()}:${crypto.randomBytes(4).toString('hex')}`;
+  let acquired = false;
+
+  while (true) {
+    try {
+      const fd = fs.openSync(lockPath, 'wx', 0o600);
+      try {
+        const lockPayload = JSON.stringify({
+          pid: process.pid,
+          acquiredAt: Date.now(),
+          token: ownerToken,
+        });
+        fs.writeFileSync(fd, lockPayload, 'utf8');
+      } finally {
+        try {
+          fs.closeSync(fd);
+        } catch {}
+      }
+      acquired = true;
+      break;
+    } catch (err) {
+      if (err && err.code === 'EEXIST') {
+        try {
+          const stat = fs.statSync(lockPath);
+          let lockPid = null;
+          let acquiredAt = stat.mtimeMs;
+          try {
+            const raw = fs.readFileSync(lockPath, 'utf8').trim();
+            if (raw.startsWith('{')) {
+              const parsed = JSON.parse(raw);
+              if (parsed && typeof parsed === 'object') {
+                if (parsed.pid !== undefined) lockPid = Number(parsed.pid);
+                if (Number.isFinite(Number(parsed.acquiredAt)) && Number(parsed.acquiredAt) > 0) {
+                  acquiredAt = Number(parsed.acquiredAt);
+                }
+              }
+            } else if (raw.includes(':')) {
+              const [pidPart, tsPart] = raw.split(':');
+              lockPid = Number(pidPart);
+              if (Number.isFinite(Number(tsPart)) && Number(tsPart) > 0) {
+                acquiredAt = Number(tsPart);
+              }
+            }
+          } catch {}
+
+          const ageMs = Date.now() - acquiredAt;
+          const pidDead = lockPid ? !isProcessAlive(lockPid) : false;
+          if (ageMs > 10_000 && pidDead) {
+            try {
+              fs.unlinkSync(lockPath);
+              continue;
+            } catch {}
+          }
+        } catch {}
+
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          break;
+        }
+        sleepSyncMs(Math.min(8, Math.max(1, remaining)));
+        continue;
+      }
+
+      if (Date.now() >= deadline) {
+        break;
+      }
+      sleepSyncMs(4);
+    }
+  }
+
+  if (!acquired) {
+    const err = new Error(
+      `Timed out after ${effectiveTimeoutMs}ms waiting for exclusive secret vault lock (${lockPath}).`
+    );
+    err.code = 'VAULT_LOCK_TIMEOUT';
+    throw err;
+  }
+
+  const releaseLock = () => {
+    try {
+      if (fs.existsSync(lockPath)) {
+        fs.unlinkSync(lockPath);
+      }
+    } catch {}
+  };
+
+  let isAsync = false;
+  try {
+    const result = fn();
+    if (result && typeof result.then === 'function') {
+      isAsync = true;
+      return result.finally(releaseLock);
+    }
+    return result;
+  } finally {
+    if (!isAsync) {
+      releaseLock();
+    }
+  }
 }
 
 /**
@@ -138,9 +298,9 @@ export function getOrCreateMasterKey({ allowCreate = true } = {}) {
   }
 
   const newKey = crypto.randomBytes(32);
-  const tmpKeyFile = `${keyFile}.tmp.${process.pid}.${Date.now()}`;
+  const tmpKeyFile = `${keyFile}.tmp.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`;
   fs.writeFileSync(tmpKeyFile, newKey.toString('hex'), { encoding: 'utf8', mode: 0o600 });
-  fs.renameSync(tmpKeyFile, keyFile);
+  renameFileAtomicWithRetry(tmpKeyFile, keyFile);
   return newKey;
 }
 
@@ -167,12 +327,12 @@ export function writeEncryptedVault(secretsMap = {}) {
 
   const vaultFile = getVaultFilePath();
   fs.mkdirSync(path.dirname(vaultFile), { recursive: true });
-  const tmpFile = `${vaultFile}.tmp.${process.pid}.${Date.now()}`;
+  const tmpFile = `${vaultFile}.tmp.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`;
   fs.writeFileSync(tmpFile, JSON.stringify(payload, null, 2), {
     encoding: 'utf8',
     mode: 0o600,
   });
-  fs.renameSync(tmpFile, vaultFile);
+  renameFileAtomicWithRetry(tmpFile, vaultFile);
   return { vaultPath: vaultFile, updatedAt: payload.updatedAt };
 }
 
@@ -267,20 +427,46 @@ function parseHomeDotEnv() {
 }
 
 /**
- * Saves a single secret into the AES-256-GCM Encrypted Vault (`~/.gemini/config/.secrets.vault.enc`).
+ * Saves a single secret into the AES-256-GCM Encrypted Vault (`~/.gemini/config/.secrets.vault.enc`)
+ * under an exclusive file lock (`withVaultLock`) so concurrent updates across processes never overwrite keys.
  * Throws if an existing vault is corrupt or its master key is missing/mismatched so existing
  * secrets are never overwritten with `{}`.
  */
-export function setSecretInVault(secretName, secretValue) {
+export function setSecretInVault(secretName, secretValue, { timeoutMs = 5000 } = {}) {
   if (!secretName) throw new Error('secretName is required');
-  const current = readEncryptedVault({ throwOnCorrupt: true });
-  const cleanVal = String(secretValue || '').trim();
-  if (cleanVal) {
-    current[secretName] = cleanVal;
-  } else {
-    delete current[secretName];
+  return withVaultLock(() => {
+    const current = readEncryptedVault({ throwOnCorrupt: true });
+    const cleanVal = String(secretValue || '').trim();
+    if (cleanVal) {
+      current[secretName] = cleanVal;
+    } else {
+      delete current[secretName];
+    }
+    return writeEncryptedVault(current);
+  }, timeoutMs);
+}
+
+/**
+ * Atomically updates multiple secrets in the AES-256-GCM Encrypted Vault inside a single
+ * exclusive `withVaultLock` transaction.
+ */
+export function setSecretsInVaultBatch(entriesObj = {}, { timeoutMs = 5000 } = {}) {
+  if (!entriesObj || typeof entriesObj !== 'object' || Array.isArray(entriesObj)) {
+    throw new Error('entriesObj must be a plain object mapping secret names to values');
   }
-  return writeEncryptedVault(current);
+  return withVaultLock(() => {
+    const current = readEncryptedVault({ throwOnCorrupt: true });
+    for (const [secretName, secretValue] of Object.entries(entriesObj)) {
+      if (!secretName) continue;
+      const cleanVal = String(secretValue ?? '').trim();
+      if (cleanVal) {
+        current[secretName] = cleanVal;
+      } else {
+        delete current[secretName];
+      }
+    }
+    return writeEncryptedVault(current);
+  }, timeoutMs);
 }
 
 /**

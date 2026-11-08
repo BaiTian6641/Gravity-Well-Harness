@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs, { realpathSync } from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -12,7 +13,7 @@ import {
   registerUiRoutes,
 } from 'antigravity-sidecar-kit/server';
 import { exitWithLanguageServer } from 'antigravity-sidecar-kit/lifecycle';
-import { createLsRpcCache, persistSidecarRuntime } from 'antigravity-sidecar-kit/rpc';
+import { persistSidecarRuntime } from 'antigravity-sidecar-kit/rpc';
 import { resolveHostTheme } from 'antigravity-sidecar-kit/theme';
 import {
   extractTrajectoryWorkspace,
@@ -53,7 +54,81 @@ const GLOBAL_SIDECAR_DATA_DIR = path.join(
   SIDECAR_ID
 );
 const ACTIVE_WORKSPACE_FILE = path.join(GLOBAL_SIDECAR_DATA_DIR, 'active-workspace.json');
-const SUBAGENT_LIFECYCLE_MEM = new Map(); // workspaceRoot -> { revision, nodes: { [key]: { status, recalled, recallCount, recalledAt, completedAt, autoCompleteAtMs } } }
+const SUBAGENT_LIFECYCLE_MEM = new Map(); // workspaceRoot -> { revision, nodes: { [key]: { status, recalled, recallCount, recalledAt, completedAt } } }
+
+export const SURFACE_COMPATIBILITY_MATRIX = Object.freeze({
+  'antigravity-ide': {
+    surface: 'antigravity-ide',
+    supportedContracts: [
+      'plugin.json (skills, agents, rules, hooks, mcpServers, sidecars)',
+      'hooks.json (SessionStart, PostToolUse)',
+      'mcp_config.json (stdio & remote HTTP MCP servers)',
+      'sidecar://harness-ide-monitor/ (Auxiliary Pane UI via antigravity-sidecar-kit)',
+      'invoke_subagent (Workspace: inherit | branch | share)',
+    ],
+    privateHostRpcUsed: false,
+  },
+  'antigravity-app': {
+    surface: 'antigravity-app',
+    supportedContracts: [
+      'Standalone HTTP loopback UI (127.0.0.1)',
+      'MCP JSON-RPC 2.0 stdio server (mcp/harness-rag-server.mjs)',
+      'Local hybrid RAG index (.harness/)',
+    ],
+    privateHostRpcUsed: false,
+  },
+  'antigravity-python-sdk': {
+    surface: 'antigravity-python-sdk',
+    supportedContracts: [
+      'AntigravityExecutor (adapters/harness2_antigravity_executor.py)',
+      'agy.Agent / agy.Subagent orchestration with explicit evaluation receipts',
+      'Snapshot Isolation lock enforcement via .harness/logs/active-snapshot.json',
+    ],
+    privateHostRpcUsed: false,
+  },
+  'external-provider-apis': {
+    surface: 'external-provider-apis',
+    supportedContracts: [
+      'DeepSeek Official API (https://api.deepseek.com/chat/completions)',
+      'OpenCode Go Coding Plan API (https://opencode.ai/zen/go/v1/chat/completions)',
+      'Multi-Engine Web Search (Parallel AI, Tavily, DuckDuckGo, Jina, Wikipedia, HN Algolia)',
+    ],
+    privateHostRpcUsed: false,
+  },
+});
+
+export const KNOWN_TEMPLATE_NODE_IDS = new Set([
+  'main-orchestrator',
+  'harness-proposer',
+  'rag-context-researcher',
+  'harness-prober-1',
+  'harness-prober-2',
+  'harness-prober-3',
+  'harness-sandbox-verifier',
+  'harness-composer',
+  'deepseek-peer-reasoner',
+  'opencode-peer-coder',
+]);
+
+const DEFAULT_REGISTERED_WORKSPACES = new Set();
+try {
+  DEFAULT_REGISTERED_WORKSPACES.add(fs.realpathSync(REPO_ROOT));
+} catch {}
+if (process.env.HARNESS_WORKSPACE_ROOT && fs.existsSync(process.env.HARNESS_WORKSPACE_ROOT)) {
+  try {
+    DEFAULT_REGISTERED_WORKSPACES.add(fs.realpathSync(process.env.HARNESS_WORKSPACE_ROOT));
+  } catch {}
+}
+
+export function registerWorkspace(wsPath, targetSet = DEFAULT_REGISTERED_WORKSPACES) {
+  if (!wsPath || !fs.existsSync(wsPath)) return null;
+  const real = fs.realpathSync(wsPath);
+  DEFAULT_REGISTERED_WORKSPACES.add(real);
+  if (targetSet && targetSet !== DEFAULT_REGISTERED_WORKSPACES) {
+    targetSet.add(real);
+  }
+  return real;
+}
 
 function getLifecycleFilePath(workspaceRoot) {
   return path.join(workspaceRoot || REPO_ROOT, '.harness', 'runtime', 'subagent-lifecycle.json');
@@ -109,6 +184,7 @@ function mutateSubagentLifecycle(workspaceRoot, payload = {}) {
       recallCount: isRecall ? (Number(prev.recallCount || 0) + 1) : Number(prev.recallCount || 0),
       recalledAt: isRecall ? nowIso : prev.recalledAt || null,
       completedAt: status === 'COMPLETED' ? nowIso : null,
+      cancelledAt: status === 'CANCELLED' ? nowIso : null,
     };
   };
 
@@ -116,6 +192,8 @@ function mutateSubagentLifecycle(workspaceRoot, payload = {}) {
     setNodeEntry(formationId, nodeId, 'RUNNING', true);
   } else if (action === 'complete' && nodeId) {
     setNodeEntry(formationId, nodeId, 'COMPLETED', false);
+  } else if ((action === 'cancel' || action === 'kill') && nodeId) {
+    setNodeEntry(formationId, nodeId, 'CANCELLED', false);
   } else if (action === 'recall_all') {
     const nodeIds = Array.isArray(payload.nodeIds) ? payload.nodeIds : [];
     for (const nid of nodeIds) {
@@ -170,8 +248,32 @@ function mutateSubagentLifecycle(workspaceRoot, payload = {}) {
   return saveSubagentLifecycle(workspaceRoot, state);
 }
 
-const ALLOWED_ORIGIN_RE =
-  /^(http:\/\/127\.0\.0\.1(:\d+)?(\/.*)?|http:\/\/localhost(:\d+)?(\/.*)?|vscode-webview:\/\/.*)/i;
+export function isStrictLoopbackOrigin(originHeader, activePort = 0) {
+  const raw = String(originHeader || '').trim();
+  if (!raw) return true;
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return false;
+  }
+  const protocol = parsed.protocol;
+  if (protocol === 'vscode-webview:') {
+    return true;
+  }
+  if (protocol !== 'http:' && protocol !== 'https:') {
+    return false;
+  }
+  const hostname = parsed.hostname;
+  if (hostname !== '127.0.0.1' && hostname !== 'localhost') {
+    return false;
+  }
+  if (parsed.port && Number(activePort) > 0 && Number(parsed.port) !== Number(activePort)) {
+    return false;
+  }
+  return true;
+}
+
 const MAX_POST_BODY_BYTES = 1_048_576; // 1MB
 
 // Dynamically resolve sidecar_sdk or provide a clean loopback HTTP fallback for standalone/test runs
@@ -183,12 +285,35 @@ try {
   ResponseClass = sdk.Response || FallbackResponse;
 } catch {
   class StandaloneSidecarApp {
-    constructor() {
+    constructor(options = {}) {
       this.pages = new Map();
       this.apis = new Map();
       this.apiMethods = new Map();
       this.server = null;
       this.port = 0;
+      this.sessionToken =
+        options.sessionToken ||
+        process.env.AGY_SIDECAR_TOKEN ||
+        crypto.randomBytes(24).toString('hex');
+      this.requireAuth = Boolean(
+        options.requireAuth ??
+          (process.env.HARNESS_REQUIRE_HTTP_AUTH === '1' ||
+            process.env.HARNESS_REQUIRE_HTTP_AUTH === 'true')
+      );
+      this.allowUnregisteredWorkspaces = Boolean(options.allowUnregisteredWorkspaces);
+      this.registeredWorkspaces = new Set(DEFAULT_REGISTERED_WORKSPACES);
+      if (options.workspaceRoot && fs.existsSync(options.workspaceRoot)) {
+        this.registerWorkspace(options.workspaceRoot);
+        this.defaultWorkspaceRoot = fs.realpathSync(options.workspaceRoot);
+      }
+      if (Array.isArray(options.registeredWorkspaces)) {
+        for (const ws of options.registeredWorkspaces) {
+          this.registerWorkspace(ws);
+        }
+      }
+    }
+    registerWorkspace(wsPath) {
+      return registerWorkspace(wsPath, this.registeredWorkspaces);
     }
     page(route, handler) {
       this.pages.set(route, handler);
@@ -215,7 +340,41 @@ try {
           const pathname = urlObj.pathname;
           const reqMethod = String(req.method || 'GET').toUpperCase();
 
+          const originHeader = req.headers?.origin;
+          if (originHeader && !isStrictLoopbackOrigin(originHeader, this.port)) {
+            res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'Forbidden Origin' }));
+            return;
+          }
+
+          const authHeader = String(req.headers?.authorization || '').trim();
+          const bearerToken = authHeader.toLowerCase().startsWith('bearer ')
+            ? authHeader.slice(7).trim()
+            : '';
+          const headerToken = String(req.headers?.['x-sidecar-token'] || '').trim();
+          const queryToken = String(urlObj.searchParams.get('token') || '').trim();
+          const suppliedToken = headerToken || bearerToken || queryToken;
+          const hasValidToken = Boolean(suppliedToken && suppliedToken === this.sessionToken);
+
+          if (suppliedToken && !hasValidToken) {
+            res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'Unauthorized sidecar token' }));
+            return;
+          }
+
+          const enforceAuth =
+            this.requireAuth ||
+            process.env.HARNESS_REQUIRE_HTTP_AUTH === '1' ||
+            process.env.HARNESS_REQUIRE_HTTP_AUTH === 'true' ||
+            req.headers?.['x-sidecar-require-auth'] === '1';
+
           if (this.apis.has(pathname)) {
+            if (enforceAuth && !hasValidToken) {
+              res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+              res.end(JSON.stringify({ ok: false, error: 'Unauthorized sidecar token' }));
+              return;
+            }
+
             const allowedMethods = this.apiMethods.get(pathname);
             if (allowedMethods && allowedMethods.size > 0 && !allowedMethods.has(reqMethod)) {
               res.writeHead(405, {
@@ -224,15 +383,6 @@ try {
               });
               res.end(JSON.stringify({ ok: false, error: 'Method Not Allowed' }));
               return;
-            }
-
-            if (reqMethod === 'POST') {
-              const originHeader = req.headers?.origin;
-              if (originHeader && !ALLOWED_ORIGIN_RE.test(String(originHeader).trim())) {
-                res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
-                res.end(JSON.stringify({ ok: false, error: 'Forbidden Origin' }));
-                return;
-              }
             }
 
             let rawBody = '';
@@ -275,13 +425,17 @@ try {
               req,
               body: parsedBody,
               query: Object.fromEntries(urlObj.searchParams.entries()),
+              authenticated: hasValidToken,
+              registeredWorkspaces: this.registeredWorkspaces,
+              allowUnregisteredWorkspaces: this.allowUnregisteredWorkspaces,
+              defaultWorkspaceRoot: this.defaultWorkspaceRoot,
               ...parsedBody,
             });
             if (
               out instanceof ResponseClass ||
-              (out && typeof out === 'object' && 'body' in out && 'status' in out)
+              (out && typeof out === 'object' && 'body' in out && ('status' in out || 'statusCode' in out))
             ) {
-              res.writeHead(out.status || 200, {
+              res.writeHead(Number(out.status || out.statusCode || 200), {
                 'Content-Type': out.contentType || 'application/json; charset=utf-8',
                 ...(out.headers || {}),
               });
@@ -302,11 +456,25 @@ try {
               headers: req.headers,
               query: Object.fromEntries(urlObj.searchParams.entries()),
             });
+            const contentType = out?.contentType || 'text/html; charset=utf-8';
+            let bodyStr = out?.body ?? String(out ?? '');
+            if (
+              typeof bodyStr === 'string' &&
+              contentType.includes('text/html') &&
+              !bodyStr.includes('window.__AGY_TOKEN__')
+            ) {
+              const tokenScript = `<script>window.__AGY_TOKEN__ = ${JSON.stringify(this.sessionToken)};</script>`;
+              if (bodyStr.includes('</head>')) {
+                bodyStr = bodyStr.replace('</head>', `${tokenScript}\n</head>`);
+              } else {
+                bodyStr = `${tokenScript}\n${bodyStr}`;
+              }
+            }
             res.writeHead(out?.status || 200, {
-              'Content-Type': out?.contentType || 'text/html; charset=utf-8',
+              'Content-Type': contentType,
               ...(out?.headers || {}),
             });
-            res.end(out?.body ?? String(out ?? ''));
+            res.end(bodyStr);
             return;
           }
 
@@ -336,21 +504,6 @@ try {
   SidecarAppClass = StandaloneSidecarApp;
 }
 
-const lsCache = createLsRpcCache({
-  ttlMs: {
-    GetAllCascadeTrajectories: 1500,
-    GetMcpServerStates: 4000,
-    GetSidecars: 4000,
-  },
-  defaultTtlMs: 1000,
-});
-
-const SERVER_BOOT_MS = Date.now();
-
-function getLiveWallSec() {
-  return Math.max(1, Math.floor((Date.now() - SERVER_BOOT_MS) / 1000));
-}
-
 function formatCompactNumber(num) {
   const n = Number(num || 0);
   if (n >= 5_000_000) return `${(n / 1_000_000).toFixed(3)}M`;
@@ -364,7 +517,9 @@ function formatCompactNumber(num) {
 }
 
 function formatDurationSec(totalSec) {
-  const s = Math.max(1, Math.round(Number(totalSec || 0)));
+  const num = Math.round(Number(totalSec || 0));
+  if (num <= 0) return '0s';
+  const s = Math.max(1, num);
   if (s < 60) return `${s}s`;
   const m = Math.floor(s / 60);
   const rem = s % 60;
@@ -419,7 +574,22 @@ function saveActiveWorkspaceState(workspaceRoot, conversationId = '', source = '
   } catch {}
 }
 
-export function validateAndResolveWorkspacePath(rawWorkspaceRoot) {
+function isWithinAllowedRoots(realPath, rootsIterable) {
+  const normTarget = process.platform === 'win32' ? realPath.toLowerCase() : realPath;
+  for (const candidate of rootsIterable || []) {
+    if (!candidate) continue;
+    try {
+      const realRoot = fs.existsSync(candidate) ? fs.realpathSync(candidate) : path.resolve(candidate);
+      const normRoot = process.platform === 'win32' ? realRoot.toLowerCase() : realRoot;
+      if (normTarget === normRoot || normTarget.startsWith(normRoot + path.sep)) {
+        return true;
+      }
+    } catch {}
+  }
+  return false;
+}
+
+export function validateAndResolveWorkspacePath(rawWorkspaceRoot, options = {}) {
   const rawStr = String(rawWorkspaceRoot || '').trim();
   if (!rawStr) {
     const err = new Error('Workspace path cannot be empty');
@@ -457,29 +627,62 @@ export function validateAndResolveWorkspacePath(rawWorkspaceRoot) {
     err.statusCode = 400;
     throw err;
   }
+
+  const allowedEnv =
+    process.env.HARNESS_ALLOWED_WORKSPACES || process.env.HARNESS_ALLOWED_WORKSPACE_ROOT || '';
+  if (String(allowedEnv).trim()) {
+    const envRoots = String(allowedEnv)
+      .split(/[;,]/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (envRoots.length > 0 && !isWithinAllowedRoots(realPath, envRoots)) {
+      const err = new Error(`Workspace "${realPath}" is outside allowed workspace roots`);
+      err.statusCode = 403;
+      throw err;
+    }
+  }
+
+  const regSet = options.registeredWorkspaces || DEFAULT_REGISTERED_WORKSPACES;
+  if (isWithinAllowedRoots(realPath, regSet)) {
+    return realPath;
+  }
+
+  if (options.allowUnregisteredWorkspaces === true) {
+    return realPath;
+  }
+
+  const harnessDir = path.join(realPath, '.harness');
+  const hasHarnessDir = fs.existsSync(harnessDir) && fs.statSync(harnessDir).isDirectory();
+  if (!hasHarnessDir) {
+    const err = new Error(
+      `Unregistered workspace rejected: "${realPath}" is not in registeredWorkspaces and has no .harness directory`
+    );
+    err.statusCode = 403;
+    throw err;
+  }
+
+  if (options.requireAuthForUnregistered && !options.authenticated) {
+    const err = new Error(
+      `Unregistered workspace switching denied without valid session token: "${realPath}"`
+    );
+    err.statusCode = 403;
+    throw err;
+  }
+
   return realPath;
 }
 
 /**
  * Resolves the currently active workspace smoothly across:
  * 1. Explicit pinned/selected workspace in UI (`reqPayload.workspaceRoot`)
- * 2. Live Antigravity Language Server trajectories + host clientWorkspaceUris (`resolveActiveWorkspace`)
+ * 2. Host clientWorkspaceUris (`resolveActiveWorkspace`)
  * 3. Hook-recorded active workspace (`active-workspace.json`)
  * 4. Environment / Repo fallback
  */
-export async function resolveWorkspaceContext(reqPayload = {}) {
+export async function resolveWorkspaceContext(reqPayload = {}, reqContext = {}) {
   const payload = reqPayload?.body || reqPayload || {};
-  let trajectoriesResponse = null;
-  let lsConnected = false;
-
-  try {
-    trajectoriesResponse = await lsCache.call('GetAllCascadeTrajectories', {});
-    if (trajectoriesResponse && typeof trajectoriesResponse === 'object') {
-      lsConnected = true;
-    }
-  } catch {
-    // Standalone / test mode without LS RPC
-  }
+  const trajectoriesResponse = null;
+  const lsConnected = false;
 
   const clientWorkspaceUris = Array.isArray(payload.clientWorkspaceUris)
     ? payload.clientWorkspaceUris
@@ -491,7 +694,7 @@ export async function resolveWorkspaceContext(reqPayload = {}) {
 
   const lsResolved = resolveActiveWorkspace({
     clientWorkspaceUris,
-    trajectoriesResponse: trajectoriesResponse || {},
+    trajectoriesResponse: {},
     requestedConversationId,
   });
 
@@ -500,22 +703,42 @@ export async function resolveWorkspaceContext(reqPayload = {}) {
   let resolutionSource = 'default';
 
   const explicitRoot = payload.workspaceRoot ?? reqPayload?.query?.workspaceRoot;
+  const validationOptions = {
+    registeredWorkspaces:
+      reqContext?.registeredWorkspaces ||
+      reqPayload?.registeredWorkspaces ||
+      DEFAULT_REGISTERED_WORKSPACES,
+    allowUnregisteredWorkspaces: Boolean(
+      reqContext?.allowUnregisteredWorkspaces ?? reqPayload?.allowUnregisteredWorkspaces
+    ),
+    authenticated: Boolean(reqContext?.authenticated ?? reqPayload?.authenticated),
+    requireAuthForUnregistered: Boolean(reqContext?.requireAuthForUnregistered),
+  };
+
   // 1. If user explicitly pinned a workspace in UI (or test passed workspaceRoot), validate with realpathSync
   if (explicitRoot !== undefined && explicitRoot !== null && String(explicitRoot).trim() !== '') {
-    chosenRoot = validateAndResolveWorkspacePath(explicitRoot);
+    chosenRoot = validateAndResolveWorkspacePath(explicitRoot, validationOptions);
     resolutionSource = payload.pinnedWorkspace ? 'user_pinned' : 'explicit_request';
   }
-  // 2. If host pushed workspace or LS resolved an active trajectory workspace
+  // 2. If app has a bound defaultWorkspaceRoot
+  else if (
+    (reqContext?.defaultWorkspaceRoot || reqPayload?.defaultWorkspaceRoot) &&
+    fs.existsSync(reqContext?.defaultWorkspaceRoot || reqPayload?.defaultWorkspaceRoot)
+  ) {
+    chosenRoot = fs.realpathSync(reqContext?.defaultWorkspaceRoot || reqPayload?.defaultWorkspaceRoot);
+    resolutionSource = 'app_default';
+  }
+  // 3. If host pushed workspace
   else if (lsResolved.workspacePath && fs.existsSync(lsResolved.workspacePath)) {
     chosenRoot = fs.realpathSync(path.resolve(lsResolved.workspacePath));
-    resolutionSource = `ide_${lsResolved.source || 'trajectory'}`;
+    resolutionSource = `ide_${lsResolved.source || 'host'}`;
   }
-  // 3. If SessionStart / PostToolUse hook recently recorded an active workspace
+  // 4. If SessionStart / PostToolUse hook recently recorded an active workspace
   else if (savedState.workspaceRoot && fs.existsSync(savedState.workspaceRoot)) {
     chosenRoot = fs.realpathSync(path.resolve(savedState.workspaceRoot));
     resolutionSource = `hook_${savedState.source || 'telemetry'}`;
   }
-  // 4. Environment override
+  // 5. Environment override
   else if (
     process.env.HARNESS_WORKSPACE_ROOT &&
     fs.existsSync(process.env.HARNESS_WORKSPACE_ROOT)
@@ -523,7 +746,7 @@ export async function resolveWorkspaceContext(reqPayload = {}) {
     chosenRoot = fs.realpathSync(path.resolve(process.env.HARNESS_WORKSPACE_ROOT));
     resolutionSource = 'env';
   }
-  // 5. Repo root if it exists
+  // 6. Repo root if it exists
   else if (fs.existsSync(path.join(REPO_ROOT, '.harness'))) {
     chosenRoot = fs.realpathSync(REPO_ROOT);
     resolutionSource = 'repo_root';
@@ -568,22 +791,6 @@ export async function resolveWorkspaceContext(reqPayload = {}) {
   for (const uri of clientWorkspaceUris) {
     addCandidateWorkspace(uri, 'host_push');
   }
-
-  // Extract workspaces from GetAllCascadeTrajectories (supports both map and array formats)
-  const rawSummaries = trajectoriesResponse?.trajectorySummaries;
-  const trajEntries = Array.isArray(rawSummaries)
-    ? rawSummaries.map((s, i) => [s.cascadeId || s.conversationId || `traj-${i}`, s])
-    : rawSummaries && typeof rawSummaries === 'object'
-      ? Object.entries(rawSummaries)
-      : [];
-
-  for (const [cid, summary] of trajEntries) {
-    const ws =
-      extractTrajectoryWorkspace(summary) ||
-      (summary?.workspaceUris?.[0] ? normalizeWorkspacePath(summary.workspaceUris[0]) : '');
-    if (ws) addCandidateWorkspace(ws, 'trajectory', cid);
-  }
-
   for (const recent of savedState.recentWorkspaces || []) {
     addCandidateWorkspace(recent, 'recent');
   }
@@ -896,44 +1103,157 @@ function resolveWorkspaceBrainTranscript(workspaceContext) {
   return null;
 }
 
+function loadWorkspaceTelemetry(workspaceRoot) {
+  if (!workspaceRoot) return { sessions: {}, recentEvents: [], subagents: [] };
+  const localTelPath = path.join(workspaceRoot, '.harness', 'runtime', 'telemetry.json');
+  if (fs.existsSync(localTelPath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(localTelPath, 'utf8'));
+      if (parsed && typeof parsed === 'object') {
+        return parsed;
+      }
+    } catch {}
+  }
+  return { sessions: {}, recentEvents: [], subagents: [] };
+}
+
+function inspectTelemetryActivity(workspaceRoot, activeBrain = null, telemetryOverride = null) {
+  const tel = telemetryOverride || loadWorkspaceTelemetry(workspaceRoot);
+  const telSessions = Object.values(tel?.sessions || {}).filter(
+    (s) =>
+      !s?.workspaceRoot ||
+      !workspaceRoot ||
+      path.resolve(s.workspaceRoot).toLowerCase() === path.resolve(workspaceRoot).toLowerCase()
+  );
+  const telEvents = Array.isArray(tel?.recentEvents) ? tel.recentEvents : [];
+  const telSubs = [
+    ...(Array.isArray(tel?.subagents) ? tel.subagents : []),
+    ...telSessions.flatMap((s) => (Array.isArray(s?.subagents) ? s.subagents : [])),
+  ];
+  const uniqueSubs = [];
+  for (const s of telSubs) {
+    if (s && s.id && !uniqueSubs.some((u) => u.id === s.id)) {
+      uniqueSubs.push(s);
+    }
+  }
+  const recordedToolCalls =
+    telSessions.reduce((acc, s) => acc + Number(s?.toolCallCount || 0), 0) || telEvents.length;
+  const hasTranscriptSteps = Boolean(activeBrain && Number(activeBrain.totalSteps || 0) > 0);
+  const hasHookActivity = recordedToolCalls > 0 || telEvents.length > 0 || uniqueSubs.length > 0;
+  const hasRealTranscriptOrEvents = hasTranscriptSteps || hasHookActivity;
+  return {
+    tel,
+    telSessions,
+    telEvents,
+    telSubs: uniqueSubs,
+    recordedToolCalls,
+    hasTranscriptSteps,
+    hasHookActivity,
+    hasRealTranscriptOrEvents,
+  };
+}
+
 /**
- * Builds the 3 hierarchical Swarm Formations (matching Screenshots 2, 3, and 4)
- * plus live session telemetry computed dynamically from the active conversation
- * transcript, context analytics, and RAG index.
+ * Builds the hierarchical Swarm Formations plus live session telemetry computed
+ * deterministically from the active conversation transcript, context analytics, and RAG index.
+ * Supports both:
+ *   - buildSwarmFormations(workspaceContext, activeBrain, liveSubagents, ragStatus, contextAnalytics, ragDocuments, options)
+ *   - buildSwarmFormations(workspaceRoot, ragStatus, activeLock, telemetry, options)
  */
-function buildSwarmFormations(
-  workspaceContext,
-  activeBrain,
-  liveSubagents,
-  ragStatus,
-  contextAnalytics = null,
-  ragDocuments = []
+export function buildSwarmFormations(
+  arg1,
+  arg2 = null,
+  arg3 = [],
+  arg4 = null,
+  arg5 = null,
+  arg6 = [],
+  arg7 = {}
 ) {
+  let workspaceContext;
+  let activeBrain;
+  let liveSubagents;
+  let ragStatus;
+  let contextAnalytics;
+  let ragDocuments;
+  let telemetryOverride = null;
+  let options = {};
+
+  if (typeof arg1 === 'string') {
+    const workspaceRoot = arg1;
+    workspaceContext = {
+      workspaceRoot,
+      workspaceName: extractWorkspaceName(normalizeWorkspacePath(workspaceRoot)) || path.basename(workspaceRoot),
+    };
+    ragStatus = {
+      ...(arg2 || {}),
+      snapshotIsolationLock: arg3 || arg2?.snapshotIsolationLock || { active: false },
+    };
+    telemetryOverride = arg4 || null;
+    options = arg5 && typeof arg5 === 'object' ? arg5 : {};
+    activeBrain = options.activeBrain || resolveWorkspaceBrainTranscript(workspaceContext);
+    ragDocuments = Array.isArray(ragStatus?.documents) ? ragStatus.documents : [];
+    const activity = inspectTelemetryActivity(workspaceRoot, activeBrain, telemetryOverride);
+    liveSubagents = [
+      ...(Array.isArray(activeBrain?.subagents) ? activeBrain.subagents : []),
+      ...activity.telSubs.filter(
+        (s) => !(activeBrain?.subagents || []).some((b) => b.id && b.id === s.id)
+      ),
+    ];
+    contextAnalytics =
+      options.contextAnalytics ||
+      buildContextAndTokenAnalytics(workspaceRoot, ragStatus, telemetryOverride, options);
+  } else {
+    workspaceContext = arg1 || { workspaceRoot: REPO_ROOT, workspaceName: 'Gravity-Well-Harness' };
+    activeBrain = arg2 || null;
+    liveSubagents = Array.isArray(arg3) ? arg3 : [];
+    ragStatus = arg4 || {};
+    contextAnalytics = arg5 || null;
+    ragDocuments = Array.isArray(arg6) ? arg6 : [];
+    options = arg7 && typeof arg7 === 'object' ? arg7 : {};
+    telemetryOverride = options.telemetry || null;
+  }
+
+  const wsRoot = workspaceContext.workspaceRoot || REPO_ROOT;
   const wsName = workspaceContext.workspaceName || 'Gravity-Well-Harness';
-  const mainSteps = Math.max(1, activeBrain?.totalSteps || 48);
-  const mainDurationSec = activeBrain?.activeDurationSec || Math.max(45, mainSteps * 9);
+  const activity = inspectTelemetryActivity(wsRoot, activeBrain, telemetryOverride);
+  const demoMode = Boolean(options.demoMode);
+  const hasObservedActivity =
+    activity.hasRealTranscriptOrEvents || liveSubagents.length > 0 || demoMode;
+
+  const mainSteps = hasObservedActivity
+    ? Math.max(1, activeBrain?.totalSteps || activity.recordedToolCalls || (demoMode ? 12 : 1))
+    : 0;
+  const mainDurationSec = hasObservedActivity
+    ? activeBrain?.activeDurationSec || Math.max(12, mainSteps * 6)
+    : 0;
   const mainDuration = formatDurationSec(mainDurationSec);
   const lockActive = Boolean(ragStatus?.snapshotIsolationLock?.active);
   const lockId = ragStatus?.snapshotIsolationLock?.snapshotId || 'snap-ready';
   const totalRagDocs = ragStatus?.totalDocuments || ragDocuments.length || 0;
-  const latestTool = activeBrain?.recentTools?.[0] || null;
+  const latestTool = activeBrain?.recentTools?.[0] || activity.telEvents?.[0] || null;
   const latestExpDoc =
     ragDocuments.find((d) => d.collection === 'experiment-knowledge' && d.docid !== 'INDEX-EXP') ||
     ragDocuments[0] ||
     null;
 
-  // Dynamic metrics for Main Orchestrator from real Context Analytics
-  const mainTotalTokens =
-    contextAnalytics?.tokenStats?.totalTokens || 840_000 + mainSteps * 18_500;
-  const mainContextTokens =
-    contextAnalytics?.currentWindow?.usedTokens || Math.min(420_000, 52_000 + mainSteps * 1_650);
-  const mainContextPct =
-    contextAnalytics?.currentWindow?.usedPct ||
-    Number(((mainContextTokens / 512_000) * 100).toFixed(1));
-  const mainCostUsd = Number((mainTotalTokens * 0.00000145).toFixed(2));
+  // Deterministic metrics for Main Orchestrator from Context Analytics
+  const mainTotalTokens = hasObservedActivity
+    ? (contextAnalytics?.tokenStats?.totalTokens ?? mainSteps * 4_200)
+    : 0;
+  const mainContextTokens = hasObservedActivity
+    ? (contextAnalytics?.currentWindow?.usedTokens ?? Math.min(420_000, mainSteps * 1_650))
+    : 0;
+  const mainContextPct = hasObservedActivity
+    ? (contextAnalytics?.currentWindow?.usedPct ??
+      Number(((mainContextTokens / 512_000) * 100).toFixed(1)))
+    : 0;
+  const mainCostUsd = hasObservedActivity
+    ? Number((mainTotalTokens * 0.00000145).toFixed(2))
+    : 0;
 
   const winCats = contextAnalytics?.currentWindow?.categories || [];
   const getCatPct = (key, fallback) => {
+    if (!hasObservedActivity) return 0;
     const found = winCats.find((c) => c.key === key);
     return found ? Math.max(2, Math.round((found.pct || fallback) * (mainContextPct / 100) * 2.1)) : fallback;
   };
@@ -950,7 +1270,7 @@ function buildSwarmFormations(
   );
   const freePct = Math.max(8, 100 - usedDnaSum);
 
-  // Scale Tier 1-3 Harness² subagent metrics dynamically with live session activity
+  // Scale Tier 1-3 Harness² subagent metrics deterministically
   const proposerSteps = Math.max(12, Math.round(mainSteps * 0.28));
   const proposerTokens = 210_000 + proposerSteps * 7_400;
   const proposerCtx = 64_000 + proposerSteps * 1_600;
@@ -976,47 +1296,53 @@ function buildSwarmFormations(
   const composerCtx = 86_000 + composerSteps * 1_300;
   const composerCost = Number((composerTokens * 0.00000115).toFixed(2));
 
-  // Formation 1: Live Session + Gravity Well Harness² Recursive Formation
-  const liveNodes = [
-    {
-      id: 'main-orchestrator',
-      parentIds: [],
-      tier: 0,
-      teamId: 'team-core',
-      teamName: 'Tier 0 · Root Orchestrator Core',
-      role: `Main Orchestrator (${wsName})`,
-      title: activeBrain?.lastUserPrompt?.slice(0, 44) || `Orchestrating ${wsName}`,
-      typeName: 'antigravity-main',
-      model: 'gemini-4-argon-high',
-      workspace: 'inherit',
-      isCurrent: true,
-      status: 'RUNNING',
-      totalTokens: mainTotalTokens,
-      totalTokensFormatted: formatCompactNumber(mainTotalTokens),
-      contextTokens: mainContextTokens,
-      contextTokensFormatted: formatCompactNumber(mainContextTokens),
-      costUsd: mainCostUsd,
-      costFormatted: `$${mainCostUsd.toFixed(2)}`,
-      durationFormatted: `${mainDuration} · ${mainSteps} steps`,
-      steps: mainSteps,
-      contextUsedPct: mainContextPct,
-      dna: {
-        systemPrompt: sysPct,
-        toolDefinitions: toolDefPct,
-        userMessages: userPct,
-        injectedRag: ragPct,
-        skillInjection: skillPct,
-        assistantMessages: asstPct,
-        toolResults: toolResPct,
-        freeWindow: freePct,
-      },
-      latestReport: latestTool
-        ? `Live Step #${latestTool.stepIndex} · ${latestTool.toolName} (${latestTool.summary}) | Active in ${wsName} with ${totalRagDocs} indexed RAG docs.`
-        : `Active in workspace ${wsName}. Coordinating Local Hybrid RAG (${totalRagDocs} docs) & Harness² Swarm.`,
-      taskPrompt:
-        activeBrain?.lastUserPrompt ||
-        `Coordinate Gravity Well Harness architecture, local RAG retrieval, and multi-tier subagent verification in ${wsName}.`,
+  const rootOrchestratorNode = {
+    id: 'main-orchestrator',
+    parentIds: [],
+    tier: 0,
+    teamId: 'team-core',
+    teamName: 'Tier 0 · Root Orchestrator Core',
+    role: `Main Orchestrator (${wsName})`,
+    title: activeBrain?.lastUserPrompt?.slice(0, 44) || `Orchestrating ${wsName}`,
+    typeName: 'antigravity-main',
+    model: 'gemini-4-argon-high',
+    workspace: 'inherit',
+    isCurrent: true,
+    status: hasObservedActivity ? 'RUNNING' : 'IDLE',
+    totalTokens: mainTotalTokens,
+    totalTokensFormatted: formatCompactNumber(mainTotalTokens),
+    contextTokens: mainContextTokens,
+    contextTokensFormatted: formatCompactNumber(mainContextTokens),
+    costUsd: mainCostUsd,
+    costFormatted: `$${mainCostUsd.toFixed(2)}`,
+    durationFormatted: `${mainDuration} · ${mainSteps} steps`,
+    steps: mainSteps,
+    contextUsedPct: mainContextPct,
+    dna: {
+      systemPrompt: sysPct,
+      toolDefinitions: toolDefPct,
+      userMessages: userPct,
+      injectedRag: ragPct,
+      skillInjection: skillPct,
+      assistantMessages: asstPct,
+      toolResults: toolResPct,
+      freeWindow: freePct,
     },
+    latestReport: latestTool
+      ? `Live Step #${latestTool.stepIndex ?? 1} · ${latestTool.toolName} (${latestTool.summary || ''}) | Active in ${wsName} with ${totalRagDocs} indexed RAG docs.`
+      : hasObservedActivity
+        ? `Active in workspace ${wsName}. Coordinating Local Hybrid RAG (${totalRagDocs} docs) & Harness² Swarm.`
+        : `No active session events recorded in ${wsName}.`,
+    taskPrompt:
+      activeBrain?.lastUserPrompt ||
+      `Coordinate Gravity Well Harness architecture, local RAG retrieval, and multi-tier subagent verification in ${wsName}.`,
+  };
+
+  // Formation 1: Live Session + Gravity Well Harness² Recursive Formation
+  const liveNodes = !hasObservedActivity
+    ? [rootOrchestratorNode]
+    : [
+        rootOrchestratorNode,
     {
       id: 'harness-proposer',
       parentIds: ['main-orchestrator'],
@@ -1280,13 +1606,18 @@ function buildSwarmFormations(
   // so multiple subagents with the same role are never merged.
   for (let i = 0; i < liveSubagents.length; i++) {
     const sub = liveSubagents[i];
-    const resolvedSubStatus = sub.status === 'RUNNING' ? 'RUNNING' : (sub.status || 'COMPLETED');
+    const resolvedSubStatus =
+      sub.status === 'RUNNING'
+        ? 'RUNNING'
+        : sub.status === 'CANCELLED'
+          ? 'CANCELLED'
+          : sub.status || 'COMPLETED';
     const subNodeId = sub.id || `session-sub-${i + 1}`;
 
     const matchedBuiltIn = liveNodes.find((n) => n.tier > 0 && n.id === subNodeId);
     if (matchedBuiltIn) {
-      if (resolvedSubStatus === 'RUNNING') {
-        matchedBuiltIn.status = 'RUNNING';
+      if (resolvedSubStatus === 'RUNNING' || resolvedSubStatus === 'CANCELLED') {
+        matchedBuiltIn.status = resolvedSubStatus;
       }
       if (sub.recalled) {
         matchedBuiltIn.recalled = true;
@@ -1314,6 +1645,8 @@ function buildSwarmFormations(
         recallCount: Number(sub.recallCount || 0),
         recalledAt: sub.recalledAt || null,
         completedAt: resolvedSubStatus === 'COMPLETED' ? sub.completedAt || sub.invokedAt : null,
+        cancelledAt: resolvedSubStatus === 'CANCELLED' ? sub.cancelledAt || sub.invokedAt : null,
+        terminationReason: sub.terminationReason || null,
         totalTokens: 195_000,
         totalTokensFormatted: '195.0k',
         contextTokensFormatted: '64.2k',
@@ -1839,7 +2172,7 @@ function buildSwarmFormations(
     if (hMatch) sec += Number(hMatch[1]) * 3600;
     if (mMatch) sec += Number(mMatch[1]) * 60;
     if (sMatch) sec += Number(sMatch[1]);
-    return sec > 0 ? sec : 120;
+    return sec > 0 ? sec : 0;
   };
 
   const parseTokenStr = (str) => {
@@ -1850,12 +2183,11 @@ function buildSwarmFormations(
     return Math.round(num);
   };
 
-  const liveSec = getLiveWallSec();
   const lifecycleState = loadSubagentLifecycle(workspaceContext.workspaceRoot);
 
   const packFormation = (id, name, description, rawNodes) => {
     const currencySymbol = id === 'live-harness2' ? '$' : '¥';
-    const nodes = rawNodes.map((origNode, idx) => {
+    const nodes = rawNodes.map((origNode) => {
       const n = { ...origNode, dna: { ...(origNode.dna || {}) } };
       const override = lifecycleState?.nodes?.[`${id}:${n.id}`] || null;
       if (override && n.tier > 0) {
@@ -1864,6 +2196,7 @@ function buildSwarmFormations(
         n.recallCount = Number(override.recallCount || 0);
         n.recalledAt = override.recalledAt || null;
         n.completedAt = override.completedAt || null;
+        n.cancelledAt = override.cancelledAt || n.cancelledAt || null;
         if (n.recalled && n.status === 'RUNNING') {
           n.latestReport = `[↺ Recalled #${n.recallCount}] Rejoined active network graph — ${n.latestReport}`;
         }
@@ -1875,53 +2208,35 @@ function buildSwarmFormations(
       const isRunning = n.status === 'RUNNING';
       n.isActive = isRunning;
       const baseSec = parseDurationStrToSec(n.durationFormatted);
-      const baseCtx = n.contextTokens || parseTokenStr(n.contextTokensFormatted) || 95_000;
+      const baseCtx =
+        n.contextTokens !== undefined
+          ? n.contextTokens
+          : parseTokenStr(n.contextTokensFormatted) || (hasObservedActivity ? 95_000 : 0);
       const baseCost =
-        n.costUsd ?? (parseFloat(String(n.costFormatted || '0').replace(/[^0-9.]/g, '')) || 0.45);
+        n.costUsd !== undefined
+          ? n.costUsd
+          : parseFloat(String(n.costFormatted || '0').replace(/[^0-9.]/g, '')) || 0;
 
-      if (isRunning) {
-        const liveDurationSec = baseSec + liveSec;
-        const stepInterval = n.tier === 0 ? 5 : 6 + (idx % 3);
-        const liveSteps = (n.steps || 20) + Math.floor(liveSec / stepInterval);
-        const tokVelocity = (n.totalTokens || 0) >= 5_000_000 ? 1_650 + idx * 180 : 260 + idx * 45;
-        const ctxVelocity = 95 + idx * 18;
-        const liveTotalTokens = (n.totalTokens || 250_000) + liveSec * tokVelocity;
-        const liveCtxTokens = Math.min(488_000, baseCtx + (liveSec % 300) * ctxVelocity);
-        const costVelocity = currencySymbol === '$' ? 0.0028 : 0.016;
-        const liveCostVal = baseCost + liveSec * costVelocity;
-        const liveCtxPct = Number(((liveCtxTokens / 512_000) * 100).toFixed(1));
-
-        n.durationSec = liveDurationSec;
-        n.steps = liveSteps;
-        n.durationFormatted = `${formatDurationSec(liveDurationSec)} · ${liveSteps} steps`;
-        n.totalTokens = liveTotalTokens;
-        n.totalTokensFormatted = formatCompactNumber(liveTotalTokens);
-        n.contextTokens = liveCtxTokens;
-        n.contextTokensFormatted = formatCompactNumber(liveCtxTokens);
-        n.costUsd = liveCostVal;
-        n.costFormatted = `${currencySymbol}${liveCostVal.toFixed(2)}`;
-        n.contextUsedPct = liveCtxPct;
-
-        // Subtle live DNA bar shift as toolResults & assistantMessages stream in
-        const shift = liveSec % 4;
-        n.dna.toolResults = Math.min(48, (n.dna.toolResults || 30) + shift);
-        n.dna.freeWindow = Math.max(5, (n.dna.freeWindow || 12) - shift);
-      } else {
-        n.durationSec = baseSec;
-        n.contextTokens = baseCtx;
-        n.costUsd = baseCost;
-        n.totalTokensFormatted = formatCompactNumber(n.totalTokens || 200_000);
-        n.contextTokensFormatted = formatCompactNumber(baseCtx);
-      }
+      n.durationSec = baseSec;
+      n.steps = Number(n.steps || 0);
+      n.durationFormatted = `${formatDurationSec(baseSec)} · ${n.steps} steps`;
+      n.totalTokens = Number(n.totalTokens || 0);
+      n.totalTokensFormatted = formatCompactNumber(n.totalTokens);
+      n.contextTokens = baseCtx;
+      n.contextTokensFormatted = formatCompactNumber(baseCtx);
+      n.costUsd = baseCost;
+      n.costFormatted = `${currencySymbol}${Number(baseCost || 0).toFixed(2)}`;
+      n.contextUsedPct = Number(((baseCtx / 512_000) * 100).toFixed(1));
       return n;
     });
 
     const runningCount = nodes.filter((n) => n.status === 'RUNNING').length;
     const completedCount = nodes.filter((n) => n.status === 'COMPLETED').length;
+    const cancelledCount = nodes.filter((n) => n.status === 'CANCELLED').length;
     const standbyCount = nodes.filter((n) => n.status === 'STANDBY').length;
     const totalTokens = nodes.reduce((acc, n) => acc + (n.totalTokens || 0), 0);
-    const totalContextTokens = nodes.reduce((acc, n) => acc + (n.contextTokens || 95_000), 0);
-    const totalCostVal = nodes.reduce((acc, n) => acc + (n.costUsd || 0.35), 0);
+    const totalContextTokens = nodes.reduce((acc, n) => acc + (n.contextTokens || 0), 0);
+    const totalCostVal = nodes.reduce((acc, n) => acc + (n.costUsd || 0), 0);
     const subNodes = nodes.filter((n) => n.tier > 0);
     const subCompleted = subNodes.filter((n) => n.status === 'COMPLETED').length;
     const activeSubagentCount = subNodes.filter((n) => n.status === 'RUNNING').length;
@@ -1937,7 +2252,12 @@ function buildSwarmFormations(
           id: `${pid}->${node.id}`,
           from: pid,
           to: node.id,
-          status: node.status === 'RUNNING' ? 'RUNNING' : 'COMPLETED',
+          status:
+            node.status === 'RUNNING'
+              ? 'RUNNING'
+              : node.status === 'CANCELLED'
+                ? 'CANCELLED'
+                : 'COMPLETED',
           color: palette[colorIdx++ % palette.length],
         });
       }
@@ -2003,18 +2323,20 @@ function buildSwarmFormations(
       recalledCount,
       summary: {
         totalAgents: nodes.length,
+        subagentCount: subNodes.length,
         runningCount,
         completedCount,
+        cancelledCount,
         standbyCount,
         activeSubagentCount,
         inactiveSubagentCount,
         recalledCount,
-        totalTokens,
-        totalTokensFormatted: formatCompactNumber(totalTokens),
-        totalContextFormatted: formatCompactNumber(totalContextTokens),
+        totalTokens: hasObservedActivity ? totalTokens : null,
+        totalTokensFormatted: hasObservedActivity ? formatCompactNumber(totalTokens) : '0',
+        totalContextFormatted: hasObservedActivity ? formatCompactNumber(totalContextTokens) : '0',
         estimatedCostFormatted: `${currencySymbol}${totalCostVal.toFixed(2)}`,
         progressCompleted: subCompleted,
-        progressTotal: Math.max(1, subNodes.length),
+        progressTotal: subNodes.length,
       },
       nodes,
       edges,
@@ -2053,47 +2375,106 @@ function buildSwarmFormations(
 }
 
 /**
- * Computes real-time Context Window & Token DNA Analytics (matching Screenshot 1)
- * from the active conversation transcript, workspace RAG index, and real-time wall clock.
+ * Computes deterministic Context Window & Token DNA Analytics from the active
+ * conversation transcript, workspace telemetry, and RAG index without any wall-clock drift.
+ * Supports both:
+ *   - buildContextAndTokenAnalytics(workspaceRoot, ragStatus, telemetry, options)
+ *   - gatherContextAnalytics(workspaceContext, activeBrain, ragDocuments, options)
  */
-function gatherContextAnalytics(workspaceContext, activeBrain, ragDocuments = []) {
-  const liveSec = getLiveWallSec();
-  const steps = Math.max(1, (activeBrain?.totalSteps || 24) + Math.floor(liveSec / 5));
-  const turns = Math.max(1, activeBrain?.userTurns || 2);
-  const modelReplies = Math.max(
-    1,
-    (activeBrain?.modelReplies || Math.ceil(steps * 0.45)) + Math.floor(liveSec / 10)
-  );
-  const reads = (activeBrain?.readOps ?? 11) + Math.floor(liveSec / 8);
-  const writes = (activeBrain?.writeOps ?? 4) + Math.floor(liveSec / 16);
-  const searches = (activeBrain?.searchOps ?? 14) + Math.floor(liveSec / 11);
+export function buildContextAndTokenAnalytics(arg1, arg2 = null, arg3 = [], arg4 = {}) {
+  let workspaceContext;
+  let workspaceRoot;
+  let activeBrain = null;
+  let ragDocuments = [];
+  let telemetryOverride = null;
+  let options = {};
+
+  if (typeof arg1 === 'string') {
+    workspaceRoot = arg1;
+    workspaceContext = {
+      workspaceRoot,
+      workspaceName:
+        extractWorkspaceName(normalizeWorkspacePath(workspaceRoot)) || path.basename(workspaceRoot),
+    };
+    const ragStatus = arg2 || {};
+    ragDocuments = Array.isArray(ragStatus?.documents) ? ragStatus.documents : [];
+    telemetryOverride = arg3 && !Array.isArray(arg3) ? arg3 : null;
+    options = arg4 && typeof arg4 === 'object' ? arg4 : {};
+    activeBrain = options.activeBrain || resolveWorkspaceBrainTranscript(workspaceContext);
+  } else {
+    workspaceContext = arg1 || { workspaceRoot: REPO_ROOT, workspaceName: 'Gravity-Well-Harness' };
+    workspaceRoot = workspaceContext.workspaceRoot || REPO_ROOT;
+    activeBrain = arg2 || null;
+    ragDocuments = Array.isArray(arg3) ? arg3 : [];
+    options = arg4 && typeof arg4 === 'object' ? arg4 : {};
+    telemetryOverride = options.telemetry || null;
+  }
+
+  const activity = inspectTelemetryActivity(workspaceRoot, activeBrain, telemetryOverride);
+  const demoMode = Boolean(options.demoMode);
+  const hasRealTranscriptOrEvents = activity.hasRealTranscriptOrEvents;
+  const hasObservedOrDemo = hasRealTranscriptOrEvents || demoMode;
+  const telemetryQuality = hasRealTranscriptOrEvents
+    ? 'observed'
+    : demoMode
+      ? 'simulated'
+      : 'unavailable';
+
+  const steps = hasObservedOrDemo
+    ? Math.max(1, activeBrain?.totalSteps || activity.recordedToolCalls || (demoMode ? 12 : 1))
+    : 0;
+  const turns = hasObservedOrDemo
+    ? Math.max(1, activeBrain?.userTurns || activity.telSessions.length || 1)
+    : 0;
+  const modelReplies = hasObservedOrDemo
+    ? Math.max(1, activeBrain?.modelReplies || Math.ceil(steps * 0.5))
+    : 0;
+  const reads = hasObservedOrDemo
+    ? (activeBrain?.readOps ??
+      activity.telEvents.filter((e) => /read|view|get/i.test(e.toolName || '')).length)
+    : 0;
+  const writes = hasObservedOrDemo
+    ? (activeBrain?.writeOps ??
+      activity.telEvents.filter((e) => /write|edit|record/i.test(e.toolName || '')).length)
+    : 0;
+  const searches = hasObservedOrDemo
+    ? (activeBrain?.searchOps ??
+      activity.telEvents.filter((e) => /search|query|grep|find/i.test(e.toolName || '')).length)
+    : 0;
   const userInputs = turns;
   const ioTotal = userInputs + reads + writes + searches;
 
-  const ragInjected = Math.max(ragDocuments.length, activeBrain?.ragInjections || 5);
+  const ragInjected = hasObservedOrDemo
+    ? Math.max(ragDocuments.length, activeBrain?.ragInjections || 0)
+    : 0;
   const compacted = steps > 45 ? 1 : 0;
   const pruned = 0;
   const contextEventsTotal = ragInjected + compacted + pruned;
-  const skillsLoaded = Math.max(2, activeBrain?.skillInjections || 3);
+  const skillsLoaded = hasObservedOrDemo ? Math.max(1, activeBrain?.skillInjections || 2) : 0;
 
-  // Compute realistic token counts scaled by actual transcript characters, steps, and real-time streaming
-  const sysTokens = 25_700;
-  const toolDefTokens = 148_200;
-  const userTokens = Math.max(4_800, Math.round((activeBrain?.userChars || 16_000) / 3.2));
-  const ragTokens = Math.max(54_000, ragInjected * 9_200 + (liveSec % 60) * 40);
-  const skillTokens = Math.max(38_500, skillsLoaded * 13_500);
-  const assistantTokens = Math.max(
-    142_000,
-    Math.round(((activeBrain?.assistantChars || 95_000) + steps * 4_200) * 1.1) + liveSec * 165
-  );
-  const toolResultTokens = Math.max(
-    398_000,
-    Math.round(((activeBrain?.toolResultsChars || 180_000) + steps * 9_500) * 1.2) + liveSec * 235
-  );
-  const outputThinkingTokens = Math.max(
-    12_400,
-    Math.round(((activeBrain?.thinkingChars || 28_000) + 12_000) / 3.0) + liveSec * 75
-  );
+  // Deterministic token counts scaled strictly by recorded transcript/hook activity (zero wall-clock drift)
+  const sysTokens = hasObservedOrDemo ? 4_200 : 0;
+  const toolDefTokens = hasObservedOrDemo ? 14_800 : 0;
+  const userTokens = hasObservedOrDemo
+    ? Math.max(600, Math.round((activeBrain?.userChars || turns * 1_200) / 3.2))
+    : 0;
+  const ragTokens = hasObservedOrDemo ? ragInjected * 1_450 : 0;
+  const skillTokens = hasObservedOrDemo ? skillsLoaded * 1_800 : 0;
+  const assistantTokens = hasObservedOrDemo
+    ? Math.max(
+        1_200,
+        Math.round(((activeBrain?.assistantChars || steps * 1_600) + steps * 800) * 1.0)
+      )
+    : 0;
+  const toolResultTokens = hasObservedOrDemo
+    ? Math.max(
+        1_800,
+        Math.round(((activeBrain?.toolResultsChars || steps * 2_400) + steps * 1_200) * 1.0)
+      )
+    : 0;
+  const outputThinkingTokens = hasObservedOrDemo
+    ? Math.max(400, Math.round(((activeBrain?.thinkingChars || steps * 900) + 600) / 3.0))
+    : 0;
 
   const totalSessionTokens =
     sysTokens +
@@ -2105,7 +2486,10 @@ function gatherContextAnalytics(workspaceContext, activeBrain, ragDocuments = []
     toolResultTokens +
     outputThinkingTokens;
 
-  const pct = (val) => Number(((val / Math.max(1, totalSessionTokens)) * 100).toFixed(1));
+  const pct = (val) =>
+    totalSessionTokens > 0
+      ? Number(((val / Math.max(1, totalSessionTokens)) * 100).toFixed(1))
+      : 0;
 
   const tokenCategories = [
     {
@@ -2184,18 +2568,20 @@ function gatherContextAnalytics(workspaceContext, activeBrain, ragDocuments = []
 
   // Current Context Window (Next Request Snapshot)
   const maxWindowTokens = 512_000;
-  const winSys = 4_200;
-  const winTools = 14_800;
-  const winUser = Math.min(8_500, Math.max(950, Math.round(userTokens * 0.35)));
-  const winRag = Math.min(18_000, Math.max(4_600, ragDocuments.length * 1_450 + (liveSec % 90) * 20));
-  const winSkill = Math.min(12_000, Math.max(3_200, skillsLoaded * 1_800));
-  const winAssistant = Math.min(84_000, Math.max(11_400, steps * 480 + (liveSec % 240) * 95));
-  const winToolRes = Math.min(148_000, Math.max(26_500, steps * 1_120 + (liveSec % 240) * 145));
+  const winSys = hasObservedOrDemo ? 4_200 : 0;
+  const winTools = hasObservedOrDemo ? 14_800 : 0;
+  const winUser = hasObservedOrDemo ? Math.min(8_500, Math.max(400, Math.round(userTokens * 0.5))) : 0;
+  const winRag = hasObservedOrDemo ? Math.min(18_000, ragDocuments.length * 1_450) : 0;
+  const winSkill = hasObservedOrDemo ? Math.min(12_000, skillsLoaded * 1_800) : 0;
+  const winAssistant = hasObservedOrDemo ? Math.min(84_000, steps * 480) : 0;
+  const winToolRes = hasObservedOrDemo ? Math.min(148_000, steps * 1_120) : 0;
   const usedWindowTokens =
     winSys + winTools + winUser + winRag + winSkill + winAssistant + winToolRes;
-  const usedWindowPct = Number(((usedWindowTokens / maxWindowTokens) * 100).toFixed(1));
+  const usedWindowPct =
+    usedWindowTokens > 0 ? Number(((usedWindowTokens / maxWindowTokens) * 100).toFixed(1)) : 0;
 
-  const winPct = (v) => Math.max(1, Math.round((v / Math.max(1, usedWindowTokens)) * 100));
+  const winPct = (v) =>
+    usedWindowTokens > 0 ? Math.max(1, Math.round((v / Math.max(1, usedWindowTokens)) * 100)) : 0;
 
   const currentWindowCategories = [
     {
@@ -2205,11 +2591,13 @@ function gatherContextAnalytics(workspaceContext, activeBrain, ragDocuments = []
       tokens: winSys,
       tokensFormatted: `≈${formatCompactNumber(winSys)}`,
       pct: winPct(winSys),
-      itemCount: 2,
-      items: [
-        'Antigravity Core Identity & Tooling Prompt',
-        'Gravity Well Harness Rules (plugin/harness-ide/rules/AGENTS.md)',
-      ],
+      itemCount: hasObservedOrDemo ? 2 : 0,
+      items: hasObservedOrDemo
+        ? [
+            'Antigravity Core Identity & Tooling Prompt',
+            'Gravity Well Harness Rules (plugin/harness-ide/rules/AGENTS.md)',
+          ]
+        : [],
     },
     {
       key: 'toolDefinitions',
@@ -2218,12 +2606,14 @@ function gatherContextAnalytics(workspaceContext, activeBrain, ragDocuments = []
       tokens: winTools,
       tokensFormatted: `≈${formatCompactNumber(winTools)}`,
       pct: winPct(winTools),
-      itemCount: 29,
-      items: [
-        'harness_query, harness_get, harness_multi_get, harness_status, harness_snapshot_lock, harness_record_experience',
-        'invoke_subagent, send_message, manage_subagents, run_command, read_file, write_file, edit_file',
-        'Context7 MCP (resolve-library-id, query-docs)',
-      ],
+      itemCount: hasObservedOrDemo ? 16 : 0,
+      items: hasObservedOrDemo
+        ? [
+            'harness_query, harness_get, harness_multi_get, harness_status, harness_snapshot_lock, harness_record_experience',
+            'invoke_subagent, send_message, manage_subagents, run_command, read_file, write_file, edit_file',
+            'Context7 MCP (resolve-library-id, query-docs)',
+          ]
+        : [],
     },
     {
       key: 'userMessages',
@@ -2233,10 +2623,12 @@ function gatherContextAnalytics(workspaceContext, activeBrain, ragDocuments = []
       tokensFormatted: `≈${formatCompactNumber(winUser)}`,
       pct: winPct(winUser),
       itemCount: turns,
-      items: [
-        activeBrain?.lastUserPrompt ||
-          `Active prompt in ${workspaceContext.workspaceName}`,
-      ],
+      items: hasObservedOrDemo
+        ? [
+            activeBrain?.lastUserPrompt ||
+              `Active prompt in ${workspaceContext.workspaceName}`,
+          ]
+        : [],
     },
     {
       key: 'injectedRag',
@@ -2245,11 +2637,12 @@ function gatherContextAnalytics(workspaceContext, activeBrain, ragDocuments = []
       tokens: winRag,
       tokensFormatted: `≈${formatCompactNumber(winRag)}`,
       pct: winPct(winRag),
-      itemCount: Math.max(1, ragDocuments.length),
-      items:
-        ragDocuments.length > 0
+      itemCount: hasObservedOrDemo ? ragDocuments.length : 0,
+      items: hasObservedOrDemo
+        ? ragDocuments.length > 0
           ? ragDocuments.slice(0, 5).map((d) => `[${d.docid}] ${d.title} (${d.collection})`)
-          : ['SessionStart Pre-Planning RAG Context Hook'],
+          : ['SessionStart Pre-Planning RAG Context Hook']
+        : [],
     },
     {
       key: 'skillInjection',
@@ -2259,11 +2652,13 @@ function gatherContextAnalytics(workspaceContext, activeBrain, ragDocuments = []
       tokensFormatted: `≈${formatCompactNumber(winSkill)}`,
       pct: winPct(winSkill),
       itemCount: skillsLoaded,
-      items: [
-        'harness2-loop (Propose → Probe → Compose)',
-        'qmd-knowledge-lifecycle (Local Hybrid RAG & Provenance)',
-        'harness-swarm-monitor (Auxiliary Pane UI Sidecar)',
-      ],
+      items: hasObservedOrDemo
+        ? [
+            'harness2-loop (Propose → Probe → Compose)',
+            'qmd-knowledge-lifecycle (Local Hybrid RAG & Provenance)',
+            'harness-swarm-monitor (Auxiliary Pane UI Sidecar)',
+          ]
+        : [],
     },
     {
       key: 'assistantMessages',
@@ -2273,7 +2668,9 @@ function gatherContextAnalytics(workspaceContext, activeBrain, ragDocuments = []
       tokensFormatted: `≈${formatCompactNumber(winAssistant)}`,
       pct: winPct(winAssistant),
       itemCount: modelReplies,
-      items: [`${modelReplies} planner reasoning & response steps in current trajectory`],
+      items: hasObservedOrDemo
+        ? [`${modelReplies} planner reasoning & response steps in current trajectory`]
+        : [],
     },
     {
       key: 'toolResults',
@@ -2282,15 +2679,17 @@ function gatherContextAnalytics(workspaceContext, activeBrain, ragDocuments = []
       tokens: winToolRes,
       tokensFormatted: `≈${formatCompactNumber(winToolRes)}`,
       pct: winPct(winToolRes),
-      itemCount: Math.max(1, reads + writes + searches),
-      items: (activeBrain?.recentTools || [])
+      itemCount: reads + writes + searches,
+      items: (activeBrain?.recentTools || activity.telEvents || [])
         .slice(0, 5)
-        .map((t) => `Step #${t.stepIndex}: ${t.toolName} — ${t.summary}`),
+        .map((t, i) => `Step #${t.stepIndex ?? i + 1}: ${t.toolName} — ${t.summary || t.toolName}`),
     },
   ];
 
-  // Latency Breakdown (Real-Time Ticking)
-  const totalSec = Math.max(45, (activeBrain?.activeDurationSec || 78) + liveSec);
+  // Latency Breakdown (Deterministic)
+  const totalSec = hasObservedOrDemo
+    ? Math.max(12, activeBrain?.activeDurationSec || steps * 4)
+    : 0;
   const waitSec = Number((totalSec * 0.295).toFixed(1));
   const thinkSec = Number((totalSec * 0.415).toFixed(1));
   const replySec = Number((totalSec * 0.16).toFixed(1));
@@ -2303,114 +2702,112 @@ function gatherContextAnalytics(workspaceContext, activeBrain, ragDocuments = []
       label: 'Model Wait (模型等待)',
       color: '#6366f1',
       durationFormatted: `${waitSec}s · ${modelReplies}x`,
-      pct: 29.5,
+      pct: hasObservedOrDemo ? 29.5 : 0,
     },
     {
       key: 'modelThinking',
       label: 'Model Thinking (模型思考)',
       color: '#8b5cf6',
       durationFormatted: `${thinkSec}s · ${modelReplies}x`,
-      pct: 41.5,
+      pct: hasObservedOrDemo ? 41.5 : 0,
     },
     {
       key: 'modelReply',
       label: 'Model Reply (模型回复)',
       color: '#ec4899',
       durationFormatted: `${replySec}s · ${modelReplies}x`,
-      pct: 16.0,
+      pct: hasObservedOrDemo ? 16.0 : 0,
     },
     {
       key: 'toolArgs',
       label: 'Tool Args (工具参数)',
       color: '#f59e0b',
       durationFormatted: `${argsSec}s · ${reads + writes + searches}x`,
-      pct: 6.5,
+      pct: hasObservedOrDemo ? 6.5 : 0,
     },
     {
       key: 'toolExec',
       label: 'Tool Execution (工具执行)',
       color: '#10b981',
       durationFormatted: `${execSec}s · ${reads + writes + searches}x`,
-      pct: 6.2,
+      pct: hasObservedOrDemo ? 6.2 : 0,
     },
     {
       key: 'otherOverhead',
       label: 'Other Overhead (其他开销)',
       color: '#64748b',
-      durationFormatted: `${12 + (liveSec % 7)}ms`,
-      pct: 0.3,
+      durationFormatted: hasObservedOrDemo ? '12ms' : '0ms',
+      pct: hasObservedOrDemo ? 0.3 : 0,
     },
   ];
 
-  // Step-by-Step Context Trend (20 bars)
-  const bucketCount = Math.min(20, Math.max(10, steps));
+  // Step-by-Step Context Trend (deterministic; empty when no observed events)
   const stepTrends = [];
-  for (let i = 1; i <= bucketCount; i++) {
-    const ratio = i / bucketCount;
-    const stepNo = Math.max(1, Math.round(ratio * steps));
-    const sysH = winSys;
-    const toolDefH = winTools;
-    const ragH = Math.round(winRag * (0.4 + 0.6 * ratio));
-    const skillH = Math.round(winSkill * (0.5 + 0.5 * ratio));
-    const asstH = Math.round(winAssistant * ratio);
-    const toolResH = Math.round(winToolRes * Math.pow(ratio, 1.15));
-    const totalStepTokens = sysH + toolDefH + ragH + skillH + asstH + toolResH;
-    const latencyStepSec = Number(
-      (1.8 + ((i * 7 + (i === bucketCount ? liveSec % 4 : 0)) % 5) * 1.4 + (i % 3 === 0 ? 2.6 : 0)).toFixed(1)
-    );
+  if (hasObservedOrDemo) {
+    const bucketCount = Math.min(20, Math.max(10, steps));
+    for (let i = 1; i <= bucketCount; i++) {
+      const ratio = i / bucketCount;
+      const stepNo = Math.max(1, Math.round(ratio * steps));
+      const sysH = winSys;
+      const toolDefH = winTools;
+      const ragH = Math.round(winRag * (0.4 + 0.6 * ratio));
+      const skillH = Math.round(winSkill * (0.5 + 0.5 * ratio));
+      const asstH = Math.round(winAssistant * ratio);
+      const toolResH = Math.round(winToolRes * Math.pow(ratio, 1.15));
+      const totalStepTokens = sysH + toolDefH + ragH + skillH + asstH + toolResH;
+      const latencyStepSec = Number(
+        (1.8 + ((i * 7) % 5) * 1.4 + (i % 3 === 0 ? 2.6 : 0)).toFixed(1)
+      );
 
-    stepTrends.push({
-      barIndex: i,
-      stepNumber: stepNo,
-      totalTokens: totalStepTokens,
-      totalFormatted: formatCompactNumber(totalStepTokens),
-      latencySec: latencyStepSec,
-      segments: {
-        toolDefinitions: toolDefH,
-        systemPrompt: sysH,
-        injectedRag: ragH,
-        skillInjection: skillH,
-        assistantMessages: asstH,
-        toolResults: toolResH,
-      },
-    });
+      stepTrends.push({
+        barIndex: i,
+        stepNumber: stepNo,
+        totalTokens: totalStepTokens,
+        totalFormatted: formatCompactNumber(totalStepTokens),
+        latencySec: latencyStepSec,
+        segments: {
+          toolDefinitions: toolDefH,
+          systemPrompt: sysH,
+          injectedRag: ragH,
+          skillInjection: skillH,
+          assistantMessages: asstH,
+          toolResults: toolResH,
+        },
+      });
+    }
   }
 
-  // Top tool call breakdown
-  const rawCounts = activeBrain?.toolCounts || {};
+  // Top tool call breakdown (deterministic)
+  const rawCounts = { ...(activeBrain?.toolCounts || {}) };
+  if (Object.keys(rawCounts).length === 0 && activity.telEvents.length > 0) {
+    for (const ev of activity.telEvents) {
+      const tName = ev?.toolName || 'tool';
+      rawCounts[tName] = (rawCounts[tName] || 0) + 1;
+    }
+  }
   const sortedTools = Object.entries(rawCounts).sort((a, b) => b[1] - a[1]);
-  const topTools =
-    sortedTools.length > 0
-      ? sortedTools.slice(0, 4).map(([name, count], idx) => ({
-          name,
-          count: count + (idx === 0 ? Math.floor(liveSec / 8) : Math.floor(liveSec / 16)),
-        }))
-      : [
-          { name: 'read_file', count: reads },
-          { name: 'harness_query', count: ragInjected },
-          { name: 'write_file', count: writes },
-          { name: 'run_command', count: 5 + Math.floor(liveSec / 18) },
-        ];
-  const totalToolCalls =
-    topTools.reduce((acc, t) => acc + t.count, 0) || reads + writes + searches;
+  const topTools = hasObservedOrDemo
+    ? sortedTools.slice(0, 4).map(([name, count]) => ({ name, count }))
+    : [];
+  const totalToolCalls = hasObservedOrDemo
+    ? topTools.reduce((acc, t) => acc + t.count, 0) || activity.recordedToolCalls
+    : 0;
 
-  const subCount = (activeBrain?.subagents || []).length || 5;
-  const subTokens = subCount * 385_000 + liveSec * 420;
-  const liveOutputSpeed = 228 + Math.round(Math.sin(liveSec * 0.85) * 16 + Math.cos(liveSec * 0.35) * 6);
-  const liveCacheHitPct = Number((94.2 + Math.sin(liveSec * 0.4) * 0.38).toFixed(2));
-  const localTelPath = path.join(workspaceContext.workspaceRoot, '.harness', 'runtime', 'telemetry.json');
-  let hasHookEvents = false;
-  if (fs.existsSync(localTelPath)) {
-    try {
-      const tel = JSON.parse(fs.readFileSync(localTelPath, 'utf8'));
-      hasHookEvents = Array.isArray(tel.recentEvents) && tel.recentEvents.length > 0;
-    } catch {}
-  }
-  const hasRealTranscriptOrEvents = Boolean((activeBrain && activeBrain.totalSteps > 0) || hasHookEvents);
-  const telemetryQuality = hasRealTranscriptOrEvents ? 'observed' : 'estimated';
+  const subCount = hasObservedOrDemo
+    ? (activeBrain?.subagents?.length ?? activity.telSubs.length)
+    : 0;
+  const subTokens = hasObservedOrDemo ? subCount * 32_000 : 0;
+  const liveOutputSpeed = hasObservedOrDemo ? 228 : 0;
+  const liveCacheHitPct = hasObservedOrDemo ? 94.2 : 0;
 
   return {
     telemetryQuality,
+    observedSteps: steps,
+    observedSubagentCount: subCount,
+    observedTokens: hasObservedOrDemo ? totalSessionTokens : null,
+    usedTokens: hasObservedOrDemo ? usedWindowTokens : null,
+    totalSteps: steps,
+    totalTokens: hasObservedOrDemo ? totalSessionTokens : null,
     flowSummary: {
       io: {
         total: ioTotal,
@@ -2447,6 +2844,7 @@ function gatherContextAnalytics(workspaceContext, activeBrain, ragDocuments = []
     },
     tokenStats: {
       quality: telemetryQuality,
+      observedTokens: hasObservedOrDemo ? totalSessionTokens : null,
       totalTokens: totalSessionTokens,
       totalFormatted: formatCompactNumber(totalSessionTokens),
       cacheHitPct: liveCacheHitPct,
@@ -2462,6 +2860,7 @@ function gatherContextAnalytics(workspaceContext, activeBrain, ragDocuments = []
     currentWindow: {
       quality: telemetryQuality,
       modelName: 'Gemini 4 Argon (High) · Gravity Well Harness',
+      observedTokens: hasObservedOrDemo ? usedWindowTokens : null,
       usedTokens: usedWindowTokens,
       usedFormatted: formatCompactNumber(usedWindowTokens),
       maxTokens: maxWindowTokens,
@@ -2473,6 +2872,8 @@ function gatherContextAnalytics(workspaceContext, activeBrain, ragDocuments = []
   };
 }
 
+export const gatherContextAnalytics = buildContextAndTokenAnalytics;
+
 async function gatherSwarmState(
   workspaceContext,
   ragStatus,
@@ -2480,27 +2881,10 @@ async function gatherSwarmState(
   activeBrain = null,
   contextAnalytics = null
 ) {
-  const { workspaceRoot, lsConnected, trajectoriesResponse } = workspaceContext;
-  let mcpServers = [];
+  const { workspaceRoot, lsConnected } = workspaceContext;
+  const mcpServers = [];
 
-  try {
-    const mcpRes = await lsCache.call('GetMcpServerStates', {});
-    if (mcpRes && Array.isArray(mcpRes.states)) {
-      mcpServers = mcpRes.states.map((s) => ({
-        name: s.serverName || s.name || 'mcp',
-        status: s.status || 'CONNECTED',
-        toolCount: Array.isArray(s.tools) ? s.tools.length : 0,
-      }));
-    }
-  } catch {}
-
-  let hookTelemetry = { sessions: {}, recentEvents: [] };
-  const localTelPath = path.join(workspaceRoot, '.harness', 'runtime', 'telemetry.json');
-  if (fs.existsSync(localTelPath)) {
-    try {
-      hookTelemetry = JSON.parse(fs.readFileSync(localTelPath, 'utf8'));
-    } catch {}
-  }
+  const hookTelemetry = loadWorkspaceTelemetry(workspaceRoot);
 
   if (!activeBrain) {
     activeBrain = resolveWorkspaceBrainTranscript(workspaceContext);
@@ -2578,7 +2962,8 @@ async function gatherSwarmState(
     liveSubagents,
     ragStatus,
     contextAnalytics,
-    ragDocuments
+    ragDocuments,
+    { telemetry: hookTelemetry }
   );
 
   const recentEvents =
@@ -2586,40 +2971,27 @@ async function gatherSwarmState(
       ? activeBrain.recentTools
       : hookTelemetry.recentEvents || [];
 
-  const rawSummaries = trajectoriesResponse?.trajectorySummaries;
-  const lsTrajectories = Array.isArray(rawSummaries)
-    ? rawSummaries.slice(0, 8)
-    : rawSummaries && typeof rawSummaries === 'object'
-      ? Object.entries(rawSummaries)
-          .slice(0, 8)
-          .map(([cid, t]) => ({
-            cascadeId: cid,
-            summary: t.summary || 'Active Conversation',
-            stepCount: t.stepCount || 0,
-            status: t.status || 'IDLE',
-            workspaceUri: extractTrajectoryWorkspace(t) || workspaceRoot,
-          }))
-      : [];
-
-  const hasRealTranscriptOrEvents = Boolean(
-    (activeBrain && activeBrain.totalSteps > 0) ||
-      recentEvents.length > 0 ||
-      liveSubagents.length > 0
-  );
-  const telemetryQuality = hasRealTranscriptOrEvents ? 'observed' : 'estimated';
+  const activity = inspectTelemetryActivity(workspaceRoot, activeBrain, hookTelemetry);
+  const hasRealTranscriptOrEvents =
+    activity.hasRealTranscriptOrEvents || recentEvents.length > 0 || liveSubagents.length > 0;
+  const telemetryQuality = hasRealTranscriptOrEvents ? 'observed' : 'unavailable';
 
   return {
     telemetryQuality,
+    observedSubagents: liveSubagents,
+    observedSubagentCount: liveSubagents.length,
     lsConnected,
     activeConversationId:
       activeBrain?.conversationId ||
       workspaceContext.activeConversationId ||
-      'live-session',
+      (hasRealTranscriptOrEvents ? 'live-session' : 'none'),
     mainAgent: {
       role: `Main Orchestrator Agent (${workspaceContext.workspaceName})`,
       model: 'Gemini 4 Argon (High)',
-      status: 'ACTIVE',
-      totalSteps: activeBrain?.totalSteps || 0,
+      status: hasRealTranscriptOrEvents ? 'ACTIVE' : 'IDLE',
+      totalSteps: hasRealTranscriptOrEvents
+        ? activeBrain?.totalSteps || activity.recordedToolCalls
+        : 0,
       lastUserPrompt:
         activeBrain?.lastUserPrompt ||
         `Gravity Well Harness active in ${workspaceContext.workspaceName}`,
@@ -2630,12 +3002,12 @@ async function gatherSwarmState(
     liveSubagents,
     configuredSwarmRoles,
     recentEvents: recentEvents.slice(0, 25),
-    lsTrajectories,
+    lsTrajectories: [],
     mcpServers:
       mcpServers.length > 0
         ? mcpServers
         : [
-            { name: 'harness_ide_rag_mcp', status: 'READY (Local Stdio)', toolCount: 9 },
+            { name: 'harness_ide_rag_mcp', status: 'READY (Local Stdio)', toolCount: 16 },
             { name: 'harness_ide_context7', status: 'CONFIGURED (Remote HTTP)', toolCount: 2 },
           ],
   };
@@ -2688,11 +3060,33 @@ function syncMcpConfigFromSettings(workspaceRoot, settings) {
   }
 }
 
-export function createHarnessMonitorApp() {
+export function createHarnessMonitorApp(options = {}) {
   const serveAsset = (relPath, contentType) =>
     createAssetHandler(UI_DIR, relPath, contentType, { ResponseClass });
 
-  const app = new SidecarAppClass();
+  const app = new SidecarAppClass(options);
+  if (!app.sessionToken) {
+    app.sessionToken =
+      options.sessionToken ||
+      process.env.AGY_SIDECAR_TOKEN ||
+      crypto.randomBytes(24).toString('hex');
+  }
+  if (!app.registeredWorkspaces) {
+    app.registeredWorkspaces = new Set(DEFAULT_REGISTERED_WORKSPACES);
+  }
+  if (typeof app.registerWorkspace !== 'function') {
+    app.registerWorkspace = (wsPath) => registerWorkspace(wsPath, app.registeredWorkspaces);
+  }
+  if (options.workspaceRoot && fs.existsSync(options.workspaceRoot)) {
+    app.registerWorkspace(options.workspaceRoot);
+    app.defaultWorkspaceRoot = fs.realpathSync(options.workspaceRoot);
+  }
+  if (Array.isArray(options.registeredWorkspaces)) {
+    for (const ws of options.registeredWorkspaces) {
+      app.registerWorkspace(ws);
+    }
+  }
+
   app.page('/', serveAsset('index.html', 'text/html; charset=utf-8'));
   app.page('/index.html', serveAsset('index.html', 'text/html; charset=utf-8'));
   app.page('/ui.html', serveAsset('index.html', 'text/html; charset=utf-8'));
@@ -2704,7 +3098,7 @@ export function createHarnessMonitorApp() {
   app.page('/app.js', serveAsset('app.js', 'text/javascript; charset=utf-8'));
 
   const handleStatus = async (reqData = {}) => {
-    const wsCtx = await resolveWorkspaceContext(reqData);
+    const wsCtx = await resolveWorkspaceContext(reqData, reqData);
     const engine = new HarnessKnowledgeEngine(wsCtx.workspaceRoot);
     return {
       ok: true,
@@ -2715,6 +3109,7 @@ export function createHarnessMonitorApp() {
       hasHarness: wsCtx.hasHarness,
       availableWorkspaces: wsCtx.availableWorkspaces,
       ragStatus: engine.getStatus(),
+      surfaceCompatibilityMatrix: SURFACE_COMPATIBILITY_MATRIX,
       theme: resolveHostTheme(),
       timestamp: new Date().toISOString(),
     };
@@ -2723,19 +3118,22 @@ export function createHarnessMonitorApp() {
   app.api('/api/status', handleStatus, 'GET');
 
   const handleLivePulse = async (reqData = {}) => {
-    const wsCtx = await resolveWorkspaceContext(reqData);
+    const wsCtx = await resolveWorkspaceContext(reqData, reqData);
     const engine = new HarnessKnowledgeEngine(wsCtx.workspaceRoot);
     const status = engine.getStatus();
     const lifecycleState = loadSubagentLifecycle(wsCtx.workspaceRoot);
     const hubCfg = loadHubConfig(wsCtx.workspaceRoot);
     const messageBus = loadMessageBus(wsCtx.workspaceRoot);
     const activeBrain = resolveWorkspaceBrainTranscript(wsCtx);
-    const lastToolObj = activeBrain?.recentTools?.[0] || null;
-    const liveSec = getLiveWallSec();
+    const activity = inspectTelemetryActivity(wsCtx.workspaceRoot, activeBrain);
+    const lastToolObj = activeBrain?.recentTools?.[0] || activity.telEvents?.[0] || null;
+    const totalSteps = activity.hasRealTranscriptOrEvents
+      ? activeBrain?.totalSteps || activity.recordedToolCalls
+      : 0;
     const liveRevision = [
       wsCtx.workspaceRoot,
       activeBrain?.conversationId || 'none',
-      activeBrain?.totalSteps || 0,
+      totalSteps,
       activeBrain?.lastActiveIso || '',
       status.totalDocuments || 0,
       status.indexedAt || '',
@@ -2743,17 +3141,18 @@ export function createHarnessMonitorApp() {
       lifecycleState?.revision || 1,
       messageBus?.revision || 1,
       hubCfg?.updatedAt || '',
-      liveSec,
     ].join('|');
 
     return {
       ok: true,
       liveRevision,
-      liveWallSec: liveSec,
+      telemetryQuality: activity.hasRealTranscriptOrEvents ? 'observed' : 'unavailable',
       workspaceRoot: wsCtx.workspaceRoot,
       workspaceName: wsCtx.workspaceName,
-      totalSteps: (activeBrain?.totalSteps || 24) + Math.floor(liveSec / 5),
-      lastTool: lastToolObj ? `${lastToolObj.toolName}: ${lastToolObj.summary}` : '',
+      totalSteps,
+      lastTool: lastToolObj
+        ? `${lastToolObj.toolName}: ${lastToolObj.summary || lastToolObj.toolName}`
+        : '',
       totalDocuments: status.totalDocuments || 0,
       snapshotLocked: Boolean(status.snapshotIsolationLock?.active),
       timestamp: new Date().toISOString(),
@@ -2763,7 +3162,7 @@ export function createHarnessMonitorApp() {
   app.api('/api/live-pulse', handleLivePulse, 'GET');
 
   const handleDashboard = async (reqData = {}) => {
-    const wsCtx = await resolveWorkspaceContext(reqData);
+    const wsCtx = await resolveWorkspaceContext(reqData, reqData);
     const { workspaceRoot } = wsCtx;
     const engine = new HarnessKnowledgeEngine(workspaceRoot);
     const index = wsCtx.hasHarness
@@ -2774,7 +3173,11 @@ export function createHarnessMonitorApp() {
     const snapshots = wsCtx.hasHarness ? engine.listSnapshots() : [];
     const lifecycleState = loadSubagentLifecycle(workspaceRoot);
     const activeBrain = resolveWorkspaceBrainTranscript(wsCtx);
-    const contextAnalytics = gatherContextAnalytics(wsCtx, activeBrain, index.documents);
+    const hookTelemetry = loadWorkspaceTelemetry(workspaceRoot);
+    const contextAnalytics = buildContextAndTokenAnalytics(wsCtx, activeBrain, index.documents, {
+      telemetry: hookTelemetry,
+      demoMode: Boolean(reqData?.demoMode ?? reqData?.body?.demoMode),
+    });
     const swarm = await gatherSwarmState(
       wsCtx,
       status,
@@ -2790,11 +3193,10 @@ export function createHarnessMonitorApp() {
     const modelCatalog = getEnrichedModelCatalog(workspaceRoot, contextAnalytics);
     const messageBus = loadMessageBus(workspaceRoot);
 
-    const liveSec = getLiveWallSec();
     const liveRevision = [
       workspaceRoot,
       activeBrain?.conversationId || 'none',
-      activeBrain?.totalSteps || 0,
+      contextAnalytics.observedSteps || 0,
       activeBrain?.lastActiveIso || '',
       status.totalDocuments || 0,
       status.indexedAt || '',
@@ -2802,12 +3204,12 @@ export function createHarnessMonitorApp() {
       lifecycleState?.revision || 1,
       messageBus?.revision || 1,
       hubCfg?.updatedAt || '',
-      liveSec,
     ].join('|');
 
     return {
       ok: true,
       formalName: 'Gravity Well Harness',
+      telemetryQuality: contextAnalytics.telemetryQuality,
       liveRevision,
       timestamp: new Date().toISOString(),
       workspaceRoot,
@@ -2877,22 +3279,31 @@ export function createHarnessMonitorApp() {
       const payload = reqData?.body || reqData || {};
       let target;
       try {
-        target = validateAndResolveWorkspacePath(payload.workspaceRoot);
+        target = validateAndResolveWorkspacePath(payload.workspaceRoot, {
+          registeredWorkspaces: app.registeredWorkspaces,
+          allowUnregisteredWorkspaces: app.allowUnregisteredWorkspaces,
+          authenticated: Boolean(reqData?.authenticated),
+          requireAuthForUnregistered: true,
+        });
       } catch (err) {
-        return new ResponseClass({
-          status: 400,
+        return {
+          status: err?.statusCode || 400,
           contentType: 'application/json; charset=utf-8',
           body: JSON.stringify({
             ok: false,
             error: err?.message || `Workspace path does not exist: ${payload.workspaceRoot}`,
           }),
-        });
+        };
       }
+      app.registerWorkspace(target);
       saveActiveWorkspaceState(target, payload.conversationId || '', 'ui_switch');
-      const wsCtx = await resolveWorkspaceContext({
-        workspaceRoot: target,
-        pinnedWorkspace: true,
-      });
+      const wsCtx = await resolveWorkspaceContext(
+        {
+          workspaceRoot: target,
+          pinnedWorkspace: true,
+        },
+        reqData
+      );
       return {
         ok: true,
         workspaceRoot: wsCtx.workspaceRoot,
@@ -2908,7 +3319,7 @@ export function createHarnessMonitorApp() {
     '/api/workspace/init',
     async (reqData = {}) => {
       const payload = reqData?.body || reqData || {};
-      const wsCtx = await resolveWorkspaceContext(payload);
+      const wsCtx = await resolveWorkspaceContext(payload, reqData);
       const engine = new HarnessKnowledgeEngine(wsCtx.workspaceRoot);
       engine.ensureDirectories();
       const settings = engine.loadConfig();
@@ -2959,7 +3370,7 @@ export function createHarnessMonitorApp() {
     '/api/rag/query',
     async (reqData = {}) => {
       const payload = reqData?.body || reqData || {};
-      const wsCtx = await resolveWorkspaceContext(payload);
+      const wsCtx = await resolveWorkspaceContext(payload, reqData);
       const engine = new HarnessKnowledgeEngine(wsCtx.workspaceRoot);
       const res = engine.query({
         query: payload.query || '',
@@ -2980,7 +3391,7 @@ export function createHarnessMonitorApp() {
     '/api/rag/doc',
     async (reqData = {}) => {
       const payload = reqData?.body || reqData || {};
-      const wsCtx = await resolveWorkspaceContext(payload);
+      const wsCtx = await resolveWorkspaceContext(payload, reqData);
       const { workspaceRoot } = wsCtx;
       const engine = new HarnessKnowledgeEngine(workspaceRoot);
 
@@ -3066,7 +3477,7 @@ export function createHarnessMonitorApp() {
     '/api/rag/refresh',
     async (reqData = {}) => {
       const payload = reqData?.body || reqData || {};
-      const wsCtx = await resolveWorkspaceContext(payload);
+      const wsCtx = await resolveWorkspaceContext(payload, reqData);
       const engine = new HarnessKnowledgeEngine(wsCtx.workspaceRoot);
       const idx = engine.buildIndex({ runQmdSync: true });
       return {
@@ -3085,7 +3496,7 @@ export function createHarnessMonitorApp() {
     '/api/harness2/snapshot',
     async (reqData = {}) => {
       const payload = reqData?.body || reqData || {};
-      const wsCtx = await resolveWorkspaceContext(payload);
+      const wsCtx = await resolveWorkspaceContext(payload, reqData);
       const engine = new HarnessKnowledgeEngine(wsCtx.workspaceRoot);
       const action = payload.action || 'status';
 
@@ -3096,11 +3507,11 @@ export function createHarnessMonitorApp() {
           mode: payload.mode || 'parallel',
           description: payload.description || 'Manual UI Snapshot Isolation Lock',
         });
-        return { ok: true, lock };
+        return { ok: lock?.ok !== false, lock };
       }
       if (action === 'release') {
         const res = engine.releaseSnapshotLock();
-        return { ok: true, ...res };
+        return { ok: res?.released !== false, ...res };
       }
       return {
         ok: true,
@@ -3115,21 +3526,25 @@ export function createHarnessMonitorApp() {
     '/api/harness2/experience',
     async (reqData = {}) => {
       const payload = reqData?.body || reqData || {};
-      const wsCtx = await resolveWorkspaceContext(payload);
+      const wsCtx = await resolveWorkspaceContext(payload, reqData);
       const engine = new HarnessKnowledgeEngine(wsCtx.workspaceRoot);
       const action = payload.action || 'record';
 
       if (action === 'promote') {
         const res = engine.promoteExperienceToProjectKnowledge({
+          ...payload,
           task_id_or_docid: payload.task_id_or_docid,
           adr_id: payload.adr_id,
           title: payload.title,
           summary: payload.summary,
+          receiptId: payload.receipt_id ?? payload.receiptId,
+          evaluationReceipt: payload.evaluation_receipt ?? payload.evaluationReceipt,
         });
-        return { ok: true, ...res };
+        return { ok: res?.ok !== false, ...res };
       }
 
       const res = engine.recordExperience({
+        ...payload,
         task_id: payload.task_id || `task-${Date.now()}`,
         domain: payload.domain || 'software-engineering',
         title: payload.title,
@@ -3140,32 +3555,75 @@ export function createHarnessMonitorApp() {
         status: payload.status || 'active',
         tags: payload.tags || ['harness2', 'experience'],
         adopted_harness: payload.adopted_harness || null,
+        receiptId: payload.receipt_id ?? payload.receiptId,
+        evaluationReceipt: payload.evaluation_receipt ?? payload.evaluationReceipt,
+        synthetic: payload.synthetic,
       });
-      return { ok: true, ...res };
+      return { ok: res?.ok !== false, ...res };
     },
     'POST'
   );
 
   const handleSwarmRecall = async (reqData = {}) => {
     const payload = reqData?.body || reqData || {};
-    const wsCtx = await resolveWorkspaceContext(payload);
+    const wsCtx = await resolveWorkspaceContext(payload, reqData);
+    const action = String(payload.action || 'recall').toLowerCase();
+    const nodeId = String(payload.nodeId || '').trim();
+    const activity = inspectTelemetryActivity(wsCtx.workspaceRoot);
+
+    if (action === 'recall') {
+      const isRecordedWorker = activity.telSubs.some((s) => s.id === nodeId);
+      const isKnownTemplateWorker = KNOWN_TEMPLATE_NODE_IDS.has(nodeId);
+      if (!nodeId || (!isRecordedWorker && !isKnownTemplateWorker)) {
+        return {
+          status: 404,
+          contentType: 'application/json; charset=utf-8',
+          body: JSON.stringify({
+            ok: false,
+            status: 'not_found',
+            error: 'UNKNOWN_OR_UNREGISTERED_WORKER',
+            nodeId: nodeId || null,
+            nodeState: null,
+          }),
+        };
+      }
+
+      if (
+        !isRecordedWorker &&
+        !activity.hasRealTranscriptOrEvents &&
+        payload.demoMode !== true &&
+        payload.allowTemplatePreview !== true
+      ) {
+        return {
+          status: 409,
+          contentType: 'application/json; charset=utf-8',
+          body: JSON.stringify({
+            ok: false,
+            status: 'unavailable',
+            error: 'NO_REGISTERED_EXECUTOR_FOR_WORKER',
+            nodeId,
+            nodeState: null,
+          }),
+        };
+      }
+    }
+
     const updated = mutateSubagentLifecycle(wsCtx.workspaceRoot, {
       formationId: payload.formationId || 'live-harness2',
-      nodeId: payload.nodeId || '',
+      nodeId,
       nodeIds: payload.nodeIds || [],
-      action: payload.action || 'recall',
+      action,
       durationSec: Number(payload.durationSec || 180),
     });
-    const entry =
-      payload.nodeId
-        ? updated.nodes?.[`${payload.formationId || 'live-harness2'}:${payload.nodeId}`] || null
-        : null;
+    const entry = nodeId
+      ? updated.nodes?.[`${payload.formationId || 'live-harness2'}:${nodeId}`] || null
+      : null;
     return {
       ok: true,
       workspaceRoot: wsCtx.workspaceRoot,
       formationId: payload.formationId || 'live-harness2',
-      nodeId: payload.nodeId || null,
-      action: payload.action || 'recall',
+      nodeId: nodeId || null,
+      action,
       nodeState: entry,
       revision: updated.revision,
     };
@@ -3174,9 +3632,18 @@ export function createHarnessMonitorApp() {
 
   const handleHarness2Run = async (reqData = {}) => {
     const payload = reqData?.body || reqData || {};
-    const wsCtx = await resolveWorkspaceContext(payload);
+    const wsCtx = await resolveWorkspaceContext(payload, reqData);
     const engine = new HarnessKnowledgeEngine(wsCtx.workspaceRoot);
-    const report = engine.runHarness2Loop({
+    const strictExec = payload.strictExecution ?? payload.strict_execution;
+    const explicitAllowSim = payload.allowSimulation ?? payload.allow_simulation;
+    const resolvedAllowSim =
+      explicitAllowSim !== undefined
+        ? Boolean(explicitAllowSim)
+        : strictExec === true
+          ? false
+          : undefined;
+    const report = await engine.runHarness2Loop({
+      ...payload,
       task_id: payload.task_id || payload.taskId || `task-${Date.now()}`,
       domain: payload.domain || 'software-engineering',
       problem: payload.problem || 'Optimize execution harness with token-efficient reasoning depth.',
@@ -3188,14 +3655,18 @@ export function createHarnessMonitorApp() {
       prober_model_tier: payload.prober_model_tier || payload.proberModelTier,
       early_stop: payload.early_stop ?? payload.earlyStopOnFirstPass,
       record_to_library: payload.record_to_library !== false,
+      requiredArtifacts: payload.requiredArtifacts ?? payload.required_artifacts,
+      allowSimulation: resolvedAllowSim,
+      strictExecution: strictExec,
+      passThreshold: payload.passThreshold ?? payload.pass_threshold,
     });
-    return { ok: true, ...report };
+    return { ok: report?.ok !== false, ...report };
   };
   app.api('/api/harness2/run', handleHarness2Run, 'POST');
 
   const handleModelsConfig = async (reqData = {}) => {
     const payload = reqData?.body || reqData || {};
-    const wsCtx = await resolveWorkspaceContext(payload);
+    const wsCtx = await resolveWorkspaceContext(payload, reqData);
     const updated = saveHubConfig(wsCtx.workspaceRoot, payload.config || payload);
     return {
       ok: true,
@@ -3209,17 +3680,24 @@ export function createHarnessMonitorApp() {
 
   const handleModelsInvoke = async (reqData = {}) => {
     const payload = reqData?.body || reqData || {};
-    const wsCtx = await resolveWorkspaceContext(payload);
+    const wsCtx = await resolveWorkspaceContext(payload, reqData);
     const result = await invokeUnifiedModel(wsCtx.workspaceRoot, {
       modelId: payload.modelId || payload.model_id,
       reasoningDepth: payload.reasoningDepth || payload.reasoning_depth,
       reasoningEffort: payload.reasoningEffort || payload.reasoning_effort,
       prompt: payload.prompt || 'Verify multi-model harness readiness.',
-      systemPrompt: payload.systemPrompt,
+      systemPrompt: payload.systemPrompt || payload.system_prompt,
       delegateToPeerModel: payload.delegateToPeerModel || payload.delegate_to_peer_model,
+      strictExecution: payload.strictExecution ?? payload.strict_execution,
+      allowSimulation: payload.allowSimulation ?? payload.allow_simulation,
+      executionMode: payload.executionMode ?? payload.execution_mode,
+      demoMode: payload.demoMode ?? payload.demo_mode,
+      timeoutMs: payload.timeoutMs ?? payload.timeout_ms,
+      endpoint: payload.endpoint,
+      baseUrl: payload.baseUrl || payload.base_url,
     });
     return {
-      ok: true,
+      ok: result?.ok !== false,
       workspaceRoot: wsCtx.workspaceRoot,
       ...result,
     };
@@ -3228,14 +3706,20 @@ export function createHarnessMonitorApp() {
 
   const handleSearchMulti = async (reqData = {}) => {
     const payload = reqData?.body || reqData || {};
-    const wsCtx = await resolveWorkspaceContext(payload);
+    const wsCtx = await resolveWorkspaceContext(payload, reqData);
     const result = await searchWebMultiEngine(wsCtx.workspaceRoot, {
       query: payload.query || 'Google Research Harness2 self-improving agent',
       engine: payload.engine || 'multi-fusion',
-      limit: Number(payload.limit || 6),
+      limit: Number(payload.limit || payload.maxResults || 6),
+      strictExecution: payload.strictExecution ?? payload.strict_execution,
+      allowSimulation: payload.allowSimulation ?? payload.allow_simulation,
+      executionMode: payload.executionMode ?? payload.execution_mode,
+      demoMode: payload.demoMode ?? payload.demo_mode,
+      endpoint: payload.endpoint,
+      baseUrl: payload.baseUrl || payload.base_url,
     });
     return {
-      ok: true,
+      ok: result?.ok !== false,
       workspaceRoot: wsCtx.workspaceRoot,
       ...result,
     };
@@ -3244,20 +3728,26 @@ export function createHarnessMonitorApp() {
 
   const handleSwarmMessageInject = async (reqData = {}) => {
     const payload = reqData?.body || reqData || {};
-    const wsCtx = await resolveWorkspaceContext(payload);
+    const wsCtx = await resolveWorkspaceContext(payload, reqData);
     const toAgent = payload.toAgent || payload.to_agent || 'harness-proposer';
     const res = await injectOrConveySwarmMessage(wsCtx.workspaceRoot, {
+      id: payload.id ?? payload.messageId ?? payload.message_id,
       fromAgent: payload.fromAgent || payload.from_agent || 'main-orchestrator',
       toAgent,
       fromModel: payload.fromModel || payload.from_model,
       toModel: payload.toModel || payload.to_model,
-      type: payload.type || 'INJECT_DIRECTIVE',
+      type: payload.type || payload.messageType || 'INJECT_DIRECTIVE',
       priority: payload.priority || 'high',
       reasoningDepth: payload.reasoningDepth || payload.reasoning_depth,
       content: payload.content || '',
-      executeTargetModel: payload.executeTargetModel !== false,
+      executeTargetModel:
+        (payload.executeTargetModel ?? payload.execute_target_model) !== false,
+      strictExecution: payload.strictExecution ?? payload.strict_execution,
+      allowSimulation: payload.allowSimulation ?? payload.allow_simulation,
+      executionMode: payload.executionMode ?? payload.execution_mode,
+      demoMode: payload.demoMode ?? payload.demo_mode,
     });
-    if (toAgent && toAgent !== 'main-orchestrator' && toAgent !== 'all') {
+    if (res?.ok !== false && toAgent && toAgent !== 'main-orchestrator' && toAgent !== 'all') {
       mutateSubagentLifecycle(wsCtx.workspaceRoot, {
         formationId: 'live-harness2',
         nodeId: toAgent,
@@ -3266,7 +3756,7 @@ export function createHarnessMonitorApp() {
       });
     }
     return {
-      ok: true,
+      ok: res?.ok !== false,
       workspaceRoot: wsCtx.workspaceRoot,
       ...res,
     };
@@ -3275,21 +3765,29 @@ export function createHarnessMonitorApp() {
 
   const handleSelfImprove = async (reqData = {}) => {
     const payload = reqData?.body || reqData || {};
-    const wsCtx = await resolveWorkspaceContext(payload);
+    const wsCtx = await resolveWorkspaceContext(payload, reqData);
     const engine = new HarnessKnowledgeEngine(wsCtx.workspaceRoot);
     const res = await runSelfImprovementCoopCycle(wsCtx.workspaceRoot, engine, {
-      task: payload.task,
+      ...payload,
+      task: payload.task || payload.problem,
       domain: payload.domain || 'software-engineering',
       reasoningDepth: payload.reasoningDepth || payload.reasoning_depth,
+      strictExecution: payload.strictExecution ?? payload.strict_execution,
+      allowSimulation: payload.allowSimulation ?? payload.allow_simulation,
+      executionMode: payload.executionMode ?? payload.execution_mode,
+      demoMode: payload.demoMode ?? payload.demo_mode,
+      requiredArtifacts: payload.requiredArtifacts ?? payload.required_artifacts,
     });
-    mutateSubagentLifecycle(wsCtx.workspaceRoot, {
-      formationId: 'live-harness2',
-      nodeIds: ['harness-proposer', 'harness-prober-1', 'harness-prober-2', 'harness-composer'],
-      action: 'recall_all',
-      durationSec: 180,
-    });
+    if (res?.ok !== false) {
+      mutateSubagentLifecycle(wsCtx.workspaceRoot, {
+        formationId: 'live-harness2',
+        nodeIds: ['harness-proposer', 'harness-prober-1', 'harness-prober-2', 'harness-composer'],
+        action: 'recall_all',
+        durationSec: 180,
+      });
+    }
     return {
-      ok: true,
+      ok: res?.ok !== false,
       workspaceRoot: wsCtx.workspaceRoot,
       ...res,
     };
@@ -3300,7 +3798,7 @@ export function createHarnessMonitorApp() {
     '/api/settings/save',
     async (reqData = {}) => {
       const payload = reqData?.body || reqData || {};
-      const wsCtx = await resolveWorkspaceContext(payload);
+      const wsCtx = await resolveWorkspaceContext(payload, reqData);
       const engine = new HarnessKnowledgeEngine(wsCtx.workspaceRoot);
       const updated = engine.saveConfig(payload.settings || payload, true);
       syncMcpConfigFromSettings(wsCtx.workspaceRoot, updated);

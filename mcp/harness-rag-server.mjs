@@ -3,15 +3,39 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { HarnessKnowledgeEngine } from '../src/rag-engine.mjs';
-import {
-  invokeUnifiedModel,
-  searchWebMultiEngine,
-  injectOrConveySwarmMessage,
-  runSelfImprovementCoopCycle,
-  getEnrichedModelCatalog,
-  SEARCH_ENGINE_CATALOG,
-} from '../src/model-hub.mjs';
+
+let HarnessKnowledgeEngine;
+try {
+  ({ HarnessKnowledgeEngine } = await import('../src/rag-engine.mjs'));
+} catch {
+  ({ HarnessKnowledgeEngine } = await import('./rag-engine.mjs'));
+}
+
+let invokeUnifiedModel;
+let searchWebMultiEngine;
+let injectOrConveySwarmMessage;
+let runSelfImprovementCoopCycle;
+let getEnrichedModelCatalog;
+let SEARCH_ENGINE_CATALOG;
+try {
+  ({
+    invokeUnifiedModel,
+    searchWebMultiEngine,
+    injectOrConveySwarmMessage,
+    runSelfImprovementCoopCycle,
+    getEnrichedModelCatalog,
+    SEARCH_ENGINE_CATALOG,
+  } = await import('../src/model-hub.mjs'));
+} catch {
+  ({
+    invokeUnifiedModel,
+    searchWebMultiEngine,
+    injectOrConveySwarmMessage,
+    runSelfImprovementCoopCycle,
+    getEnrichedModelCatalog,
+    SEARCH_ENGINE_CATALOG,
+  } = await import('./model-hub.mjs'));
+}
 
 let ContextResilienceManager;
 try {
@@ -22,7 +46,11 @@ try {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const REPO_ROOT = path.resolve(__dirname, '..');
+const REPO_ROOT = fs.existsSync(path.join(path.resolve(__dirname, '..'), '.harness'))
+  ? path.resolve(__dirname, '..')
+  : fs.existsSync(path.join(path.resolve(__dirname, '..', '..', '..'), '.harness'))
+    ? path.resolve(__dirname, '..', '..', '..')
+    : path.resolve(__dirname, '..');
 
 export const SUPPORTED_PROTOCOL_VERSIONS = new Set([
   '2024-11-05',
@@ -34,6 +62,53 @@ function createRpcError(code, message) {
   const err = new Error(message);
   err.code = code;
   return err;
+}
+
+function enforceAllowedWorkspacesBoundary(realPath) {
+  const rawAllowedList = [];
+  if (process.env.HARNESS_ALLOWED_WORKSPACES) {
+    rawAllowedList.push(
+      ...String(process.env.HARNESS_ALLOWED_WORKSPACES)
+        .split(/[,;]+/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+    );
+  }
+  if (process.env.HARNESS_ALLOWED_WORKSPACE_ROOT) {
+    rawAllowedList.push(
+      ...String(process.env.HARNESS_ALLOWED_WORKSPACE_ROOT)
+        .split(/[,;]+/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+    );
+  }
+  if (rawAllowedList.length === 0) return;
+
+  const allowedRealRoots = [];
+  for (const rawAllowed of rawAllowedList) {
+    try {
+      if (fs.existsSync(rawAllowed)) {
+        allowedRealRoots.push(fs.realpathSync(rawAllowed));
+      } else {
+        allowedRealRoots.push(path.resolve(rawAllowed));
+      }
+    } catch {
+      allowedRealRoots.push(path.resolve(rawAllowed));
+    }
+  }
+
+  const normTarget = process.platform === 'win32' ? realPath.toLowerCase() : realPath;
+  const insideAny = allowedRealRoots.some((bound) => {
+    const normBound = process.platform === 'win32' ? bound.toLowerCase() : bound;
+    return normTarget === normBound || normTarget.startsWith(normBound + path.sep);
+  });
+
+  if (!insideAny) {
+    throw createRpcError(
+      -32602,
+      `Workspace "${realPath}" is outside allowed workspace boundary (${allowedRealRoots.join(', ')})`
+    );
+  }
 }
 
 export function resolveWorkspace(args = {}) {
@@ -61,21 +136,7 @@ export function resolveWorkspace(args = {}) {
     if (!stat.isDirectory()) {
       throw createRpcError(-32602, `Invalid workspace_root: path is not a directory (${realPath})`);
     }
-    const allowedBoundary = process.env.HARNESS_ALLOWED_WORKSPACE_ROOT;
-    if (allowedBoundary && fs.existsSync(allowedBoundary)) {
-      const realBoundary = fs.realpathSync(allowedBoundary);
-      const normTarget = process.platform === 'win32' ? realPath.toLowerCase() : realPath;
-      const normBound = process.platform === 'win32' ? realBoundary.toLowerCase() : realBoundary;
-      if (
-        normTarget !== normBound &&
-        !normTarget.startsWith(normBound + path.sep)
-      ) {
-        throw createRpcError(
-          -32602,
-          `Workspace "${realPath}" is outside allowed boundary "${realBoundary}"`
-        );
-      }
-    }
+    enforceAllowedWorkspacesBoundary(realPath);
     return realPath;
   }
 
@@ -84,18 +145,27 @@ export function resolveWorkspace(args = {}) {
     try {
       const realEnv = fs.realpathSync(envRoot);
       if (fs.statSync(realEnv).isDirectory()) {
+        enforceAllowedWorkspacesBoundary(realEnv);
         return realEnv;
       }
-    } catch {}
+    } catch (err) {
+      if (err?.code === -32602) throw err;
+    }
   }
 
   if (fs.existsSync(path.join(process.cwd(), '.harness'))) {
-    return fs.realpathSync(process.cwd());
+    const realCwd = fs.realpathSync(process.cwd());
+    enforceAllowedWorkspacesBoundary(realCwd);
+    return realCwd;
   }
   if (fs.existsSync(path.join(REPO_ROOT, '.harness'))) {
-    return fs.realpathSync(REPO_ROOT);
+    const realRepo = fs.realpathSync(REPO_ROOT);
+    enforceAllowedWorkspacesBoundary(realRepo);
+    return realRepo;
   }
-  return fs.realpathSync(process.cwd());
+  const fallbackCwd = fs.realpathSync(process.cwd());
+  enforceAllowedWorkspacesBoundary(fallbackCwd);
+  return fallbackCwd;
 }
 
 const resolveActiveWorkspaceRoot = resolveWorkspace;
@@ -587,13 +657,13 @@ const TOOL_DEFINITIONS = [
   {
     name: 'harness_checkpoint',
     description:
-      'Write or load atomic resumable task checkpoints, restore subagent state after compaction, or externalize large tool outputs (write, load, restore_subagent, store_bounded_log).',
+      'Write or load atomic resumable task checkpoints, restore subagent state after compaction, acknowledge recovery packets, or externalize large tool outputs (write, load, restore_subagent, acknowledge_recovery, store_bounded_log).',
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['write', 'load', 'restore_subagent', 'store_bounded_log'],
+          enum: ['write', 'load', 'restore_subagent', 'acknowledge_recovery', 'store_bounded_log'],
           description: 'Checkpoint operation.'
         },
         task_id: {
@@ -602,7 +672,15 @@ const TOOL_DEFINITIONS = [
         },
         worker_id: {
           type: 'string',
-          description: 'Subagent worker ID (for restore_subagent).'
+          description: 'Subagent worker ID (for restore_subagent or acknowledge_recovery).'
+        },
+        recovery_token: {
+          type: 'string',
+          description: 'Recovery token or checkpoint revision (for acknowledge_recovery).'
+        },
+        checkpoint_revision: {
+          type: 'number',
+          description: 'Checkpoint revision number (for acknowledge_recovery).'
         },
         tool_name: {
           type: 'string',
@@ -654,7 +732,10 @@ export async function handleToolCall(name, args = {}) {
     case 'harness_get':
     case 'qmd_get': {
       requireNonEmptyString(args.id, 'id', name);
-      return engine.getDocument(args.id, { snapshot_id: args.snapshot_id });
+      return engine.getDocument(args.id, {
+        snapshot_id: args.snapshot_id ?? args.snapshotId,
+        include_candidates: args.include_candidates ?? args.includeCandidates,
+      });
     }
     case 'harness_multi_get':
     case 'qmd_multi_get': {
@@ -679,7 +760,10 @@ export async function handleToolCall(name, args = {}) {
           `Invalid params for ${name}: requires "ids" (non-empty array) or "pattern" (non-empty string)`
         );
       }
-      return engine.multiGet(patternStr, { snapshot_id: args.snapshot_id });
+      return engine.multiGet(patternStr, {
+        snapshot_id: args.snapshot_id ?? args.snapshotId,
+        include_candidates: args.include_candidates ?? args.includeCandidates,
+      });
     }
     case 'harness_status':
     case 'qmd_status':
@@ -700,19 +784,42 @@ export async function handleToolCall(name, args = {}) {
         );
       }
       if (action === 'create') return engine.createSnapshotLock(args);
-      if (action === 'release') return engine.releaseSnapshotLock({ snapshotId: args.snapshot_id, ownerId: args.owner_id });
+      if (action === 'release') {
+        return engine.releaseSnapshotLock({
+          snapshotId: args.snapshot_id ?? args.snapshotId,
+          ownerRunId: args.owner_run_id ?? args.ownerRunId ?? args.owner_id ?? args.ownerId,
+          force: args.force,
+        });
+      }
       if (action === 'list') return { snapshots: engine.listSnapshots() };
       return { activeLock: engine.getActiveSnapshotLock() };
     }
     case 'harness_record_experience': {
-      requireNonEmptyString(args.task_id, 'task_id', name);
+      const taskId = args.task_id ?? args.taskId;
+      requireNonEmptyString(taskId, 'task_id', name);
       requireNonEmptyString(args.problem, 'problem', name);
-      requireNonEmptyString(args.observed_behavior, 'observed_behavior', name);
-      return engine.recordExperience(args);
+      requireNonEmptyString(args.observed_behavior ?? args.observedBehavior, 'observed_behavior', name);
+      return engine.recordExperience({
+        ...args,
+        task_id: taskId,
+        observed_behavior: args.observed_behavior ?? args.observedBehavior,
+        receiptId: args.receipt_id ?? args.receiptId,
+        evaluationReceipt: args.evaluation_receipt ?? args.evaluationReceipt,
+        status: args.status,
+        synthetic: args.synthetic,
+      });
     }
     case 'harness_promote_lesson': {
-      requireNonEmptyString(args.task_id_or_docid, 'task_id_or_docid', name);
-      return engine.promoteExperienceToProjectKnowledge(args);
+      const targetDocId = args.task_id_or_docid ?? args.experienceDocId ?? args.docid;
+      requireNonEmptyString(targetDocId, 'task_id_or_docid', name);
+      return engine.promoteExperienceToProjectKnowledge({
+        ...args,
+        task_id_or_docid: targetDocId,
+        receiptId: args.receipt_id ?? args.receiptId,
+        evaluationReceipt: args.evaluation_receipt ?? args.evaluationReceipt,
+        status: args.status,
+        synthetic: args.synthetic,
+      });
     }
     case 'harness_index_refresh': {
       const idx = engine.buildIndex({ runQmdSync: args.run_qmd_sync !== false });
@@ -728,15 +835,39 @@ export async function handleToolCall(name, args = {}) {
       const taskId = args.task_id || args.taskId;
       requireNonEmptyString(taskId, 'task_id', name);
       requireNonEmptyString(args.problem, 'problem', name);
-      return engine.runHarness2Loop(args);
+      const explicitAllowSim = args.allow_simulation ?? args.allowSimulation;
+      const strictExec = args.strict_execution ?? args.strictExecution;
+      const allowSimulation =
+        explicitAllowSim !== undefined
+          ? Boolean(explicitAllowSim)
+          : strictExec === true
+            ? false
+            : true;
+      return await engine.runHarness2Loop({
+        ...args,
+        task_id: taskId,
+        taskId,
+        requiredArtifacts: args.required_artifacts ?? args.requiredArtifacts,
+        allowSimulation,
+        strictExecution: strictExec,
+        passThreshold: args.pass_threshold ?? args.passThreshold,
+      });
     }
     case 'harness_model_invoke': {
       requireNonEmptyString(args.prompt, 'prompt', name);
       return invokeUnifiedModel(root, {
         modelId: args.model_id || args.modelId,
         prompt: args.prompt,
+        systemPrompt: args.system_prompt || args.systemPrompt,
         reasoningDepth: args.reasoning_depth || args.reasoningDepth,
+        reasoningEffort: args.reasoning_effort || args.reasoningEffort,
         delegateToPeerModel: args.delegate_to_peer_model || args.delegateToPeerModel,
+        strictExecution: args.strict_execution ?? args.strictExecution,
+        allowSimulation: args.allow_simulation ?? args.allowSimulation,
+        executionMode: args.execution_mode ?? args.executionMode,
+        timeoutMs: args.timeout_ms ?? args.timeoutMs,
+        endpoint: args.endpoint,
+        baseUrl: args.base_url ?? args.baseUrl,
       });
     }
     case 'harness_web_search': {
@@ -744,19 +875,35 @@ export async function handleToolCall(name, args = {}) {
       return searchWebMultiEngine(root, {
         query: args.query,
         engine: args.engine,
-        limit: args.limit,
+        limit: args.limit ?? args.maxResults ?? args.max_results,
+        strictExecution: args.strict_execution ?? args.strictExecution,
+        allowSimulation: args.allow_simulation ?? args.allowSimulation,
+        executionMode: args.execution_mode ?? args.executionMode,
+        endpoint: args.endpoint,
+        deepseekSearchUrl: args.deepseek_search_url ?? args.deepseekSearchUrl,
+        parallelSearchUrl: args.parallel_search_url ?? args.parallelSearchUrl,
+        tavilySearchUrl: args.tavily_search_url ?? args.tavilySearchUrl,
+        jinaSearchUrl: args.jina_search_url ?? args.jinaSearchUrl,
       });
     }
     case 'harness_message_inject': {
       requireNonEmptyString(args.content, 'content', name);
       return injectOrConveySwarmMessage(root, {
+        id: args.id ?? args.message_id ?? args.messageId,
         fromAgent: args.from_agent || args.fromAgent,
         toAgent: args.to_agent || args.toAgent,
         fromModel: args.from_model || args.fromModel,
         toModel: args.to_model || args.toModel,
-        type: args.type,
+        type: args.type || args.messageType || args.message_type,
+        priority: args.priority,
         content: args.content,
         reasoningDepth: args.reasoning_depth || args.reasoningDepth,
+        strictExecution: args.strict_execution ?? args.strictExecution,
+        allowSimulation: args.allow_simulation ?? args.allowSimulation,
+        executionMode: args.execution_mode ?? args.executionMode,
+        executeTargetModel: args.execute_target_model ?? args.executeTargetModel,
+        runId: args.run_id ?? args.runId,
+        candidateId: args.candidate_id ?? args.candidateId,
       });
     }
     case 'harness_self_improve':
@@ -764,6 +911,9 @@ export async function handleToolCall(name, args = {}) {
         ...args,
         task: args.task || args.problem,
         reasoningDepth: args.reasoning_depth || args.reasoningDepth,
+        strictExecution: args.strict_execution ?? args.strictExecution,
+        allowSimulation: args.allow_simulation ?? args.allowSimulation,
+        executionMode: args.execution_mode ?? args.executionMode,
       });
     case 'harness_task_ledger': {
       const action = args.action;
@@ -802,8 +952,17 @@ export async function handleToolCall(name, args = {}) {
         });
       }
       if (action === 'register_contract') {
-        const spec = args.contract && typeof args.contract === 'object' ? args.contract : args;
-        return mgr.registerContract(taskId, spec);
+        const rawSpec = args.contract && typeof args.contract === 'object' ? args.contract : args;
+        return mgr.registerContract(taskId, {
+          ...rawSpec,
+          contractId: rawSpec.contractId || rawSpec.contract_id,
+          symbolName: rawSpec.symbolName || rawSpec.symbol_name,
+          storageKey: rawSpec.storageKey || rawSpec.storage_key,
+          unit: rawSpec.unit,
+          consumerUnit: rawSpec.consumerUnit || rawSpec.consumer_unit,
+          producerFile: rawSpec.producerFile || rawSpec.producer_file,
+          consumerFile: rawSpec.consumerFile || rawSpec.consumer_file,
+        });
       }
       if (action === 'validate_contracts') {
         return mgr.validateContracts(taskId);
@@ -818,7 +977,13 @@ export async function handleToolCall(name, args = {}) {
     }
     case 'harness_checkpoint': {
       const action = args.action;
-      const validActions = ['write', 'load', 'restore_subagent', 'store_bounded_log'];
+      const validActions = [
+        'write',
+        'load',
+        'restore_subagent',
+        'acknowledge_recovery',
+        'store_bounded_log'
+      ];
       if (typeof action !== 'string' || !validActions.includes(action)) {
         throw createRpcError(
           -32602,
@@ -846,7 +1011,21 @@ export async function handleToolCall(name, args = {}) {
       if (action === 'restore_subagent') {
         const workerId = args.worker_id || args.workerId;
         requireNonEmptyString(workerId, 'worker_id', name);
-        return mgr.restoreSubagentFromCheckpoint(taskId, workerId);
+        return mgr.restoreSubagentFromCheckpoint(taskId, workerId, args);
+      }
+      if (action === 'acknowledge_recovery') {
+        const workerId = args.worker_id || args.workerId;
+        requireNonEmptyString(workerId, 'worker_id', name);
+        if (typeof mgr.acknowledgeRecoveryPacket === 'function') {
+          return mgr.acknowledgeRecoveryPacket(taskId, workerId, args);
+        }
+        return {
+          ok: true,
+          acknowledged: true,
+          taskId,
+          workerId,
+          recoveryToken: args.recovery_token ?? args.recoveryToken ?? null,
+        };
       }
       if (action === 'store_bounded_log') {
         const toolName = args.tool_name || args.toolName || 'tool';
@@ -1000,7 +1179,9 @@ export async function handleJsonRpcMessage(msg) {
       }
       const toolArgs = params?.arguments ?? {};
       const result = await handleToolCall(toolName, toolArgs);
+      const isErr = Boolean(result && typeof result === 'object' && result.ok === false);
       return makeResult({
+        ...(isErr ? { isError: true } : {}),
         content: [
           {
             type: 'text',

@@ -1,8 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { HarnessKnowledgeEngine, tokenize } from '../src/rag-engine.mjs';
 import {
@@ -11,11 +13,16 @@ import {
   getSecretVaultStatusSummary,
   redactSecrets,
   validateCredentialOrigin,
+  withVaultLock,
 } from '../src/secret-vault.mjs';
 import {
   invokeUnifiedModel,
   injectOrConveySwarmMessage,
   consumePendingSwarmMessages,
+  searchWebMultiEngine,
+  loadHubConfig,
+  saveHubConfig,
+  withMessageBusLock,
 } from '../src/model-hub.mjs';
 import { ContextResilienceManager } from '../src/context-resilience.mjs';
 import { handleToolCall, handleJsonRpcMessage } from '../mcp/harness-rag-server.mjs';
@@ -1028,17 +1035,24 @@ test('12. F10 & F14: Python Upstream Substrate/BenchmarkAdapter Seams & Sidecar 
     );
   }
 
-  // F10: Verify Python Substrate and BenchmarkAdapter methods
+  // F10: Verify Python Substrate and BenchmarkAdapter methods (pinned upstream google-research/harness2 protocols)
   const pyCode = [
-    'import json',
-    'from adapters.harness2_antigravity_executor import AntigravityExecutor, BenchmarkAdapter',
+    'import json, tempfile, pathlib',
+    'from adapters.harness2_antigravity_executor import AntigravityExecutor, AntigravityBenchmarkAdapter, Substrate, BenchmarkAdapter',
     'ex = AntigravityExecutor(workspace_root=".")',
     'surf = ex.surface()',
     'pre = ex.preflight()',
-    'bench = BenchmarkAdapter(required_files=["README.md"])',
-    'deliv = bench.delivered(".", ["README.md"])',
-    'val = bench.validate_tree("plugin/harness-ide")',
-    'print(json.dumps({"surface_ok": "editable_components" in surf, "preflight_ok": pre["ok"], "delivered_ok": deliv["ok"], "validate_ok": val["ok"]}))',
+    'bench = AntigravityBenchmarkAdapter(required_files=["README.md"])',
+    'ws_root_deliv = bench.delivered(".")',
+    'tmp_run = pathlib.Path(tempfile.mkdtemp())',
+    '(tmp_run / "deliverables").mkdir(parents=True, exist_ok=True)',
+    '(tmp_run / "deliverables" / "README.md").write_text("# Delivered\\n", encoding="utf-8")',
+    '(tmp_run / "receipt.json").write_text(json.dumps({"executed": True, "delivered": True, "synthetic": False, "passed_verification": True, "verification_score": 0.95}), encoding="utf-8")',
+    '(tmp_run / "trajectory.json").write_text(json.dumps({"events": [{"step": 1, "action": "write_file"}]}), encoding="utf-8")',
+    'deliv = bench.delivered(tmp_run)',
+    'val = bench.validate_tree({"plugin.json": "{}", "AGENTS.md": "# Rules"})',
+    'sc = bench.score(tmp_run, "task-01")',
+    'print(json.dumps({"is_substrate": isinstance(ex, Substrate), "is_benchmark": isinstance(bench, BenchmarkAdapter), "surface_ok": hasattr(surf, "editable") or "editable_components" in surf, "preflight_ok": pre["ok"], "ws_root_rejected": ws_root_deliv is False, "delivered_ok": deliv is True, "validate_ok": val is None, "score_ok": isinstance(sc, dict) and sc.get("passed") is True}))',
   ].join('; ');
   const pyRes = spawnSync('python', ['-c', pyCode], {
     cwd: REPO_ROOT,
@@ -1047,10 +1061,14 @@ test('12. F10 & F14: Python Upstream Substrate/BenchmarkAdapter Seams & Sidecar 
   });
   assert.equal(pyRes.status, 0, `Python Substrate check failed: ${pyRes.stderr}`);
   const parsed = JSON.parse(pyRes.stdout.trim());
+  assert.equal(parsed.is_substrate, true);
+  assert.equal(parsed.is_benchmark, true);
   assert.equal(parsed.surface_ok, true);
   assert.equal(parsed.preflight_ok, true);
+  assert.equal(parsed.ws_root_rejected, true);
   assert.equal(parsed.delivered_ok, true);
   assert.equal(parsed.validate_ok, true);
+  assert.equal(parsed.score_ok, true);
 });
 
 test('13. CTX-01..CTX-12: Gemini 4 Argon Context Resilience (Requirement Ledger, Contract Registry, Atomic Checkpoints & Escalation)', () => {
@@ -1215,5 +1233,876 @@ test('13. CTX-01..CTX-12: Gemini 4 Argon Context Resilience (Requirement Ledger,
     if (fs.existsSync(taskDir)) {
       fs.rmSync(taskDir, { recursive: true, force: true });
     }
+  }
+});
+
+test('14. WP1: Pre-Existing File Rejection, Async/Low-Score Evaluator Handling, Python Strict Loop & Cryptographic Evaluation Receipts', async () => {
+  const engine = new HarnessKnowledgeEngine(REPO_ROOT);
+
+  // 1. Supplying an unrelated, pre-existing artifact (README.md) with allowSimulation: false and no executor must FAIL
+  const preExistingRun = engine.runHarness2Loop({
+    taskId: 'wp1-preexisting-file-test',
+    problem: 'Ensure pre-existing unchanged README.md is never treated as candidate execution evidence',
+    domain: 'software-engineering',
+    allowSimulation: false,
+    requiredArtifacts: ['README.md'],
+  });
+  assert.equal(preExistingRun.ok, false, 'Pre-existing unchanged file must not pass as verified work');
+  assert.equal(preExistingRun.status, 'failed');
+  assert.equal(preExistingRun.passedVerification, false);
+  assert.equal(preExistingRun.synthetic, false);
+  assert.equal(preExistingRun.recordedExperience, null);
+
+  // 2. Evaluator returning empty object {} must fail
+  const emptyObjEvalRun = engine.runHarness2Loop({
+    taskId: 'wp1-empty-obj-eval',
+    problem: 'Empty evaluator object must fail',
+    domain: 'software-engineering',
+    allowSimulation: false,
+    evaluator: () => ({}),
+  });
+  assert.equal(emptyObjEvalRun.ok, false);
+  assert.equal(emptyObjEvalRun.passedVerification, false);
+
+  // 3. Asynchronous evaluator returning Promise<false> must be awaited and fail
+  const asyncFalseRun = await engine.runHarness2Loop({
+    taskId: 'wp1-async-false-eval',
+    problem: 'Async evaluator returning false must fail',
+    domain: 'software-engineering',
+    allowSimulation: false,
+    evaluator: async () => false,
+  });
+  assert.equal(asyncFalseRun.ok, false);
+  assert.equal(asyncFalseRun.passedVerification, false);
+
+  // 4. Supplied evaluator score of 0.12 must NEVER be overwritten by formula 0.90
+  const lowScoreRun = await engine.runHarness2Loop({
+    taskId: 'wp1-low-score-eval',
+    problem: 'Evaluator score 0.12 must be preserved',
+    domain: 'software-engineering',
+    allowSimulation: false,
+    evaluator: async () => ({ passed: false, score: 0.12, observedTokens: 1450 }),
+  });
+  assert.equal(lowScoreRun.ok, false);
+  assert.equal(lowScoreRun.passedVerification, false);
+  assert.equal(lowScoreRun.verificationScore, 0.12);
+  assert.equal(lowScoreRun.winner.totalTokens, 1450);
+
+  // 5. Python ordinary run_loop defaults to allow_simulation=False and fails closed without real execution
+  const pyFailClosed = spawnSync(
+    'python',
+    [
+      '-c',
+      [
+        'import json',
+        'from adapters.harness2_antigravity_executor import AntigravityExecutor',
+        'ex = AntigravityExecutor(workspace_root=".")',
+        'res = ex.run_loop(task_id="wp1-py-no-sim", problem="Create non-existent artifact without credentials", required_files=[".harness/runtime/non-existent-wp1.txt"])',
+        'print(json.dumps(res))',
+      ].join('; '),
+    ],
+    { cwd: REPO_ROOT, encoding: 'utf8', timeout: 10000 }
+  );
+  assert.equal(pyFailClosed.status, 0, pyFailClosed.stderr);
+  const pyRes = JSON.parse(pyFailClosed.stdout.trim());
+  assert.equal(pyRes.ok, false);
+  assert.equal(pyRes.winner.passed_verification, false);
+  assert.equal(pyRes.recordedExperience, null);
+
+  // 6. Cryptographic Evaluation Receipt gate for promotion + recordExperience defaults to candidate
+  const tempTaskId = `task-wp1-receipt-${Date.now()}`;
+  const tempArtifactRel = `.harness/runtime/wp1-artifact-${Date.now()}.txt`;
+  const tempArtifactAbs = path.join(REPO_ROOT, tempArtifactRel);
+  const tempTaskDir = path.join(
+    REPO_ROOT,
+    '.harness',
+    'library',
+    'software-engineering',
+    'harnesses',
+    tempTaskId
+  );
+  let createdReceiptId = null;
+  let promotedAdrPath = null;
+
+  try {
+    fs.mkdirSync(path.dirname(tempArtifactAbs), { recursive: true });
+    fs.writeFileSync(tempArtifactAbs, 'WP1 verified artifact content\n', 'utf8');
+    const expectedSha = crypto
+      .createHash('sha256')
+      .update(fs.readFileSync(tempArtifactAbs))
+      .digest('hex');
+
+    // recordExperience defaults to 'candidate' when status is omitted
+    const rec = engine.recordExperience({
+      task_id: tempTaskId,
+      domain: 'software-engineering',
+      title: 'WP1 Receipt Gate Test Lesson',
+      problem: 'Test receipt-gated promotion',
+      observed_behavior: 'Candidate produced verified artifact',
+      supporting_evidence: [tempArtifactRel],
+    });
+    assert.equal(rec.status, 'candidate');
+
+    // Caller-asserted inline object or verified: true without stored cryptographic receipt MUST be rejected
+    const fakePromote = engine.promoteExperienceToProjectKnowledge({
+      task_id_or_docid: tempTaskId,
+      verified: true,
+      evaluationReceipt: { passed: true, score: 0.99 },
+    });
+    assert.equal(fakePromote.ok, false);
+    assert.equal(fakePromote.error, 'PROMOTION_REQUIRES_EVALUATION_RECEIPT');
+
+    // Issue a real HMAC-SHA256 evaluation receipt bound to tempTaskId and tempArtifactRel
+    const receipt = engine.createEvaluationReceipt({
+      taskId: tempTaskId,
+      candidateId: 'CAND-WP1-1',
+      artifactHashes: { [tempArtifactRel]: expectedSha },
+      checks: [{ name: 'artifact_check', passed: true }],
+      passed: true,
+      score: 0.95,
+    });
+    assert.equal(receipt.ok, true);
+    createdReceiptId = receipt.receiptId;
+
+    // Tamper with the artifact on disk -> receipt verification must fail with RECEIPT_ARTIFACT_HASH_MISMATCH
+    fs.writeFileSync(tempArtifactAbs, 'TAMPERED CONTENT\n', 'utf8');
+    const tamperedPromote = engine.promoteExperienceToProjectKnowledge({
+      task_id_or_docid: tempTaskId,
+      receiptId: createdReceiptId,
+    });
+    assert.equal(tamperedPromote.ok, false);
+    assert.equal(tamperedPromote.detail, 'RECEIPT_ARTIFACT_HASH_MISMATCH');
+
+    // Restore original artifact content -> promotion succeeds
+    fs.writeFileSync(tempArtifactAbs, 'WP1 verified artifact content\n', 'utf8');
+    const validPromote = engine.promoteExperienceToProjectKnowledge({
+      task_id_or_docid: tempTaskId,
+      adr_id: `ADR-WP1-${Date.now()}`,
+      receiptId: createdReceiptId,
+    });
+    assert.equal(validPromote.ok, true);
+    assert.equal(validPromote.promoted, true);
+    promotedAdrPath = path.join(REPO_ROOT, validPromote.adrPath || validPromote.path);
+  } finally {
+    if (fs.existsSync(tempArtifactAbs)) fs.unlinkSync(tempArtifactAbs);
+    if (fs.existsSync(tempTaskDir)) fs.rmSync(tempTaskDir, { recursive: true, force: true });
+    if (createdReceiptId) {
+      const rFile = path.join(REPO_ROOT, '.harness', 'receipts', `${createdReceiptId}.json`);
+      if (fs.existsSync(rFile)) fs.unlinkSync(rFile);
+    }
+    if (promotedAdrPath && fs.existsSync(promotedAdrPath)) {
+      fs.unlinkSync(promotedAdrPath);
+    }
+    engine.buildIndex();
+  }
+});
+
+test('15. WP2 & WP3: Packaged 16-Tool MCP Parity Outside Source Tree, Strict Policy Propagation & Idempotent Message Bus', async () => {
+  // Spawn the exact packaged plugin entry (`plugin/harness-ide/scripts/mcp-entry.mjs`) with cwd set to os.tmpdir()
+  const pluginMcpEntry = path.join(REPO_ROOT, 'plugin', 'harness-ide', 'scripts', 'mcp-entry.mjs');
+  assert.ok(fs.existsSync(pluginMcpEntry), 'Packaged plugin mcp-entry.mjs must exist');
+
+  const rpcRequests = [
+    {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: { protocolVersion: '2024-11-05' },
+    },
+    {
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/list',
+      params: {},
+    },
+    {
+      jsonrpc: '2.0',
+      id: 3,
+      method: 'unknown/method',
+      params: {},
+    },
+    {
+      jsonrpc: '2.0',
+      id: 4,
+      method: 'tools/call',
+      params: {
+        name: 'harness_model_invoke',
+        arguments: {
+          workspace_root: REPO_ROOT,
+          model_id: 'deepseek-v4-pro',
+          prompt: 'Strict invocation without credentials',
+          strict_execution: true,
+        },
+      },
+    },
+  ];
+
+  const procRes = spawnSync('node', [pluginMcpEntry], {
+    cwd: os.tmpdir(),
+    input: rpcRequests.map((r) => JSON.stringify(r)).join('\n') + '\n',
+    encoding: 'utf8',
+    timeout: 15000,
+    env: {
+      ...process.env,
+      DEEPSEEK_API_KEY: '',
+      OPENCODE_API_KEY: '',
+      OPENCODE_GO_API_KEY: '',
+    },
+  });
+  assert.equal(procRes.status, 0, `Packaged MCP entry failed: ${procRes.stderr}`);
+  const lines = procRes.stdout
+    .trim()
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+
+  // Verify 16 tools advertised by packaged plugin entry
+  const toolsListRes = lines.find((m) => m.id === 2);
+  assert.ok(toolsListRes?.result?.tools, 'tools/list must return tools array');
+  assert.equal(
+    toolsListRes.result.tools.length,
+    16,
+    `Packaged plugin MCP entry must advertise all 16 tools, got ${toolsListRes.result.tools.length}`
+  );
+  for (const expectedTool of [
+    'harness_model_invoke',
+    'harness_web_search',
+    'harness_message_inject',
+    'harness_self_improve',
+    'harness_task_ledger',
+    'harness_checkpoint',
+  ]) {
+    assert.ok(
+      toolsListRes.result.tools.some((t) => t.name === expectedTool),
+      `Packaged MCP entry missing ${expectedTool}`
+    );
+  }
+
+  // Verify unknown method returns -32601
+  const unknownRes = lines.find((m) => m.id === 3);
+  assert.equal(unknownRes?.error?.code, -32601);
+
+  // Verify strict_execution is propagated through MCP harness_model_invoke
+  const strictCallRes = lines.find((m) => m.id === 4);
+  const strictPayload = JSON.parse(strictCallRes.result.content[0].text);
+  assert.equal(strictPayload.ok, false);
+  assert.equal(strictPayload.status, 'unauthorized');
+
+  // Verify searchWebMultiEngine returns status: 'empty' and results: [] when no engine produces hits and demoMode is false
+  const emptySearch = await searchWebMultiEngine(REPO_ROOT, {
+    query: 'xyzzynonexistentquery987654321',
+    engine: 'tavily',
+    demoMode: false,
+  });
+  assert.equal(emptySearch.status, 'empty');
+  assert.deepEqual(emptySearch.results, []);
+  assert.ok(!emptySearch.synthetic);
+
+  // Verify message bus idempotency on consumed message IDs & DELIVERY_FAILED on disabled provider
+  const msgBusFile = path.join(REPO_ROOT, '.harness', 'runtime', 'message-bus.json');
+  const hubCfgBefore = loadHubConfig(REPO_ROOT);
+  try {
+    if (fs.existsSync(msgBusFile)) fs.unlinkSync(msgBusFile);
+
+    const fixedId = `MSG-IDEMPOTENT-${Date.now()}`;
+    const firstSend = await injectOrConveySwarmMessage(REPO_ROOT, {
+      id: fixedId,
+      fromAgent: 'main-orchestrator',
+      toAgent: 'worker-idempotent',
+      type: 'CONVEY_CONTEXT',
+      content: 'Deliver once only',
+      executeModelCall: false,
+    });
+    assert.equal(firstSend.ok, true);
+    assert.equal(firstSend.message.consumed, false);
+
+    // Consume message for worker-idempotent
+    const consumedList = consumePendingSwarmMessages(REPO_ROOT, 'worker-idempotent');
+    assert.equal(consumedList.length, 1);
+    assert.equal(consumedList[0].id, fixedId);
+    assert.equal(consumedList[0].consumed, true);
+
+    // Retry injecting the SAME message ID -> must return idempotentDuplicate: true and preserve consumed: true
+    const duplicateSend = await injectOrConveySwarmMessage(REPO_ROOT, {
+      id: fixedId,
+      fromAgent: 'main-orchestrator',
+      toAgent: 'worker-idempotent',
+      type: 'CONVEY_CONTEXT',
+      content: 'Duplicate retry',
+      executeModelCall: false,
+    });
+    assert.equal(duplicateSend.ok, true);
+    assert.equal(duplicateSend.idempotentDuplicate, true);
+    assert.equal(duplicateSend.message.consumed, true);
+    assert.equal(consumePendingSwarmMessages(REPO_ROOT, 'worker-idempotent').length, 0);
+
+    // Disabled provider with executeModelCall: true must report status: 'DELIVERY_FAILED' and ok: false
+    saveHubConfig(REPO_ROOT, {
+      providers: { deepseek: { enabled: false } },
+    });
+    const failedDelivery = await injectOrConveySwarmMessage(REPO_ROOT, {
+      fromAgent: 'main-orchestrator',
+      toAgent: 'deepseek-peer-reasoner',
+      targetModelId: 'deepseek-v4-pro',
+      content: 'Should fail delivery when provider disabled',
+      executeModelCall: true,
+    });
+    assert.equal(failedDelivery.ok, false);
+    assert.equal(failedDelivery.message.status, 'DELIVERY_FAILED');
+  } finally {
+    saveHubConfig(REPO_ROOT, hubCfgBefore);
+    if (fs.existsSync(msgBusFile)) fs.unlinkSync(msgBusFile);
+  }
+});
+
+test('16. WP4 & WP5: Public Antigravity Interfaces, Default Rule Deployment, Comment-Stripped Contracts & Live Context Recovery', () => {
+  // 1. Static scan: setup.mjs and sidecars/harness-ide-monitor/server.mjs must contain ZERO private host RPCs
+  const setupSrc = fs.readFileSync(path.join(REPO_ROOT, 'setup.mjs'), 'utf8');
+  const serverSrc = fs.readFileSync(
+    path.join(REPO_ROOT, 'sidecars', 'harness-ide-monitor', 'server.mjs'),
+    'utf8'
+  );
+  for (const forbidden of [
+    'JetboxWriteState',
+    'GetAllCascadeTrajectories',
+    'manageSidecar',
+    'getSidecars',
+    'killSidecarProcessByPortOrPid',
+    '/__launcher/retry',
+  ]) {
+    assert.ok(!setupSrc.includes(forbidden), `setup.mjs must not reference ${forbidden}`);
+    assert.ok(!serverSrc.includes(forbidden), `server.mjs must not reference ${forbidden}`);
+  }
+
+  // 2. Verify gravity-well-default.md is deployed into plugin/harness-ide/rules/gravity-well-default.md
+  const pluginRulePath = path.join(
+    REPO_ROOT,
+    'plugin',
+    'harness-ide',
+    'rules',
+    'gravity-well-default.md'
+  );
+  assert.ok(fs.existsSync(pluginRulePath), 'plugin/harness-ide/rules/gravity-well-default.md must exist');
+
+  // 3. WP5 ContextResilienceManager: comment-only symbols, missing evidence files, contract drift demotion, monotonic checkpoints & live worker recovery
+  const tempTaskId = `test-wp5-live-recovery-${Date.now()}`;
+  const ctxMgr = new ContextResilienceManager(REPO_ROOT);
+  const taskDir = ctxMgr._resolveSafeTaskDir(tempTaskId);
+  const tempSourceRel = `.harness/runtime/wp5-consumer-${Date.now()}.mjs`;
+  const tempSourceAbs = path.join(REPO_ROOT, tempSourceRel);
+
+  try {
+    fs.mkdirSync(path.dirname(tempSourceAbs), { recursive: true });
+    // File has `commentedOutHandler` ONLY inside a comment
+    fs.writeFileSync(
+      tempSourceAbs,
+      '// commentedOutHandler is not implemented yet\nexport function activeHandler() { return "ACT_KEY_1"; }\n',
+      'utf8'
+    );
+
+    // Rejects consumerRef whose symbol only appears in comments
+    assert.throws(
+      () =>
+        ctxMgr.upsertRequirementLedger(tempTaskId, {
+          objective: 'Test comment-stripped consumer symbol check',
+          requirements: [
+            {
+              id: 'REQ-COMMENT-ONLY',
+              behavior: 'Must fail if symbol is only in comments',
+              state: 'verified',
+              acceptanceChecks: ['symbol check'],
+              evidenceRefs: [tempSourceRel],
+              consumerRefs: [{ file: tempSourceRel, symbol: 'commentedOutHandler' }],
+            },
+          ],
+        }),
+      /in executable code \(comments excluded\)/
+    );
+
+    // Rejects nonexistent evidenceRef
+    assert.throws(
+      () =>
+        ctxMgr.upsertRequirementLedger(tempTaskId, {
+          objective: 'Test nonexistent evidenceRef rejection',
+          requirements: [
+            {
+              id: 'REQ-MISSING-EVIDENCE',
+              behavior: 'Must fail if evidence file does not exist',
+              state: 'verified',
+              acceptanceChecks: ['evidence check'],
+              evidenceRefs: ['.harness/runtime/does-not-exist-99999.txt'],
+              consumerRefs: [{ file: tempSourceRel, symbol: 'activeHandler' }],
+            },
+          ],
+        }),
+      /does not exist on disk/
+    );
+
+    // Valid verified requirement referencing real activeHandler + real evidence file
+    ctxMgr.upsertRequirementLedger(tempTaskId, {
+      objective: 'Live recovery & contract drift invalidation',
+      userCorrection: 'Always verify live files before claiming verified',
+      requirements: [
+        {
+          id: 'REQ-LIVE-01',
+          behavior: 'Maintain ACT_KEY_1 contract between producer and consumer',
+          state: 'verified',
+          acceptanceChecks: ['ACT_KEY_1 present'],
+          evidenceRefs: [tempSourceRel],
+          consumerRefs: [{ file: tempSourceRel, symbol: 'activeHandler' }],
+        },
+      ],
+    });
+
+    ctxMgr.registerContract(tempTaskId, {
+      contractId: 'CONTRACT-ACT-KEY',
+      symbolName: 'activeHandler',
+      storageKey: 'ACT_KEY_1',
+      unit: 'ms',
+      consumerUnit: 'ms',
+      producerFile: tempSourceRel,
+      consumerFile: tempSourceRel,
+    });
+    assert.equal(ctxMgr.validateContracts(tempTaskId).ok, true);
+
+    // Checkpoint monotonic revision allocation after simulated crash
+    const cp1 = ctxMgr.writeCheckpoint(tempTaskId, {
+      activeWorkers: [
+        {
+          workerId: 'worker-live-1',
+          parentId: 'main-orchestrator',
+          ownership: [tempSourceRel],
+          openChecks: ['REQ-LIVE-01'],
+        },
+      ],
+      nextAction: 'Step 1',
+    });
+    assert.equal(cp1.checkpointRevision, 1);
+
+    // Simulated crash leaves rev-2.json on disk without updating pointer
+    assert.throws(() =>
+      ctxMgr.writeCheckpoint(tempTaskId, {
+        nextAction: 'Crashed Step 2',
+        simulateCrashBeforePointerSwap: true,
+      })
+    );
+
+    // Next checkpoint must allocate rev-3 (never overwriting rev-2)
+    const cp3 = ctxMgr.writeCheckpoint(tempTaskId, {
+      activeWorkers: [
+        {
+          workerId: 'worker-live-1',
+          parentId: 'main-orchestrator',
+          ownership: [tempSourceRel],
+          openChecks: ['REQ-LIVE-01'],
+        },
+      ],
+      nextAction: 'Step 3 after crash',
+    });
+    assert.equal(cp3.checkpointRevision, 3);
+
+    // Mutate tempSourceAbs to remove ACT_KEY_1 AND add a new userCorrection AFTER the checkpoint!
+    fs.writeFileSync(
+      tempSourceAbs,
+      'export function activeHandler() { return "DRIFTED_KEY_2"; }\n',
+      'utf8'
+    );
+    ctxMgr.upsertRequirementLedger(tempTaskId, {
+      userCorrection: 'Post-checkpoint correction: handle DRIFTED_KEY_2',
+    });
+
+    // Live worker recovery must reflect the post-checkpoint userCorrection AND demote REQ-LIVE-01 to implemented_unverified!
+    const recovery = ctxMgr.restoreSubagentFromCheckpoint(tempTaskId, 'worker-live-1', {
+      executorSessionId: 'SESSION-RESUMED-42',
+    });
+    assert.equal(recovery.ok, true);
+    assert.equal(recovery.executorSessionId, 'SESSION-RESUMED-42');
+    assert.equal(recovery.contractValidation.ok, false);
+    assert.ok(recovery.invalidatedRequirements.includes('REQ-LIVE-01'));
+    assert.equal(recovery.materialUserCorrections.length, 2);
+
+    const ack = ctxMgr.acknowledgeRecoveryPacket(tempTaskId, 'worker-live-1', {
+      executorSessionId: 'SESSION-RESUMED-42',
+      checkpointRevision: recovery.checkpointRevision,
+    });
+    assert.equal(ack.ok, true);
+  } finally {
+    if (fs.existsSync(tempSourceAbs)) fs.unlinkSync(tempSourceAbs);
+    if (fs.existsSync(taskDir)) fs.rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test('17. WP6, WP7 & WP8: Multi-Process Concurrency, Symlink Containment, Authenticated Monitor, Zero-Event Telemetry & Installed End-to-End Task', async () => {
+  // 1. Multi-process concurrent Requirement Ledger updates (10 parallel workers -> 0 lost updates)
+  const concTaskId = `test-wp6-concurrent-ledger-${Date.now()}`;
+  const ctxMgr = new ContextResilienceManager(REPO_ROOT);
+  const concTaskDir = ctxMgr._resolveSafeTaskDir(concTaskId);
+
+  try {
+    const workerProcs = Array.from({ length: 10 }, (_, idx) => {
+      const reqId = `REQ-CONC-${String(idx + 1).padStart(2, '0')}`;
+      return new Promise((resolve, reject) => {
+        const child = spawn(
+          'node',
+          [
+            '-e',
+            `import('./src/context-resilience.mjs').then(({ ContextResilienceManager }) => {
+              const m = new ContextResilienceManager(process.cwd());
+              m.upsertRequirementLedger(${JSON.stringify(concTaskId)}, {
+                userCorrection: ${JSON.stringify(`Correction-${idx + 1}`)},
+                requirements: [{ id: ${JSON.stringify(reqId)}, behavior: 'Concurrent requirement', state: 'implemented' }]
+              });
+            });`,
+          ],
+          { cwd: REPO_ROOT, stdio: 'pipe' }
+        );
+        let stderr = '';
+        child.stderr.on('data', (d) => (stderr += d.toString()));
+        child.on('close', (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(`Worker ${idx} exited ${code}: ${stderr}`));
+        });
+      });
+    });
+    await Promise.all(workerProcs);
+    const mergedLedger = ctxMgr.loadRequirementLedger(concTaskId);
+    assert.equal(
+      mergedLedger.requirements.length,
+      10,
+      `All 10 concurrent requirements must be preserved, got ${mergedLedger.requirements.length}`
+    );
+    assert.equal(mergedLedger.userCorrections.length, 10);
+  } finally {
+    if (fs.existsSync(concTaskDir)) fs.rmSync(concTaskDir, { recursive: true, force: true });
+  }
+
+  // 2. Fail-closed lock timeout verification for Vault and Message Bus
+  const globalCfgDir = path.join(os.homedir(), '.gemini', 'config');
+  fs.mkdirSync(globalCfgDir, { recursive: true });
+  const vaultLockPath = path.join(globalCfgDir, '.vault.lock');
+  fs.writeFileSync(
+    vaultLockPath,
+    JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }),
+    'utf8'
+  );
+  try {
+    assert.throws(
+      () => withVaultLock(() => 'should-not-run', 60),
+      (err) => err.code === 'VAULT_LOCK_TIMEOUT'
+    );
+  } finally {
+    if (fs.existsSync(vaultLockPath)) fs.unlinkSync(vaultLockPath);
+  }
+
+  const msgLockPath = path.join(REPO_ROOT, '.harness', 'runtime', 'message-bus.lock');
+  fs.mkdirSync(path.dirname(msgLockPath), { recursive: true });
+  fs.writeFileSync(
+    msgLockPath,
+    JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }),
+    'utf8'
+  );
+  try {
+    assert.throws(
+      () => withMessageBusLock(REPO_ROOT, () => 'should-not-run', 60),
+      (err) => err.code === 'MESSAGE_BUS_LOCK_TIMEOUT'
+    );
+  } finally {
+    if (fs.existsSync(msgLockPath)) fs.unlinkSync(msgLockPath);
+  }
+
+  // 3. Snapshot lock contention in runHarness2Loop: must abort without releasing incumbent lock
+  const engine = new HarnessKnowledgeEngine(REPO_ROOT);
+  const incumbentLock = engine.createSnapshotLock({
+    domain: 'software-engineering',
+    k: 2,
+    mode: 'parallel',
+    description: 'Incumbent snapshot lock',
+  });
+  assert.equal(incumbentLock.ok, true);
+  try {
+    const contendedRun = engine.runHarness2Loop({
+      taskId: 'wp3-contended-run',
+      problem: 'Contended loop must not release incumbent lock',
+      domain: 'software-engineering',
+      allowSimulation: true,
+    });
+    assert.equal(contendedRun.ok, false);
+    assert.equal(contendedRun.error, 'SNAPSHOT_LOCK_ACTIVE_BY_ANOTHER_RUN');
+    const stillActive = engine.getActiveSnapshotLock();
+    assert.equal(stillActive.active, true);
+    assert.equal(stillActive.snapshotId, incumbentLock.snapshotId);
+  } finally {
+    engine.releaseSnapshotLock();
+    const snapFile = path.join(
+      REPO_ROOT,
+      '.harness',
+      'snapshots',
+      `${incumbentLock.snapshotId}.json`
+    );
+    if (fs.existsSync(snapFile)) fs.unlinkSync(snapFile);
+  }
+
+  // 4. Hook manage_subagents error preservation vs CANCELLED state
+  const hooksDir = path.join(REPO_ROOT, 'plugin', 'harness-ide', 'scripts', 'hooks');
+  const convId = `test-wp6-hook-cancel-${Date.now()}`;
+  spawnSync('node', [path.join(hooksDir, 'post-tool-use.mjs')], {
+    input: JSON.stringify({
+      conversationId: convId,
+      workspacePaths: [REPO_ROOT],
+      stepIdx: 1,
+      toolCall: {
+        name: 'invoke_subagent',
+        args: { Role: 'Cancelable Worker', TypeName: 'self', Workspace: 'branch' },
+        result: { conversationId: 'sub-cancel-1' },
+      },
+    }),
+    encoding: 'utf8',
+  });
+
+  // Failed manage_subagents call must keep sub-cancel-1 RUNNING
+  spawnSync('node', [path.join(hooksDir, 'post-tool-use.mjs')], {
+    input: JSON.stringify({
+      conversationId: convId,
+      workspacePaths: [REPO_ROOT],
+      stepIdx: 2,
+      toolCall: {
+        name: 'manage_subagents',
+        args: { Action: 'kill', ConversationIds: ['sub-cancel-1'] },
+        status: 'ERROR',
+        error: 'Failed to kill worker',
+      },
+    }),
+    encoding: 'utf8',
+  });
+  let telJson = JSON.parse(
+    fs.readFileSync(path.join(REPO_ROOT, '.harness', 'runtime', 'telemetry.json'), 'utf8')
+  );
+  assert.equal(telJson.sessions?.[convId]?.subagents?.[0]?.status, 'RUNNING');
+
+  // Successful manage_subagents kill marks worker CANCELLED (not COMPLETED)
+  spawnSync('node', [path.join(hooksDir, 'post-tool-use.mjs')], {
+    input: JSON.stringify({
+      conversationId: convId,
+      workspacePaths: [REPO_ROOT],
+      stepIdx: 3,
+      toolCall: {
+        name: 'manage_subagents',
+        args: { Action: 'kill', ConversationIds: ['sub-cancel-1'] },
+        status: 'DONE',
+      },
+    }),
+    encoding: 'utf8',
+  });
+  telJson = JSON.parse(
+    fs.readFileSync(path.join(REPO_ROOT, '.harness', 'runtime', 'telemetry.json'), 'utf8')
+  );
+  assert.equal(telJson.sessions?.[convId]?.subagents?.[0]?.status, 'CANCELLED');
+
+  // 5. Authenticated Monitor, Strict URL-Parsed Origin, Zero-Event Empty Workspace Telemetry & Unknown Worker Recall Rejection
+  const emptyWs = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-empty-ws-'));
+  const app = createHarnessMonitorApp({
+    requireAuth: true,
+    sessionToken: 'test-session-token-wp6',
+    registeredWorkspaces: [REPO_ROOT, emptyWs],
+  });
+  await app.run(0);
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const authHeaders = {
+      'Content-Type': 'application/json',
+      'X-Sidecar-Token': 'test-session-token-wp6',
+    };
+
+    // Spoofed prefix origin http://127.0.0.1.evil.com must be rejected with 403
+    const spoofOriginRes = await fetch(`${base}/api/status`, {
+      headers: {
+        ...authHeaders,
+        Origin: 'http://127.0.0.1.evil.com',
+      },
+    });
+    assert.equal(spoofOriginRes.status, 403);
+
+    // Missing token when requireAuth: true must be rejected with 401
+    const noTokenRes = await fetch(`${base}/api/status`);
+    assert.equal(noTokenRes.status, 401);
+
+    // Zero-event empty workspace must report telemetryQuality: 'unavailable', observedSteps: 0, observedTokens: null
+    const dashRes = await fetch(
+      `${base}/api/dashboard?workspaceRoot=${encodeURIComponent(emptyWs)}`,
+      { headers: authHeaders }
+    );
+    assert.equal(dashRes.status, 200);
+    const dashData = await dashRes.json();
+    assert.equal(dashData.telemetryQuality, 'unavailable');
+    assert.equal(dashData.contextAnalytics.observedSteps, 0);
+    assert.equal(dashData.contextAnalytics.observedTokens, null);
+    assert.equal(dashData.swarm.observedSubagentCount, 0);
+
+    // Unknown worker recall must be rejected with 404 and ok: false
+    const recallUnknownRes = await fetch(`${base}/api/swarm/recall`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({
+        workspaceRoot: emptyWs,
+        nodeId: 'unknown-nonexistent-worker-999',
+      }),
+    });
+    assert.equal(recallUnknownRes.status, 404);
+    const recallUnknownJson = await recallUnknownRes.json();
+    assert.equal(recallUnknownJson.ok, false);
+  } finally {
+    await app.close();
+    fs.rmSync(emptyWs, { recursive: true, force: true });
+  }
+
+  // 6. WP7 Installed End-to-End Task Gate through the packaged plugin MCP entry
+  const e2eWs = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-wp7-e2e-'));
+  const pluginMcpEntry = path.join(REPO_ROOT, 'plugin', 'harness-ide', 'scripts', 'mcp-entry.mjs');
+  try {
+    // Initialize .harness directories and a real source consumer file in e2eWs
+    const e2eEngine = new HarnessKnowledgeEngine(e2eWs);
+    e2eEngine.ensureDirectories();
+    fs.mkdirSync(path.join(e2eWs, 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(e2eWs, 'src', 'feature.mjs'),
+      'export function runVerifiedFeature() { return "WP7_CONTRACT_KEY"; }\n',
+      'utf8'
+    );
+
+    // Step A: Register task ledger & contract via MCP harness_task_ledger
+    const ledgerCall = await handleToolCall('harness_task_ledger', {
+      workspace_root: e2eWs,
+      action: 'upsert',
+      task_id: 'task-wp7-e2e',
+      objective: 'Deliver verified WP7 feature artifact end-to-end',
+      user_correction: 'Require cryptographic receipt before promotion',
+      requirements: [
+        {
+          id: 'REQ-WP7-1',
+          behavior: 'Create src/feature.mjs with runVerifiedFeature and WP7_CONTRACT_KEY',
+          state: 'verified',
+          acceptanceChecks: ['runVerifiedFeature returns WP7_CONTRACT_KEY'],
+          evidenceRefs: ['src/feature.mjs'],
+          consumerRefs: [{ file: 'src/feature.mjs', symbol: 'runVerifiedFeature' }],
+        },
+      ],
+    });
+    assert.equal(ledgerCall.taskId, 'task-wp7-e2e');
+
+    const contractCall = await handleToolCall('harness_task_ledger', {
+      workspace_root: e2eWs,
+      action: 'register_contract',
+      task_id: 'task-wp7-e2e',
+      contract_id: 'CONTRACT-WP7',
+      symbol_name: 'runVerifiedFeature',
+      storage_key: 'WP7_CONTRACT_KEY',
+      unit: 'string',
+      consumer_unit: 'string',
+      producer_file: 'src/feature.mjs',
+      consumer_file: 'src/feature.mjs',
+    });
+    assert.equal(contractCall.contractId, 'CONTRACT-WP7');
+
+    // Step B: Write checkpoint, simulate interruption, and restore + acknowledge worker recovery via MCP harness_checkpoint
+    const cpWrite = await handleToolCall('harness_checkpoint', {
+      workspace_root: e2eWs,
+      action: 'write',
+      task_id: 'task-wp7-e2e',
+      active_workers: [
+        {
+          workerId: 'wp7-worker-1',
+          parentId: 'main-orchestrator',
+          ownership: ['src/feature.mjs'],
+          openChecks: [],
+        },
+      ],
+      next_action: 'Run evaluator and promote lesson',
+    });
+    assert.equal(cpWrite.checkpointRevision, 1);
+
+    const workerRestore = await handleToolCall('harness_checkpoint', {
+      workspace_root: e2eWs,
+      action: 'restore_subagent',
+      task_id: 'task-wp7-e2e',
+      worker_id: 'wp7-worker-1',
+      executor_session_id: 'WP7-SESSION-1',
+    });
+    assert.equal(workerRestore.ok, true);
+    assert.equal(workerRestore.contractValidation.ok, true);
+
+    const workerAck = await handleToolCall('harness_checkpoint', {
+      workspace_root: e2eWs,
+      action: 'acknowledge_recovery',
+      task_id: 'task-wp7-e2e',
+      worker_id: 'wp7-worker-1',
+      executor_session_id: 'WP7-SESSION-1',
+      checkpoint_revision: workerRestore.checkpointRevision,
+    });
+    assert.equal(workerAck.ok, true);
+
+    // Step C: Execute a real candidate via runHarness2Loop (allowSimulation: false) that creates a new artifact and passes real evaluation
+    const loopRes = await e2eEngine.runHarness2Loop({
+      taskId: 'task-wp7-e2e',
+      problem: 'Generate verified WP7 output artifact',
+      domain: 'software-engineering',
+      allowSimulation: false,
+      requiredArtifacts: ['src/wp7-delivered.json'],
+      executor: async ({ candidate }) => {
+        fs.writeFileSync(
+          path.join(e2eWs, 'src', 'wp7-delivered.json'),
+          JSON.stringify({ deliveredBy: candidate.id, contract: 'WP7_CONTRACT_KEY' }, null, 2),
+          'utf8'
+        );
+        return { observedTokens: 1820 };
+      },
+      evaluator: async () => {
+        const raw = JSON.parse(
+          fs.readFileSync(path.join(e2eWs, 'src', 'wp7-delivered.json'), 'utf8')
+        );
+        return {
+          passed: raw.contract === 'WP7_CONTRACT_KEY',
+          score: 0.96,
+          observedTokens: 1820,
+        };
+      },
+    });
+    assert.equal(loopRes.ok, true);
+    assert.equal(loopRes.passedVerification, true);
+    assert.equal(loopRes.synthetic, false);
+    assert.ok(loopRes.receiptId, 'Real verified loop must issue a receiptId');
+
+    // Step D: Promote the recorded experience via packaged plugin MCP stdio using the cryptographic receipt_id
+    const promoteStdio = spawnSync(
+      'node',
+      [pluginMcpEntry],
+      {
+        cwd: os.tmpdir(),
+        input:
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: 99,
+            method: 'tools/call',
+            params: {
+              name: 'harness_promote_lesson',
+              arguments: {
+                workspace_root: e2eWs,
+                task_id_or_docid: 'task-wp7-e2e',
+                adr_id: 'ADR-WP7-E2E',
+                receipt_id: loopRes.receiptId,
+              },
+            },
+          }) + '\n',
+        encoding: 'utf8',
+        timeout: 15000,
+      }
+    );
+    assert.equal(promoteStdio.status, 0, promoteStdio.stderr);
+    const promoteRpc = JSON.parse(promoteStdio.stdout.trim().split(/\r?\n/).pop());
+    const promoteData = JSON.parse(promoteRpc.result.content[0].text);
+    assert.equal(promoteData.ok, true);
+    assert.equal(promoteData.promoted, true);
+    assert.equal(promoteData.receiptId, loopRes.receiptId);
+  } finally {
+    fs.rmSync(e2eWs, { recursive: true, force: true });
   }
 });

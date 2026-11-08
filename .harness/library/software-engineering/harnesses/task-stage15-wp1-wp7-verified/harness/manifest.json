@@ -1,0 +1,10 @@
+{
+  "harness_id": "harness-software-engineering-task-stage15-wp1-wp7-verified",
+  "task_id": "task-stage15-wp1-wp7-verified",
+  "domain": "software-engineering",
+  "adopted_at": "2026-11-08T02:08:27.111Z",
+  "git_revision": "07c92b4",
+  "status": "active",
+  "synthetic": false,
+  "receipt_id": "RCPT-1794103707013-54D9A00D"
+}

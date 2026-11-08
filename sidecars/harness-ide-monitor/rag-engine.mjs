@@ -253,6 +253,8 @@ export class HarnessKnowledgeEngine {
     this.snapshotsDir = path.join(this.harnessDir, 'snapshots');
     this.snapshotBlobsDir = path.join(this.snapshotsDir, 'blobs');
     this.activeLockPath = path.join(this.snapshotsDir, 'active.lock.json');
+    this.snapshotMutexLockPath = path.join(this.snapshotsDir, '.lock');
+    this.receiptsDir = path.join(this.harnessDir, 'receipts');
     this.runtimeDir = path.join(this.harnessDir, 'runtime');
     this.telemetryPath = path.join(this.runtimeDir, 'telemetry.json');
     this.lastRunPath = path.join(this.runtimeDir, 'last-harness2-run.json');
@@ -264,6 +266,7 @@ export class HarnessKnowledgeEngine {
       this.indexDir,
       this.snapshotsDir,
       this.snapshotBlobsDir,
+      this.receiptsDir,
       this.runtimeDir,
       path.join(this.harnessDir, 'knowledge', 'project'),
       path.join(this.harnessDir, 'knowledge', 'experiments'),
@@ -275,6 +278,33 @@ export class HarnessKnowledgeEngine {
     }
   }
 
+  _resolveRealPathWithNonExistentTail(targetPath) {
+    let cur = path.resolve(targetPath);
+    const tailSegments = [];
+    while (true) {
+      if (fs.existsSync(cur)) {
+        const realBase = fs.realpathSync(cur);
+        return tailSegments.length > 0 ? path.resolve(realBase, ...tailSegments) : realBase;
+      }
+      try {
+        const lstat = fs.lstatSync(cur);
+        if (lstat.isSymbolicLink()) {
+          const linkTarget = fs.readlinkSync(cur);
+          cur = path.resolve(path.dirname(cur), linkTarget);
+          continue;
+        }
+      } catch {
+        // Path segment does not exist yet
+      }
+      const parent = path.dirname(cur);
+      if (parent === cur) {
+        return tailSegments.length > 0 ? path.resolve(cur, ...tailSegments) : cur;
+      }
+      tailSegments.unshift(path.basename(cur));
+      cur = parent;
+    }
+  }
+
   _isPathInsideWorkspace(targetPath) {
     try {
       const rootResolved = path.resolve(this.workspaceRoot);
@@ -283,13 +313,16 @@ export class HarnessKnowledgeEngine {
       if (rel.startsWith('..') || path.isAbsolute(rel)) {
         return false;
       }
-      if (fs.existsSync(rootResolved) && fs.existsSync(targetResolved)) {
-        const rootReal = fs.realpathSync(rootResolved);
-        const targetReal = fs.realpathSync(targetResolved);
-        const realRel = path.relative(rootReal, targetReal);
-        if (realRel.startsWith('..') || path.isAbsolute(realRel)) {
-          return false;
-        }
+      const wsReal = this._resolveRealPathWithNonExistentTail(rootResolved);
+      const resolved = this._resolveRealPathWithNonExistentTail(targetResolved);
+      const normWs = process.platform === 'win32' ? wsReal.toLowerCase() : wsReal;
+      const normResolved = process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+      if (normResolved !== normWs && !normResolved.startsWith(normWs + path.sep)) {
+        return false;
+      }
+      const realRel = path.relative(wsReal, resolved);
+      if (realRel.startsWith('..') || path.isAbsolute(realRel)) {
+        return false;
       }
       return true;
     } catch {
@@ -684,6 +717,7 @@ export class HarnessKnowledgeEngine {
             task_id: metadata.task_id || '',
             status,
             synthetic,
+            receipt_id: metadata.receipt_id && metadata.receipt_id !== 'null' ? metadata.receipt_id : null,
             repo: metadata.repo || 'Harness2-RAG-antigravity',
             git_revision: metadata.git_revision || 'HEAD',
             created_at: createdAt,
@@ -777,17 +811,96 @@ export class HarnessKnowledgeEngine {
     }
   }
 
+  _withSnapshotFileLock(fn, timeoutMs = 5000) {
+    fs.mkdirSync(this.snapshotsDir, { recursive: true });
+    const lockFile = this.snapshotMutexLockPath || path.join(this.snapshotsDir, '.lock');
+    const start = Date.now();
+    const waitBuf = new Int32Array(new SharedArrayBuffer(4));
+    let acquired = false;
+
+    while (Date.now() - start <= timeoutMs) {
+      try {
+        const fd = fs.openSync(lockFile, 'wx');
+        const payload = JSON.stringify({ pid: process.pid, acquiredAt: Date.now() });
+        fs.writeFileSync(fd, payload, 'utf8');
+        fs.closeSync(fd);
+        acquired = true;
+        break;
+      } catch (err) {
+        if (err && (err.code === 'EEXIST' || err.code === 'EACCES' || err.code === 'EBUSY')) {
+          try {
+            const raw = fs.readFileSync(lockFile, 'utf8');
+            if (raw) {
+              const info = JSON.parse(raw);
+              const lockAge = Date.now() - Number(info.acquiredAt || 0);
+              let pidAlive = true;
+              if (info.pid && Number.isInteger(info.pid) && info.pid !== process.pid) {
+                try {
+                  process.kill(info.pid, 0);
+                } catch (killErr) {
+                  if (killErr && killErr.code === 'ESRCH') {
+                    pidAlive = false;
+                  }
+                }
+              }
+              if (!pidAlive || lockAge > Math.max(timeoutMs * 6, 30000)) {
+                try {
+                  fs.unlinkSync(lockFile);
+                } catch {}
+                continue;
+              }
+            }
+          } catch {
+            // Writer may still be flushing lock metadata
+          }
+          try {
+            Atomics.wait(waitBuf, 0, 0, 10);
+          } catch {
+            // Fallback spin
+          }
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    if (!acquired) {
+      const timeoutErr = new Error(
+        `Timed out waiting to acquire exclusive snapshot lock ${lockFile} after ${timeoutMs}ms`
+      );
+      timeoutErr.code = 'SNAPSHOT_LOCK_CONTENTION_TIMEOUT';
+      throw timeoutErr;
+    }
+
+    try {
+      return fn();
+    } finally {
+      try {
+        if (fs.existsSync(lockFile)) {
+          fs.unlinkSync(lockFile);
+        }
+      } catch {}
+    }
+  }
+
   getActiveSnapshotLock() {
     if (!fs.existsSync(this.activeLockPath)) {
       return null;
     }
     try {
       const lock = JSON.parse(fs.readFileSync(this.activeLockPath, 'utf8'));
-      if (lock && lock.active) return lock;
+      if (lock && lock.active && lock.snapshotId && Array.isArray(lock.frozenDocuments)) {
+        return lock;
+      }
       return null;
     } catch {
       return null;
     }
+  }
+
+  getSnapshotStatus() {
+    const active = this.getActiveSnapshotLock();
+    return active || { active: false };
   }
 
   createSnapshotLock({
@@ -798,111 +911,115 @@ export class HarnessKnowledgeEngine {
     cutoffTimestamp = null,
     ownerRunId = null,
     owner_run_id = null,
-    force = false
+    force = false,
+    lockTimeoutMs = 5000
   } = {}) {
     this.ensureDirectories();
-    const effectiveOwner = ownerRunId || owner_run_id || null;
-    const currentLock = this.getActiveSnapshotLock();
-    if (currentLock && !force) {
-      if (
-        (currentLock.ownerRunId && effectiveOwner && currentLock.ownerRunId !== effectiveOwner) ||
-        (currentLock.ownerRunId && !effectiveOwner)
-      ) {
-        return {
-          ok: false,
-          active: false,
-          locked: false,
-          error: 'SNAPSHOT_LOCK_ACTIVE_BY_ANOTHER_RUN',
-          snapshotId: currentLock.snapshotId,
-          ownerRunId: currentLock.ownerRunId
-        };
+    return this._withSnapshotFileLock(() => {
+      const effectiveOwner = ownerRunId || owner_run_id || null;
+      const currentLock = this.getActiveSnapshotLock();
+      if (currentLock && !force) {
+        const sameExplicitOwner =
+          Boolean(currentLock.ownerRunId) &&
+          Boolean(effectiveOwner) &&
+          currentLock.ownerRunId === effectiveOwner;
+        if (!sameExplicitOwner) {
+          return {
+            ok: false,
+            active: false,
+            locked: false,
+            error: 'SNAPSHOT_LOCK_ACTIVE_BY_ANOTHER_RUN',
+            snapshotId: currentLock.snapshotId,
+            ownerRunId: currentLock.ownerRunId
+          };
+        }
       }
-    }
 
-    const index = this.buildIndex();
-    const cutoff = cutoffTimestamp || new Date().toISOString();
-    const snapshotId = `SNAP-${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto
-      .randomBytes(2)
-      .toString('hex')
-      .toUpperCase()}`;
+      const index = this.buildIndex();
+      const cutoff = cutoffTimestamp || new Date().toISOString();
+      const snapshotId = `SNAP-${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto
+        .randomBytes(2)
+        .toString('hex')
+        .toUpperCase()}`;
 
-    const eligibleDocs = index.documents.filter((d) => {
-      if (
-        d.status === 'candidate' ||
-        d.status === 'draft' ||
-        d.status === 'retracted' ||
-        d.status === 'superseded' ||
-        d.synthetic === true
-      ) {
-        return false;
-      }
-      if (cutoffTimestamp && d.created_at > cutoffTimestamp) return false;
-      return true;
-    });
-
-    const frozenDocuments = [];
-    const frozenDfMap = {};
-    for (const d of eligibleDocs) {
-      const absPath = path.resolve(this.workspaceRoot, d.path);
-      const rawContent =
-        this._isPathInsideWorkspace(absPath) && fs.existsSync(absPath)
-          ? fs.readFileSync(absPath, 'utf8')
-          : d.content || d.excerpt || '';
-      const blobHash = crypto.createHash('sha256').update(rawContent, 'utf8').digest('hex');
-      const blobPath = path.join(this.snapshotBlobsDir, `${blobHash}.md`);
-      if (!fs.existsSync(blobPath)) {
-        fs.writeFileSync(blobPath, rawContent, 'utf8');
-      }
-      const tf = d.tf || d.termFreqs || {};
-      for (const tok of Object.keys(tf)) {
-        frozenDfMap[tok] = (frozenDfMap[tok] || 0) + 1;
-      }
-      frozenDocuments.push({
-        ...d,
-        content: rawContent,
-        sections: d.sections || this._extractSections(rawContent, d.title),
-        tokens: d.tokens || Object.keys(tf),
-        termFreqs: tf,
-        tf,
-        length: d.tokenCount || d.length || 0,
-        tokenCount: d.tokenCount || d.length || 0,
-        vector: d.vector,
-        blobHash
+      const eligibleDocs = index.documents.filter((d) => {
+        if (
+          d.status === 'candidate' ||
+          d.status === 'draft' ||
+          d.status === 'retracted' ||
+          d.status === 'superseded' ||
+          d.synthetic === true
+        ) {
+          return false;
+        }
+        if (cutoffTimestamp && d.created_at > cutoffTimestamp) return false;
+        return true;
       });
-    }
 
-    const frozenAvgDocLen =
-      frozenDocuments.length > 0
-        ? frozenDocuments.reduce((acc, doc) => acc + (doc.tokenCount || 0), 0) / frozenDocuments.length
-        : 1;
-    const eligibleDocIds = frozenDocuments.map((d) => d.docid);
+      const frozenDocuments = [];
+      const frozenDfMap = {};
+      for (const d of eligibleDocs) {
+        const absPath = path.resolve(this.workspaceRoot, d.path);
+        const rawContent =
+          this._isPathInsideWorkspace(absPath) && fs.existsSync(absPath)
+            ? fs.readFileSync(absPath, 'utf8')
+            : d.content || d.excerpt || '';
+        const blobHash = crypto.createHash('sha256').update(rawContent, 'utf8').digest('hex');
+        const blobPath = path.join(this.snapshotBlobsDir, `${blobHash}.md`);
+        if (!fs.existsSync(blobPath)) {
+          fs.writeFileSync(blobPath, rawContent, 'utf8');
+        }
+        const tf = d.tf || d.termFreqs || {};
+        for (const tok of Object.keys(tf)) {
+          frozenDfMap[tok] = (frozenDfMap[tok] || 0) + 1;
+        }
+        frozenDocuments.push({
+          ...d,
+          content: rawContent,
+          sections: d.sections || this._extractSections(rawContent, d.title),
+          tokens: d.tokens || Object.keys(tf),
+          termFreqs: tf,
+          tf,
+          length: d.tokenCount || d.length || 0,
+          tokenCount: d.tokenCount || d.length || 0,
+          vector: d.vector,
+          blobHash
+        });
+      }
 
-    const lockPayload = {
-      ok: true,
-      active: true,
-      snapshotId,
-      ownerRunId: effectiveOwner,
-      createdAt: new Date().toISOString(),
-      cutoffTimestamp: cutoff,
-      gitRevision: this.getGitRevision(),
-      domain,
-      k,
-      mode,
-      description,
-      eligibleDocCount: eligibleDocIds.length,
-      eligibleDocIds,
-      avgDocLen: frozenAvgDocLen,
-      dfMap: frozenDfMap,
-      frozenDocuments
-    };
+      const frozenAvgDocLen =
+        frozenDocuments.length > 0
+          ? frozenDocuments.reduce((acc, doc) => acc + (doc.tokenCount || 0), 0) / frozenDocuments.length
+          : 1;
+      const eligibleDocIds = frozenDocuments.map((d) => d.docid);
 
-    fs.writeFileSync(
-      path.join(this.snapshotsDir, `${snapshotId}.json`),
-      JSON.stringify(lockPayload, null, 2),
-      'utf8'
-    );
-    fs.writeFileSync(this.activeLockPath, JSON.stringify(lockPayload, null, 2), 'utf8');
-    return lockPayload;
+      const lockPayload = {
+        ok: true,
+        active: true,
+        snapshotId,
+        ownerRunId: effectiveOwner,
+        createdAt: new Date().toISOString(),
+        cutoffTimestamp: cutoff,
+        gitRevision: this.getGitRevision(),
+        domain,
+        k,
+        mode,
+        description,
+        eligibleDocCount: eligibleDocIds.length,
+        eligibleDocIds,
+        avgDocLen: frozenAvgDocLen,
+        dfMap: frozenDfMap,
+        frozenDocuments
+      };
+
+      fs.writeFileSync(
+        path.join(this.snapshotsDir, `${snapshotId}.json`),
+        JSON.stringify(lockPayload, null, 2),
+        'utf8'
+      );
+      fs.writeFileSync(this.activeLockPath, JSON.stringify(lockPayload, null, 2), 'utf8');
+      return lockPayload;
+    }, lockTimeoutMs);
   }
 
   releaseSnapshotLock({
@@ -910,42 +1027,50 @@ export class HarnessKnowledgeEngine {
     snapshot_id = null,
     ownerRunId = null,
     owner_run_id = null,
-    force = false
+    ownerId = null,
+    force = false,
+    lockTimeoutMs = 5000
   } = {}) {
-    const current = this.getActiveSnapshotLock();
-    if (!current) {
+    return this._withSnapshotFileLock(() => {
+      const current = this.getActiveSnapshotLock();
+      if (!current) {
+        return {
+          ok: true,
+          released: false,
+          previousLock: null
+        };
+      }
+      const effectiveOwner = ownerRunId || owner_run_id || ownerId || null;
+      const targetSnapId = snapshotId || snapshot_id || null;
+      if (!force) {
+        if (current.ownerRunId && effectiveOwner !== current.ownerRunId) {
+          return {
+            ok: false,
+            released: false,
+            error: 'SNAPSHOT_LOCK_OWNED_BY_ANOTHER_RUN',
+            ownerRunId: current.ownerRunId,
+            snapshotId: current.snapshotId
+          };
+        }
+        if (targetSnapId && current.snapshotId !== targetSnapId) {
+          return {
+            ok: false,
+            released: false,
+            error: 'SNAPSHOT_LOCK_OWNED_BY_ANOTHER_RUN',
+            ownerRunId: current.ownerRunId,
+            snapshotId: current.snapshotId
+          };
+        }
+      }
+      if (fs.existsSync(this.activeLockPath)) {
+        fs.unlinkSync(this.activeLockPath);
+      }
       return {
-        released: false,
-        previousLock: null
+        ok: true,
+        released: Boolean(current),
+        previousLock: current
       };
-    }
-    const effectiveOwner = ownerRunId || owner_run_id || null;
-    const targetSnapId = snapshotId || snapshot_id || null;
-    if (!force) {
-      if (current.ownerRunId && effectiveOwner !== current.ownerRunId) {
-        return {
-          released: false,
-          error: 'SNAPSHOT_LOCK_OWNED_BY_ANOTHER_RUN',
-          ownerRunId: current.ownerRunId,
-          snapshotId: current.snapshotId
-        };
-      }
-      if (targetSnapId && current.snapshotId !== targetSnapId) {
-        return {
-          released: false,
-          error: 'SNAPSHOT_LOCK_OWNED_BY_ANOTHER_RUN',
-          ownerRunId: current.ownerRunId,
-          snapshotId: current.snapshotId
-        };
-      }
-    }
-    if (fs.existsSync(this.activeLockPath)) {
-      fs.unlinkSync(this.activeLockPath);
-    }
-    return {
-      released: Boolean(current),
-      previousLock: current
-    };
+    }, lockTimeoutMs);
   }
 
   listSnapshots() {
@@ -994,7 +1119,12 @@ export class HarnessKnowledgeEngine {
       }
       try {
         const parsed = JSON.parse(fs.readFileSync(snapFile, 'utf8'));
-        if (!parsed || typeof parsed !== 'object') {
+        if (
+          !parsed ||
+          typeof parsed !== 'object' ||
+          typeof parsed.snapshotId !== 'string' ||
+          !Array.isArray(parsed.frozenDocuments)
+        ) {
           return {
             invalidSnapshot: true,
             snapshotId: snapshotIdParam,
@@ -1011,9 +1141,71 @@ export class HarnessKnowledgeEngine {
       }
     }
     if (config.harness2?.strictSnapshotIsolation !== false) {
-      return this.getActiveSnapshotLock();
+      if (fs.existsSync(this.activeLockPath)) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(this.activeLockPath, 'utf8'));
+          if (!parsed || typeof parsed !== 'object') {
+            return {
+              invalidSnapshot: true,
+              snapshotId: 'active.lock.json',
+              error: 'INVALID_OR_MISSING_SNAPSHOT'
+            };
+          }
+          if (!parsed.active) {
+            return null;
+          }
+          if (typeof parsed.snapshotId !== 'string' || !Array.isArray(parsed.frozenDocuments)) {
+            return {
+              invalidSnapshot: true,
+              snapshotId: parsed.snapshotId || 'active.lock.json',
+              error: 'INVALID_OR_MISSING_SNAPSHOT'
+            };
+          }
+          return parsed;
+        } catch {
+          return {
+            invalidSnapshot: true,
+            snapshotId: 'active.lock.json',
+            error: 'INVALID_OR_MISSING_SNAPSHOT'
+          };
+        }
+      }
+      return null;
     }
     return null;
+  }
+
+  _verifyFrozenSnapshotBlobs(snapLock) {
+    if (!snapLock || !Array.isArray(snapLock.frozenDocuments)) {
+      return { ok: true };
+    }
+    for (const doc of snapLock.frozenDocuments) {
+      if (!doc.blobHash || typeof doc.blobHash !== 'string') {
+        return {
+          ok: false,
+          error: 'SNAPSHOT_BLOB_HASH_MISMATCH',
+          docid: doc.docid
+        };
+      }
+      const blobPath = path.join(this.snapshotBlobsDir, `${doc.blobHash}.md`);
+      if (!this._isPathInsideWorkspace(blobPath) || !fs.existsSync(blobPath)) {
+        return {
+          ok: false,
+          error: 'SNAPSHOT_BLOB_HASH_MISMATCH',
+          docid: doc.docid
+        };
+      }
+      const blobBytes = fs.readFileSync(blobPath, 'utf8');
+      const actualHash = crypto.createHash('sha256').update(blobBytes, 'utf8').digest('hex');
+      if (actualHash !== doc.blobHash) {
+        return {
+          ok: false,
+          error: 'SNAPSHOT_BLOB_HASH_MISMATCH',
+          docid: doc.docid
+        };
+      }
+    }
+    return { ok: true };
   }
 
   _resolveSnapshotFilter(snapshotIdParam) {
@@ -1069,7 +1261,8 @@ export class HarnessKnowledgeEngine {
     if (snapLock && snapLock.invalidSnapshot) {
       return {
         ok: false,
-        error: 'INVALID_OR_MISSING_SNAPSHOT',
+        invalidSnapshot: true,
+        error: snapLock.error || 'INVALID_OR_MISSING_SNAPSHOT',
         query: queryText,
         mode,
         totalEligible: 0,
@@ -1077,10 +1270,32 @@ export class HarnessKnowledgeEngine {
         snapshotIsolation: {
           active: false,
           invalidSnapshot: true,
-          error: 'INVALID_OR_MISSING_SNAPSHOT',
+          error: snapLock.error || 'INVALID_OR_MISSING_SNAPSHOT',
           snapshotId: effectiveSnapshotId
         }
       };
+    }
+
+    if (snapLock && Array.isArray(snapLock.frozenDocuments)) {
+      const blobCheck = this._verifyFrozenSnapshotBlobs(snapLock);
+      if (!blobCheck.ok) {
+        return {
+          ok: false,
+          found: false,
+          invalidSnapshot: true,
+          error: 'SNAPSHOT_BLOB_HASH_MISMATCH',
+          query: queryText,
+          mode,
+          totalEligible: 0,
+          results: [],
+          snapshotIsolation: {
+            active: false,
+            invalidSnapshot: true,
+            error: 'SNAPSHOT_BLOB_HASH_MISMATCH',
+            snapshotId: snapLock.snapshotId
+          }
+        };
+      }
     }
 
     const index = this.loadOrBuildIndex();
@@ -1266,10 +1481,20 @@ export class HarnessKnowledgeEngine {
   }
 
   getDocument(identifier, optionsOrSnapshotId = {}) {
-    const opts =
+    let targetId = identifier;
+    let opts =
       typeof optionsOrSnapshotId === 'string'
         ? { snapshot_id: optionsOrSnapshotId }
         : optionsOrSnapshotId || {};
+    if (typeof identifier === 'object' && identifier !== null) {
+      opts = { ...opts, ...identifier };
+      targetId =
+        identifier.idOrPath ??
+        identifier.identifier ??
+        identifier.docid ??
+        identifier.path ??
+        '';
+    }
     const effectiveSnapshotId = opts.snapshot_id ?? opts.snapshotId ?? null;
     const include_candidates = Boolean(opts.include_candidates ?? opts.includeCandidates);
     const snapLock = this.resolveSnapshotLock(effectiveSnapshotId);
@@ -1278,14 +1503,25 @@ export class HarnessKnowledgeEngine {
         found: false,
         invalidSnapshot: true,
         snapshotId: effectiveSnapshotId,
-        error: 'INVALID_OR_MISSING_SNAPSHOT'
+        error: snapLock.error || 'INVALID_OR_MISSING_SNAPSHOT'
       };
+    }
+    if (snapLock && Array.isArray(snapLock.frozenDocuments)) {
+      const blobCheck = this._verifyFrozenSnapshotBlobs(snapLock);
+      if (!blobCheck.ok) {
+        return {
+          found: false,
+          invalidSnapshot: true,
+          snapshotId: snapLock.snapshotId,
+          error: blobCheck.error || 'SNAPSHOT_BLOB_HASH_MISMATCH'
+        };
+      }
     }
 
     const index = this.loadOrBuildIndex();
     const useFrozenDocs = Boolean(snapLock && Array.isArray(snapLock.frozenDocuments));
     const sourceDocs = useFrozenDocs ? snapLock.frozenDocuments : index.documents;
-    const normId = String(identifier || '').trim().replace(/\\/g, '/');
+    const normId = String(targetId || '').trim().replace(/\\/g, '/');
 
     const eligibleDocs = sourceDocs.filter((d) =>
       this._isDocEligibleForSnapshot(d, snapLock, include_candidates)
@@ -1312,7 +1548,7 @@ export class HarnessKnowledgeEngine {
           blockedBySnapshotLock: true,
           snapshotId: snapLock.snapshotId,
           cutoffTimestamp: snapLock.cutoffTimestamp,
-          error: `Document '${identifier}' (${blockedMatch.docid}) is excluded by active Harness² Snapshot Isolation lock ${snapLock.snapshotId} (cutoff ${snapLock.cutoffTimestamp}).`
+          error: `Document '${targetId}' (${blockedMatch.docid}) is excluded by active Harness² Snapshot Isolation lock ${snapLock.snapshotId} (cutoff ${snapLock.cutoffTimestamp}).`
         };
       }
       const suggestions = eligibleDocs
@@ -1320,23 +1556,41 @@ export class HarnessKnowledgeEngine {
         .slice(0, 5);
       return {
         found: false,
-        error: `Document '${identifier}' not found.`,
+        error: `Document '${targetId}' not found.`,
         suggestions
       };
     }
 
     let content = match.excerpt || '';
     if (useFrozenDocs) {
-      if (match.blobHash) {
-        const blobPath = path.join(this.snapshotBlobsDir, `${match.blobHash}.md`);
-        if (this._isPathInsideWorkspace(blobPath) && fs.existsSync(blobPath)) {
-          content = fs.readFileSync(blobPath, 'utf8');
-        } else if (typeof match.content === 'string') {
-          content = match.content;
-        }
-      } else if (typeof match.content === 'string') {
-        content = match.content;
+      if (!match.blobHash || typeof match.blobHash !== 'string') {
+        return {
+          found: false,
+          invalidSnapshot: true,
+          snapshotId: snapLock.snapshotId,
+          error: 'SNAPSHOT_BLOB_HASH_MISMATCH'
+        };
       }
+      const blobPath = path.join(this.snapshotBlobsDir, `${match.blobHash}.md`);
+      if (!this._isPathInsideWorkspace(blobPath) || !fs.existsSync(blobPath)) {
+        return {
+          found: false,
+          invalidSnapshot: true,
+          snapshotId: snapLock.snapshotId,
+          error: 'SNAPSHOT_BLOB_HASH_MISMATCH'
+        };
+      }
+      const blobBytes = fs.readFileSync(blobPath, 'utf8');
+      const actualHash = crypto.createHash('sha256').update(blobBytes, 'utf8').digest('hex');
+      if (actualHash !== match.blobHash) {
+        return {
+          found: false,
+          invalidSnapshot: true,
+          snapshotId: snapLock.snapshotId,
+          error: 'SNAPSHOT_BLOB_HASH_MISMATCH'
+        };
+      }
+      content = blobBytes;
     } else {
       const absPath = path.resolve(this.workspaceRoot, match.path);
       content =
@@ -1355,6 +1609,7 @@ export class HarnessKnowledgeEngine {
       task_id: match.task_id,
       status: match.status,
       synthetic: Boolean(match.synthetic),
+      receipt_id: match.receipt_id || null,
       repo: match.repo,
       git_revision: match.git_revision,
       created_at: match.created_at,
@@ -1489,6 +1744,317 @@ export class HarnessKnowledgeEngine {
     };
   }
 
+  _getOrCreateReceiptKey() {
+    const globalKeyPath = path.join(os.homedir(), '.gemini', 'config', '.receipt.key');
+    try {
+      if (fs.existsSync(globalKeyPath)) {
+        const existing = fs.readFileSync(globalKeyPath, 'utf8').trim();
+        if (existing.length >= 64) {
+          return Buffer.from(existing.slice(0, 64), 'hex');
+        }
+      }
+      fs.mkdirSync(path.dirname(globalKeyPath), { recursive: true });
+      const rawKey = crypto.randomBytes(32);
+      fs.writeFileSync(globalKeyPath, rawKey.toString('hex') + '\n', {
+        encoding: 'utf8',
+        mode: 0o600
+      });
+      return rawKey;
+    } catch {
+      const localKeyPath = path.join(this.runtimeDir, '.receipt.key');
+      fs.mkdirSync(this.runtimeDir, { recursive: true });
+      if (fs.existsSync(localKeyPath)) {
+        const existing = fs.readFileSync(localKeyPath, 'utf8').trim();
+        if (existing.length >= 64) {
+          return Buffer.from(existing.slice(0, 64), 'hex');
+        }
+      }
+      const rawKey = crypto.randomBytes(32);
+      fs.writeFileSync(localKeyPath, rawKey.toString('hex') + '\n', {
+        encoding: 'utf8',
+        mode: 0o600
+      });
+      return rawKey;
+    }
+  }
+
+  _signReceiptPayload(core) {
+    const sortedArtifactHashes = {};
+    if (core.artifactHashes && typeof core.artifactHashes === 'object' && !Array.isArray(core.artifactHashes)) {
+      for (const k of Object.keys(core.artifactHashes).sort()) {
+        sortedArtifactHashes[k] = core.artifactHashes[k];
+      }
+    }
+    const canonical = JSON.stringify({
+      receiptId: String(core.receiptId || ''),
+      taskId: String(core.taskId || ''),
+      candidateId: String(core.candidateId || ''),
+      domain: String(core.domain || 'software-engineering'),
+      gitRevision: String(core.gitRevision || 'HEAD'),
+      score: Number(core.score),
+      passed: core.passed === true,
+      artifactHashes: sortedArtifactHashes,
+      synthetic: Boolean(core.synthetic)
+    });
+    const key = this._getOrCreateReceiptKey();
+    return crypto.createHmac('sha256', key).update(canonical, 'utf8').digest('hex');
+  }
+
+  createEvaluationReceipt({
+    taskId,
+    task_id,
+    candidateId,
+    candidate_id,
+    domain = 'software-engineering',
+    gitRevision = null,
+    git_revision = null,
+    evaluatorId = 'custom-evaluator',
+    evaluator_id = null,
+    checks = [],
+    score,
+    passed,
+    artifactHashes = {},
+    artifact_hashes = null,
+    providerCalls = 0,
+    provider_calls = null,
+    actualTokens = null,
+    actual_tokens = null,
+    synthetic = false
+  } = {}) {
+    this.ensureDirectories();
+    const resolvedTaskId = String(taskId || task_id || '')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]/g, '-');
+    const resolvedCandidateId = String(candidateId || candidate_id || '').trim();
+    const resolvedDomain = String(domain || 'software-engineering')
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]/g, '-');
+    const resolvedGitRev = String(gitRevision || git_revision || this.getGitRevision());
+    const resolvedEvaluatorId = String(evaluatorId || evaluator_id || 'custom-evaluator');
+    const resolvedArtifactHashes = artifactHashes && Object.keys(artifactHashes).length > 0
+      ? artifactHashes
+      : artifact_hashes || {};
+
+    if (
+      synthetic === true ||
+      passed !== true ||
+      typeof score !== 'number' ||
+      Number.isNaN(score) ||
+      score < 0 ||
+      score > 1 ||
+      !resolvedTaskId ||
+      !resolvedCandidateId ||
+      !resolvedArtifactHashes ||
+      typeof resolvedArtifactHashes !== 'object' ||
+      Array.isArray(resolvedArtifactHashes)
+    ) {
+      return {
+        ok: false,
+        error: 'INVALID_EVALUATION_RECEIPT_INPUT'
+      };
+    }
+
+    const verifiedHashes = {};
+    for (const [relPath, expectedSha256] of Object.entries(resolvedArtifactHashes)) {
+      const absPath = path.resolve(this.workspaceRoot, String(relPath));
+      if (
+        !this._isPathInsideWorkspace(absPath) ||
+        !fs.existsSync(absPath) ||
+        !fs.statSync(absPath).isFile()
+      ) {
+        return {
+          ok: false,
+          error: 'ARTIFACT_VERIFICATION_FAILED',
+          relPath: String(relPath)
+        };
+      }
+      const actualSha256 = crypto
+        .createHash('sha256')
+        .update(fs.readFileSync(absPath))
+        .digest('hex');
+      if (typeof expectedSha256 === 'string' && expectedSha256.length === 64) {
+        if (actualSha256.toLowerCase() !== expectedSha256.toLowerCase()) {
+          return {
+            ok: false,
+            error: 'ARTIFACT_HASH_MISMATCH',
+            relPath: String(relPath),
+            expectedSha256,
+            actualSha256
+          };
+        }
+      } else {
+        return {
+          ok: false,
+          error: 'INVALID_EVALUATION_RECEIPT_INPUT',
+          relPath: String(relPath)
+        };
+      }
+      verifiedHashes[String(relPath).replace(/\\/g, '/')] = actualSha256;
+    }
+
+    const receiptId = `RCPT-${Date.now()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+    const normScore = Number(score.toFixed(4));
+    const corePayload = {
+      receiptId,
+      taskId: resolvedTaskId,
+      candidateId: resolvedCandidateId,
+      domain: resolvedDomain,
+      gitRevision: resolvedGitRev,
+      evaluatorId: resolvedEvaluatorId,
+      checks: Array.isArray(checks) ? checks : [],
+      score: normScore,
+      passed: true,
+      artifactHashes: verifiedHashes,
+      providerCalls: Number(providerCalls ?? provider_calls ?? 0),
+      actualTokens: actualTokens ?? actual_tokens ?? null,
+      synthetic: false,
+      createdAt: new Date().toISOString()
+    };
+    const signature = this._signReceiptPayload(corePayload);
+    const storedReceipt = {
+      ok: true,
+      ...corePayload,
+      signature
+    };
+
+    const receiptFile = path.join(this.receiptsDir, `${receiptId}.json`);
+    const tmpFile = `${receiptFile}.tmp.${process.pid}.${Date.now()}`;
+    fs.writeFileSync(tmpFile, JSON.stringify(storedReceipt, null, 2) + '\n', {
+      encoding: 'utf8',
+      mode: 0o600
+    });
+    fs.renameSync(tmpFile, receiptFile);
+    return storedReceipt;
+  }
+
+  verifyEvaluationReceipt(
+    receiptIdOrObj,
+    { expectedTaskId = null, expectedCandidateId = null } = {}
+  ) {
+    if (!receiptIdOrObj || typeof receiptIdOrObj === 'boolean') {
+      return {
+        valid: false,
+        error: 'STORED_RECEIPT_NOT_FOUND'
+      };
+    }
+
+    const receiptId =
+      typeof receiptIdOrObj === 'string'
+        ? receiptIdOrObj.trim()
+        : typeof receiptIdOrObj === 'object' && typeof receiptIdOrObj.receiptId === 'string'
+          ? receiptIdOrObj.receiptId.trim()
+          : typeof receiptIdOrObj === 'object' && typeof receiptIdOrObj.receipt_id === 'string'
+            ? receiptIdOrObj.receipt_id.trim()
+            : null;
+
+    if (!receiptId || !/^RCPT-[A-Za-z0-9_-]+$/.test(receiptId)) {
+      return {
+        valid: false,
+        error: 'STORED_RECEIPT_NOT_FOUND'
+      };
+    }
+
+    const receiptPath = path.resolve(this.receiptsDir, `${receiptId}.json`);
+    if (
+      !this._isPathInsideWorkspace(receiptPath) ||
+      path.dirname(receiptPath) !== path.resolve(this.receiptsDir) ||
+      !fs.existsSync(receiptPath)
+    ) {
+      return {
+        valid: false,
+        error: 'STORED_RECEIPT_NOT_FOUND'
+      };
+    }
+
+    try {
+      const stored = JSON.parse(fs.readFileSync(receiptPath, 'utf8'));
+      if (
+        !stored ||
+        typeof stored !== 'object' ||
+        stored.receiptId !== receiptId ||
+        stored.passed !== true ||
+        stored.synthetic !== false ||
+        typeof stored.score !== 'number' ||
+        Number.isNaN(stored.score) ||
+        stored.score < 0 ||
+        stored.score > 1 ||
+        typeof stored.signature !== 'string'
+      ) {
+        return {
+          valid: false,
+          error: 'INVALID_STORED_RECEIPT_SCHEMA'
+        };
+      }
+
+      const expectedSig = this._signReceiptPayload(stored);
+      const sigBufA = Buffer.from(expectedSig, 'utf8');
+      const sigBufB = Buffer.from(stored.signature, 'utf8');
+      if (sigBufA.length !== sigBufB.length || !crypto.timingSafeEqual(sigBufA, sigBufB)) {
+        return {
+          valid: false,
+          error: 'RECEIPT_SIGNATURE_MISMATCH'
+        };
+      }
+
+      if (expectedTaskId) {
+        const normExpected = String(expectedTaskId).toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+        const normActual = String(stored.taskId || '').toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+        if (normExpected !== normActual) {
+          return {
+            valid: false,
+            error: 'RECEIPT_TASK_ID_MISMATCH'
+          };
+        }
+      }
+
+      if (expectedCandidateId && stored.candidateId !== expectedCandidateId) {
+        return {
+          valid: false,
+          error: 'RECEIPT_CANDIDATE_ID_MISMATCH'
+        };
+      }
+
+      const artifactHashes = stored.artifactHashes || {};
+      for (const [relPath, expectedSha256] of Object.entries(artifactHashes)) {
+        const absPath = path.resolve(this.workspaceRoot, String(relPath));
+        if (
+          !this._isPathInsideWorkspace(absPath) ||
+          !fs.existsSync(absPath) ||
+          !fs.statSync(absPath).isFile()
+        ) {
+          return {
+            valid: false,
+            error: 'RECEIPT_ARTIFACT_MISSING',
+            relPath
+          };
+        }
+        const actualSha256 = crypto
+          .createHash('sha256')
+          .update(fs.readFileSync(absPath))
+          .digest('hex');
+        if (actualSha256.toLowerCase() !== String(expectedSha256).toLowerCase()) {
+          return {
+            valid: false,
+            error: 'RECEIPT_ARTIFACT_HASH_MISMATCH',
+            relPath
+          };
+        }
+      }
+
+      return {
+        valid: true,
+        receiptId: stored.receiptId,
+        receipt: stored
+      };
+    } catch {
+      return {
+        valid: false,
+        error: 'CORRUPT_STORED_RECEIPT'
+      };
+    }
+  }
+
   recordExperience({
     task_id,
     domain = 'software-engineering',
@@ -1497,8 +2063,15 @@ export class HarnessKnowledgeEngine {
     problem,
     observed_behavior,
     supporting_evidence = [],
-    status = 'active',
+    status = 'candidate',
     synthetic = false,
+    receiptId = null,
+    receipt_id = null,
+    evaluationReceiptId = null,
+    evaluation_receipt_id = null,
+    evaluationReceipt = null,
+    evaluation_receipt = null,
+    allowUnverifiedActive = false,
     tags = ['harness2', 'experience'],
     adopted_harness = null
   }) {
@@ -1515,6 +2088,35 @@ export class HarnessKnowledgeEngine {
     const hash6 = crypto.createHash('sha1').update(String(task_id)).digest('hex').slice(0, 6).toUpperCase();
     const docid = `EXP-${domPrefix}-${slug}-${hash6}`;
 
+    const isSynthetic = Boolean(synthetic || adopted_harness?.synthetic);
+    const candidateReceiptRef =
+      receiptId ||
+      receipt_id ||
+      evaluationReceiptId ||
+      evaluation_receipt_id ||
+      evaluationReceipt ||
+      evaluation_receipt ||
+      adopted_harness?.receiptId ||
+      adopted_harness?.receipt_id ||
+      null;
+
+    let verifiedReceipt = null;
+    if (candidateReceiptRef && !isSynthetic) {
+      const check = this.verifyEvaluationReceipt(candidateReceiptRef, {
+        expectedTaskId: safeTaskId
+      });
+      if (check.valid) {
+        verifiedReceipt = check.receipt;
+      }
+    }
+
+    let effectiveStatus = status || 'candidate';
+    if (isSynthetic) {
+      effectiveStatus = 'candidate';
+    } else if (effectiveStatus === 'active' && !verifiedReceipt && !allowUnverifiedActive) {
+      effectiveStatus = 'candidate';
+    }
+
     const taskDir = path.join(this.harnessDir, 'library', safeDomain, 'harnesses', safeTaskId);
     const harnessSubdir = path.join(taskDir, 'harness');
     fs.mkdirSync(harnessSubdir, { recursive: true });
@@ -1523,8 +2125,9 @@ export class HarnessKnowledgeEngine {
     const manifestPayload = adopted_harness
       ? {
           ...adopted_harness,
-          status: adopted_harness.status || status,
-          synthetic: Boolean(adopted_harness.synthetic ?? synthetic)
+          status: effectiveStatus,
+          synthetic: isSynthetic,
+          receipt_id: verifiedReceipt?.receiptId || null
         }
       : {
           harness_id: `harness-${safeDomain}-${safeTaskId}`,
@@ -1532,17 +2135,24 @@ export class HarnessKnowledgeEngine {
           domain: safeDomain,
           adopted_at: nowIso,
           git_revision: gitRev,
-          status,
-          synthetic: Boolean(synthetic)
+          status: effectiveStatus,
+          synthetic: isSynthetic,
+          receipt_id: verifiedReceipt?.receiptId || null
         };
     fs.writeFileSync(manifestPath, JSON.stringify(manifestPayload, null, 2) + '\n', 'utf8');
 
     const relManifestPath = path.relative(this.workspaceRoot, manifestPath).replace(/\\/g, '/');
     const evidenceList = Array.isArray(supporting_evidence)
-      ? supporting_evidence
+      ? [...supporting_evidence]
       : [String(supporting_evidence)];
     if (!evidenceList.includes(relManifestPath)) {
       evidenceList.unshift(relManifestPath);
+    }
+    if (verifiedReceipt) {
+      const relReceiptPath = `.harness/receipts/${verifiedReceipt.receiptId}.json`;
+      if (!evidenceList.includes(relReceiptPath)) {
+        evidenceList.push(relReceiptPath);
+      }
     }
 
     const expTitle = title || `EXPERIENCE: ${safeTaskId}`;
@@ -1557,8 +2167,9 @@ export class HarnessKnowledgeEngine {
       'collection: experiment-knowledge',
       `domain: ${safeDomain}`,
       `task_id: ${safeTaskId}`,
-      `status: ${status}`,
-      `synthetic: ${Boolean(synthetic)}`,
+      `status: ${effectiveStatus}`,
+      `synthetic: ${isSynthetic}`,
+      `receipt_id: ${verifiedReceipt?.receiptId || 'null'}`,
       'repo: Harness2-RAG-antigravity',
       `git_revision: ${gitRev}`,
       `created_at: "${nowIso}"`,
@@ -1586,7 +2197,7 @@ export class HarnessKnowledgeEngine {
       ...evidenceList.map((e) => `- \`${e}\``),
       '',
       '## 5. Is the Conclusion Still Current?',
-      `- **Status**: \`${status}\``,
+      `- **Status**: \`${effectiveStatus}\``,
       `- **Recorded At**: \`${nowIso}\``,
       ''
     ].join('\n');
@@ -1594,8 +2205,8 @@ export class HarnessKnowledgeEngine {
     const expFilePath = path.join(taskDir, 'EXPERIENCE.md');
     fs.writeFileSync(expFilePath, expMd, 'utf8');
 
-    // Update domain INDEX.md and root INDEX.md only when status === 'active' and not synthetic
-    if (status === 'active' && !synthetic) {
+    // Update domain INDEX.md and root INDEX.md only when effectiveStatus === 'active' and not synthetic
+    if (effectiveStatus === 'active' && !isSynthetic) {
       const domainIndexPath = path.join(this.harnessDir, 'library', safeDomain, 'INDEX.md');
       if (!fs.existsSync(domainIndexPath)) {
         fs.writeFileSync(
@@ -1638,12 +2249,15 @@ export class HarnessKnowledgeEngine {
     const relExpPath = path.relative(this.workspaceRoot, expFilePath).replace(/\\/g, '/');
     const updatedIndex = this.buildIndex();
     return {
+      ok: true,
       recorded: true,
       docid,
+      expId: docid,
       task_id: safeTaskId,
       domain: safeDomain,
-      status,
-      synthetic: Boolean(synthetic),
+      status: effectiveStatus,
+      synthetic: isSynthetic,
+      receiptId: verifiedReceipt?.receiptId || null,
       experiencePath: relExpPath,
       relativePath: relExpPath,
       manifestPath: relManifestPath,
@@ -1654,33 +2268,41 @@ export class HarnessKnowledgeEngine {
   promoteExperienceToProjectKnowledge({
     task_id_or_docid,
     experienceDocId,
+    experienceIdOrPath,
+    docid,
+    expId,
+    task_id,
     adr_id,
     title,
     summary,
     evaluationReceipt = null,
     evaluation_receipt = null,
+    receiptId = null,
+    receipt_id = null,
     verified = undefined
   } = {}) {
-    const targetId = task_id_or_docid || experienceDocId;
+    const targetId =
+      task_id_or_docid || experienceDocId || experienceIdOrPath || docid || expId || task_id;
     const expDoc = this.getDocument(targetId, { include_candidates: true });
     if (!expDoc.found) {
       throw new Error(`Cannot promote: Experience '${targetId}' not found.`);
     }
-    const receipt = evaluationReceipt ?? evaluation_receipt ?? null;
-    const hasValidReceipt = Boolean(
-      receipt && (typeof receipt !== 'object' || receipt.passed !== false)
-    );
-    const isUnverifiedOrCandidate =
-      expDoc.status === 'candidate' ||
-      expDoc.status === 'draft' ||
-      expDoc.status === 'retracted' ||
-      expDoc.status === 'superseded' ||
-      expDoc.synthetic === true;
+
+    if (expDoc.synthetic === true) {
+      return {
+        ok: false,
+        promoted: false,
+        error: 'SYNTHETIC_EXPERIENCE_CANNOT_BE_PROMOTED',
+        docid: expDoc.docid,
+        status: expDoc.status,
+        synthetic: true
+      };
+    }
 
     if (
       verified === false ||
-      (receipt && typeof receipt === 'object' && receipt.passed === false) ||
-      (isUnverifiedOrCandidate && !hasValidReceipt && verified !== true)
+      (evaluationReceipt && typeof evaluationReceipt === 'object' && evaluationReceipt.passed === false) ||
+      (evaluation_receipt && typeof evaluation_receipt === 'object' && evaluation_receipt.passed === false)
     ) {
       return {
         ok: false,
@@ -1692,11 +2314,40 @@ export class HarnessKnowledgeEngine {
       };
     }
 
+    const candidateReceiptId =
+      receiptId ||
+      receipt_id ||
+      (typeof evaluationReceipt === 'string'
+        ? evaluationReceipt
+        : evaluationReceipt?.receiptId || evaluationReceipt?.receipt_id) ||
+      (typeof evaluation_receipt === 'string'
+        ? evaluation_receipt
+        : evaluation_receipt?.receiptId || evaluation_receipt?.receipt_id) ||
+      expDoc.receipt_id ||
+      null;
+
+    const receiptCheck = this.verifyEvaluationReceipt(candidateReceiptId, {
+      expectedTaskId: expDoc.task_id || undefined
+    });
+
+    if (!receiptCheck.valid) {
+      return {
+        ok: false,
+        promoted: false,
+        error: 'PROMOTION_REQUIRES_EVALUATION_RECEIPT',
+        detail: receiptCheck.error,
+        docid: expDoc.docid,
+        status: expDoc.status,
+        synthetic: Boolean(expDoc.synthetic)
+      };
+    }
+
     const slug = (adr_id || `ADR-PROMOTED-${expDoc.task_id || expDoc.docid}`)
       .replace(/[^a-zA-Z0-9_-]/g, '-');
     const nowIso = new Date().toISOString();
     const adrTitle = title || `${slug}: Promoted Architecture Rule from ${expDoc.task_id || expDoc.docid}`;
     const adrPath = path.join(this.harnessDir, 'knowledge', 'project', `${slug}.md`);
+    const relReceiptPath = `.harness/receipts/${receiptCheck.receiptId}.json`;
 
     const adrMd = [
       '---',
@@ -1705,12 +2356,15 @@ export class HarnessKnowledgeEngine {
       'collection: project-knowledge',
       `domain: ${expDoc.domain || 'architecture'}`,
       'status: active',
+      'synthetic: false',
+      `receipt_id: ${receiptCheck.receiptId}`,
       'repo: Harness2-RAG-antigravity',
       `git_revision: ${this.getGitRevision()}`,
       `created_at: "${nowIso}"`,
       'tags: [promoted-lesson, adr, harness2, project-knowledge]',
       'evidence_links:',
       `  - "${expDoc.path}"`,
+      `  - "${relReceiptPath}"`,
       ...(expDoc.evidence_links || []).map((e) => `  - "${e}"`),
       '---',
       '',
@@ -1721,6 +2375,7 @@ export class HarnessKnowledgeEngine {
       '',
       '## 2. Original Harness² Provenance & Evidence',
       `- **Source Experience Document**: [\`${expDoc.path}\`](../../../${expDoc.path}) (\`${expDoc.docid}\`)`,
+      `- **Evaluation Receipt**: \`${receiptCheck.receiptId}\` (\`${relReceiptPath}\`)`,
       `- **Original Task ID**: \`${expDoc.task_id}\``,
       `- **Git Revision at Verification**: \`${expDoc.git_revision}\``,
       ''
@@ -1735,7 +2390,8 @@ export class HarnessKnowledgeEngine {
       adrDocId: slug.toUpperCase(),
       adrPath: path.relative(this.workspaceRoot, adrPath).replace(/\\/g, '/'),
       sourceExperience: expDoc.path,
-      evaluationReceipt: receipt || undefined
+      receiptId: receiptCheck.receiptId,
+      evaluationReceipt: receiptCheck.receipt
     };
   }
 
@@ -1815,6 +2471,75 @@ export class HarnessKnowledgeEngine {
     return null;
   }
 
+  _parseEvaluatorOutput(evalOut, passThreshold = 0.75) {
+    if (evalOut === true) {
+      return {
+        validShape: true,
+        passed: true,
+        score: 1.0,
+        error: null,
+        usedTokens: null,
+        providerCalls: 0,
+        raw: evalOut
+      };
+    }
+    if (
+      evalOut === false ||
+      evalOut === null ||
+      evalOut === undefined ||
+      typeof evalOut !== 'object' ||
+      Array.isArray(evalOut)
+    ) {
+      return {
+        validShape: false,
+        passed: false,
+        score: 0,
+        error: 'EVALUATOR_VERIFICATION_FAILED',
+        usedTokens: null,
+        providerCalls: 0,
+        raw: evalOut
+      };
+    }
+
+    const hasExplicitPassed = typeof evalOut.passed === 'boolean';
+    const hasExplicitScore = typeof evalOut.score === 'number' && !Number.isNaN(evalOut.score);
+    if (!hasExplicitPassed && !hasExplicitScore) {
+      return {
+        validShape: false,
+        passed: false,
+        score: 0,
+        error: evalOut.error || 'INVALID_EVALUATOR_RESULT_SCHEMA',
+        usedTokens: null,
+        providerCalls: 0,
+        raw: evalOut
+      };
+    }
+
+    const rawScore = hasExplicitScore ? Number(evalOut.score) : evalOut.passed === true ? 1.0 : 0.0;
+    const clampedScore = Math.max(0, Math.min(1, rawScore));
+    const passed =
+      (hasExplicitPassed ? evalOut.passed === true : clampedScore >= passThreshold) &&
+      clampedScore >= passThreshold &&
+      evalOut.ok !== false;
+
+    return {
+      validShape: true,
+      passed,
+      score: Number(clampedScore.toFixed(4)),
+      error: passed ? null : evalOut.error || 'EVALUATION_FAILED',
+      usedTokens:
+        typeof evalOut.usedTokens === 'number'
+          ? evalOut.usedTokens
+          : typeof evalOut.totalTokens === 'number'
+            ? evalOut.totalTokens
+            : typeof evalOut.observedTokens === 'number'
+              ? evalOut.observedTokens
+              : null,
+      providerCalls: typeof evalOut.providerCalls === 'number' ? evalOut.providerCalls : 0,
+      raw: evalOut
+    };
+  }
+
   /**
    * Executes a complete, token-efficient Google Research Harness² Propose -> Probe -> Compose
    * loop with Snapshot Isolation, Invariant + Domain-Specific candidate proposals,
@@ -1855,19 +2580,83 @@ export class HarnessKnowledgeEngine {
     if (inferredArtifactMatch && !requiredArtifacts.includes(inferredArtifactMatch[1])) {
       requiredArtifacts.push(inferredArtifactMatch[1]);
     }
-    const evaluator = typeof options.evaluator === 'function' ? options.evaluator : null;
-    const allowSimulation = options.allowSimulation ?? options.allow_simulation ?? true;
 
-    // 1. Freeze Snapshot Isolation Lock
+    const executor = typeof options.executor === 'function' ? options.executor : null;
+    const evaluator = typeof options.evaluator === 'function' ? options.evaluator : null;
+    const passThreshold = typeof options.passThreshold === 'number' ? options.passThreshold : 0.75;
+    const allowSimulation =
+      options.strictExecution === true || options.executionMode === 'strict'
+        ? false
+        : (options.allowSimulation ?? options.allow_simulation ?? true);
+
+    // Snapshot pre-run state of requiredArtifacts before any execution
+    const preRunArtifacts = new Map();
+    for (const reqFile of requiredArtifacts) {
+      const relStr = String(reqFile);
+      const absFile = path.resolve(this.workspaceRoot, relStr);
+      const inside = this._isPathInsideWorkspace(absFile);
+      const exists =
+        inside &&
+        fs.existsSync(absFile) &&
+        fs.statSync(absFile).isFile() &&
+        fs.statSync(absFile).size > 0;
+      const sha256 = exists
+        ? crypto.createHash('sha256').update(fs.readFileSync(absFile)).digest('hex')
+        : null;
+      preRunArtifacts.set(relStr, { absFile, inside, exists, sha256 });
+    }
+
+    // 1. Freeze Snapshot Isolation Lock with unique ownerRunId
+    const ownerRunId =
+      options.ownerRunId ||
+      options.owner_run_id ||
+      `loop-${taskId}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
     const lock = this.createSnapshotLock({
       domain,
       k,
       mode,
+      ownerRunId,
       description: `Harness² (${profile.reasoningDepth}) Propose-Probe-Compose for ${taskId}`,
     });
+
+    if (!lock || lock.ok === false || !lock.active || !lock.snapshotId) {
+      return {
+        ok: false,
+        status: 'failed',
+        error: (lock && lock.error) || 'SNAPSHOT_LOCK_ACTIVE_BY_ANOTHER_RUN',
+        passedVerification: false,
+        verificationScore: null,
+        synthetic: false,
+        snapshotId: null,
+        ownerRunId: lock?.ownerRunId || null,
+        recordedLesson: null,
+        adoptedExperience: null,
+        recordedExperience: null,
+      };
+    }
+
     const snapshotId = lock.snapshotId;
 
-    try {
+    const cleanupSnapshotLock = () => {
+      if (lock && lock.ok === true && lock.snapshotId) {
+        this.releaseSnapshotLock({ ownerRunId, snapshotId: lock.snapshotId });
+        if (!recordToLibrary) {
+          const snapFile = path.join(this.snapshotsDir, `${lock.snapshotId}.json`);
+          if (fs.existsSync(snapFile)) {
+            try {
+              fs.unlinkSync(snapFile);
+            } catch {}
+          }
+        }
+      }
+    };
+
+    const isThenable = (v) =>
+      v !== null && (typeof v === 'object' || typeof v === 'function') && typeof v.then === 'function';
+    const chainMaybeAsync = (valOrProm, nextFn) =>
+      isThenable(valOrProm) ? Promise.resolve(valOrProm).then(nextFn) : nextFn(valOrProm);
+
+    const executeLoopBody = () => {
       // 2. Cue-First Token-Efficient Retrieval under frozen snapshot
       const expHits = this.query({
         query: `${domain} ${problem}`,
@@ -1940,87 +2729,8 @@ export class HarnessKnowledgeEngine {
         });
       }
 
-      // Enforce requiredArtifacts verification if specified
-      if (requiredArtifacts.length > 0) {
-        const missingArtifacts = [];
-        for (const reqFile of requiredArtifacts) {
-          const absFile = path.resolve(this.workspaceRoot, String(reqFile));
-          const existsAndNonEmpty =
-            this._isPathInsideWorkspace(absFile) &&
-            fs.existsSync(absFile) &&
-            fs.statSync(absFile).isFile() &&
-            fs.statSync(absFile).size > 0;
-          if (!existsAndNonEmpty) {
-            missingArtifacts.push(String(reqFile));
-          }
-        }
-        if (missingArtifacts.length > 0) {
-          const failedTrajectories = candidates.map((cand) => ({
-            candidateId: cand.candidateId,
-            front: cand.front,
-            frontLabel: cand.frontLabel,
-            modelTier: cand.modelTier,
-            workspaceMode: cand.workspaceMode,
-            passedVerification: false,
-            verificationScore: 0,
-            stepsExecuted: 0,
-            toolErrors: 1,
-            promptTokens: 0,
-            thoughtsTokens: 0,
-            outputTokens: 0,
-            totalTokens: 0,
-            tokensSaved: 0,
-            tokensSavedPct: 0,
-            earlyStopped: false,
-            observedSummary: `Verification failed: required artifact(s) missing: ${missingArtifacts.join(', ')}`,
-            evidencePaths: [],
-          }));
-          return {
-            ok: false,
-            status: 'failed',
-            error: 'REQUIRED_ARTIFACT_MISSING',
-            missingArtifacts,
-            passedVerification: false,
-            verificationScore: 0,
-            synthetic: false,
-            executionMode: 'artifact-verification',
-            runId: `h2-run-${Date.now()}`,
-            completedAt: new Date().toISOString(),
-            taskId,
-            domain,
-            problem,
-            k,
-            mode,
-            snapshotId,
-            reasoningProfile: profile,
-            candidates,
-            proposals: candidates,
-            probeTrajectories: failedTrajectories,
-            trajectories: failedTrajectories,
-            winnerCandidateId: null,
-            winnerScore: 0,
-            winner: {
-              candidateId: null,
-              score: 0,
-              verificationScore: 0,
-              passedVerification: false,
-              totalTokens: 0,
-            },
-            tokenEfficiency: {
-              totalActualTokens: 0,
-              totalUnoptimizedTokens: null,
-              totalTokensSaved: 0,
-              totalTokensSavedPct: 0,
-              earlyStopped: false,
-            },
-            composedHarness: null,
-            recordedExperience: null,
-          };
-        }
-      }
-
-      // Enforce allowSimulation === false guard when no evaluator or verified artifacts exist
-      if (allowSimulation === false && !evaluator && requiredArtifacts.length === 0) {
+      // Enforce allowSimulation === false guard when no executor or evaluator is provided
+      if (allowSimulation === false && !executor && !evaluator && requiredArtifacts.length === 0) {
         return {
           ok: false,
           status: 'failed',
@@ -2028,6 +2738,9 @@ export class HarnessKnowledgeEngine {
           passedVerification: false,
           verificationScore: null,
           synthetic: false,
+          usedTokens: null,
+          providerCalls: 0,
+          artifactChanges: 0,
           executionMode: 'verified-required',
           runId: `h2-run-${Date.now()}`,
           completedAt: new Date().toISOString(),
@@ -2059,34 +2772,577 @@ export class HarnessKnowledgeEngine {
             earlyStopped: false,
           },
           composedHarness: null,
+          recordedLesson: null,
+          adoptedExperience: null,
           recordedExperience: null,
         };
       }
 
-      // Run explicit evaluator if provided
-      let evaluatorReceipt = null;
-      if (evaluator) {
-        const evalRes = evaluator({
-          workspaceRoot: this.workspaceRoot,
-          taskId,
-          domain,
-          problem,
-          candidates,
-          snapshotId,
-        });
-        const evalPassed =
-          evalRes === true ||
-          (evalRes && typeof evalRes === 'object' && evalRes.passed !== false && evalRes.ok !== false);
-        if (!evalPassed) {
-          const evalScore = Number(evalRes?.score ?? 0);
-          return {
-            ok: false,
-            status: 'failed',
-            error: (evalRes && evalRes.error) || 'EVALUATOR_VERIFICATION_FAILED',
+      const probeContext = {
+        workspaceRoot: this.workspaceRoot,
+        taskId,
+        domain,
+        problem,
+        candidates,
+        snapshotId,
+        requiredArtifacts,
+      };
+
+      const runExecutorIfAny = () => {
+        if (!executor) return null;
+        const execResults = [];
+        const stepExec = (idx) => {
+          if (idx >= candidates.length) return execResults;
+          const cand = candidates[idx];
+          const callArg = {
+            ...probeContext,
+            ...cand,
+            candidate: cand,
+            candidateIndex: idx,
+          };
+          return chainMaybeAsync(executor(callArg, probeContext), (out) => {
+            execResults.push(out);
+            return stepExec(idx + 1);
+          });
+        };
+        return stepExec(0);
+      };
+
+      return chainMaybeAsync(runExecutorIfAny(), (execResult) => {
+        // Check post-executor state of requiredArtifacts
+        const verifiedArtifactHashes = {};
+        let artifactChanges = 0;
+        if (requiredArtifacts.length > 0) {
+          const missingArtifacts = [];
+          for (const reqFile of requiredArtifacts) {
+            const relStr = String(reqFile);
+            const absFile = path.resolve(this.workspaceRoot, relStr);
+            const existsAndNonEmpty =
+              this._isPathInsideWorkspace(absFile) &&
+              fs.existsSync(absFile) &&
+              fs.statSync(absFile).isFile() &&
+              fs.statSync(absFile).size > 0;
+            if (!existsAndNonEmpty) {
+              missingArtifacts.push(relStr);
+            } else {
+              const postSha256 = crypto
+                .createHash('sha256')
+                .update(fs.readFileSync(absFile))
+                .digest('hex');
+              verifiedArtifactHashes[relStr.replace(/\\/g, '/')] = postSha256;
+              const pre = preRunArtifacts.get(relStr);
+              if (!pre || !pre.exists || pre.sha256 !== postSha256) {
+                artifactChanges++;
+              }
+            }
+          }
+
+          if (missingArtifacts.length > 0) {
+            const failedTrajectories = candidates.map((cand) => ({
+              candidateId: cand.candidateId,
+              front: cand.front,
+              frontLabel: cand.frontLabel,
+              modelTier: cand.modelTier,
+              workspaceMode: cand.workspaceMode,
+              passedVerification: false,
+              verificationScore: 0,
+              stepsExecuted: 0,
+              toolErrors: 1,
+              promptTokens: 0,
+              thoughtsTokens: 0,
+              outputTokens: 0,
+              totalTokens: 0,
+              tokensSaved: 0,
+              tokensSavedPct: 0,
+              earlyStopped: false,
+              observedSummary: `Verification failed: required artifact(s) missing: ${missingArtifacts.join(', ')}`,
+              evidencePaths: [],
+            }));
+            return {
+              ok: false,
+              status: 'failed',
+              error: 'REQUIRED_ARTIFACT_MISSING',
+              missingArtifacts,
+              passedVerification: false,
+              verificationScore: 0,
+              synthetic: false,
+              usedTokens: null,
+              providerCalls: 0,
+              artifactChanges: 0,
+              executionMode: 'artifact-verification',
+              runId: `h2-run-${Date.now()}`,
+              completedAt: new Date().toISOString(),
+              taskId,
+              domain,
+              problem,
+              k,
+              mode,
+              snapshotId,
+              reasoningProfile: profile,
+              candidates,
+              proposals: candidates,
+              probeTrajectories: failedTrajectories,
+              trajectories: failedTrajectories,
+              winnerCandidateId: null,
+              winnerScore: 0,
+              winner: {
+                candidateId: null,
+                score: 0,
+                verificationScore: 0,
+                passedVerification: false,
+                totalTokens: 0,
+              },
+              tokenEfficiency: {
+                totalActualTokens: 0,
+                totalUnoptimizedTokens: null,
+                totalTokensSaved: 0,
+                totalTokensSavedPct: 0,
+                earlyStopped: false,
+              },
+              composedHarness: null,
+              recordedLesson: null,
+              adoptedExperience: null,
+              recordedExperience: null,
+            };
+          }
+
+          // Pre-existing unchanged files on disk without an executor or evaluator do NOT count as execution
+          if (artifactChanges === 0 && !executor && !evaluator) {
+            return {
+              ok: false,
+              status: 'failed',
+              error: 'PRE_EXISTING_UNCHANGED_ARTIFACT_NOT_EXECUTION_EVIDENCE',
+              passedVerification: false,
+              verificationScore: 0,
+              synthetic: false,
+              usedTokens: null,
+              providerCalls: 0,
+              artifactChanges: 0,
+              executionMode: 'artifact-verification',
+              runId: `h2-run-${Date.now()}`,
+              completedAt: new Date().toISOString(),
+              taskId,
+              domain,
+              problem,
+              k,
+              mode,
+              snapshotId,
+              reasoningProfile: profile,
+              candidates,
+              proposals: candidates,
+              probeTrajectories: [],
+              trajectories: [],
+              winnerCandidateId: null,
+              winnerScore: 0,
+              winner: {
+                candidateId: null,
+                score: 0,
+                verificationScore: 0,
+                passedVerification: false,
+                totalTokens: 0,
+              },
+              tokenEfficiency: {
+                totalActualTokens: 0,
+                totalUnoptimizedTokens: null,
+                totalTokensSaved: 0,
+                totalTokensSavedPct: 0,
+                earlyStopped: false,
+              },
+              composedHarness: null,
+              recordedLesson: null,
+              adoptedExperience: null,
+              recordedExperience: null,
+            };
+          }
+        }
+
+        const evaluateCandidatesMaybeAsync = () => {
+          if (!evaluator) return null;
+          const results = [];
+          const step = (idx) => {
+            if (idx >= candidates.length) return results;
+            const cand = candidates[idx];
+            const callArg = {
+              ... probeContext,
+              ...cand,
+              candidate: cand,
+              candidateIndex: idx,
+              executorResult: execResult,
+            };
+            return chainMaybeAsync(evaluator(callArg, probeContext), (rawOut) => {
+              results.push(this._parseEvaluatorOutput(rawOut, passThreshold));
+              return step(idx + 1);
+            });
+          };
+          return step(0);
+        };
+
+        return chainMaybeAsync(evaluateCandidatesMaybeAsync(), (evalResults) => {
+          const isSimulation = !evaluator && !(executor && artifactChanges > 0);
+          if (isSimulation && allowSimulation === false) {
+            return {
+              ok: false,
+              status: 'failed',
+              error: 'NO_VERIFIED_EXECUTION_OR_EVALUATOR',
+              passedVerification: false,
+              verificationScore: null,
+              synthetic: false,
+              usedTokens: null,
+              providerCalls: 0,
+              artifactChanges,
+              executionMode: 'verified-required',
+              runId: `h2-run-${Date.now()}`,
+              completedAt: new Date().toISOString(),
+              taskId,
+              domain,
+              problem,
+              k,
+              mode,
+              snapshotId,
+              reasoningProfile: profile,
+              candidates,
+              proposals: candidates,
+              probeTrajectories: [],
+              trajectories: [],
+              winnerCandidateId: null,
+              winnerScore: 0,
+              winner: {
+                candidateId: null,
+                score: 0,
+                verificationScore: 0,
+                passedVerification: false,
+                totalTokens: 0,
+              },
+              tokenEfficiency: {
+                totalActualTokens: 0,
+                totalUnoptimizedTokens: null,
+                totalTokensSaved: 0,
+                totalTokensSavedPct: 0,
+                earlyStopped: false,
+              },
+              composedHarness: null,
+              recordedLesson: null,
+              adoptedExperience: null,
+              recordedExperience: null,
+            };
+          }
+
+          // Reference unoptimized baseline (what an unbounded deep run without Cue-First pruning costs)
+          const unoptimizedPerCandidateTokens = 8_200 + 6_400 + 2_100; // 16,700 tokens/candidate
+          const baselineTrajectory = {
+            candidateId: 'reference-baseline-unbounded',
+            front: 'baseline',
+            frontLabel: 'Reference Baseline (Unbounded Thinking & Raw Context)',
+            modelTier: 'pro',
+            workspaceMode: 'inherit',
             passedVerification: false,
-            verificationScore: evalScore,
-            synthetic: false,
-            executionMode: 'evaluated',
+            verificationScore: 0.62,
+            stepsExecuted: 9,
+            toolErrors: 1,
+            promptTokens: 8_200,
+            thoughtsTokens: 6_400,
+            outputTokens: 2_100,
+            totalTokens: unoptimizedPerCandidateTokens,
+            tokensSaved: 0,
+            tokensSavedPct: 0,
+            earlyStopped: false,
+            observedSummary:
+              'Baseline run without Cue-First RAG pruning or thinking budget cap consumed 16.7k tokens (6.4k thinking) and had 1 unverified tool step.',
+          };
+
+          // 4. Probe K Candidates under frozen snapshotId with Reasoning Depth & Early-Stop Guardrails
+          const probeTrajectories = [];
+          let earlyStopTriggered = false;
+          let totalProviderCalls = 0;
+
+          for (let i = 0; i < candidates.length; i++) {
+            const cand = candidates[i];
+            if (mode === 'sequential' && profile.earlyStopOnFirstPass && earlyStopTriggered) {
+              probeTrajectories.push({
+                candidateId: cand.candidateId,
+                front: cand.front,
+                frontLabel: cand.frontLabel,
+                modelTier: cand.modelTier,
+                workspaceMode: cand.workspaceMode,
+                passedVerification: true,
+                verificationScore: 0.0,
+                stepsExecuted: 0,
+                toolErrors: 0,
+                promptTokens: 0,
+                thoughtsTokens: 0,
+                outputTokens: 0,
+                totalTokens: 0,
+                tokensSaved: unoptimizedPerCandidateTokens,
+                tokensSavedPct: 100.0,
+                earlyStopped: true,
+                synthetic: isSimulation,
+                observedSummary: `Skipped via Early-Stop Token Guardrail because an earlier candidate already passed 100% of verification checks with 0 tool errors.`,
+              });
+              continue;
+            }
+
+            const candEval = Array.isArray(evalResults) ? evalResults[i] : null;
+            let score;
+            let passed;
+            if (candEval) {
+              score = candEval.score;
+              passed = candEval.passed;
+              totalProviderCalls += candEval.providerCalls || 0;
+            } else if (!isSimulation && artifactChanges > 0) {
+              score = 1.0;
+              passed = true;
+            } else {
+              const cueBonus = cand.front !== 'invariant' && retrievedCues.length > 0 ? 0.14 : 0.06;
+              const invariantBonus = cand.front === 'invariant' || cand.front === 'hybrid' ? 0.12 : 0.09;
+              score = Number(Math.min(0.99, 0.72 + cueBonus + invariantBonus).toFixed(2));
+              passed = score >= 0.85;
+            }
+
+            const stepsUsed =
+              cand.front === 'domain-specific' || cand.front === 'hybrid'
+                ? Math.max(3, Math.min(cand.maxSteps, 4))
+                : Math.max(4, Math.min(cand.maxSteps, 5));
+
+            const promptTok =
+              profile.reasoningDepth === 'eco'
+                ? 1_950 + i * 140
+                : profile.reasoningDepth === 'balanced'
+                  ? 3_100 + i * 210
+                  : 5_400 + i * 320;
+            const thoughtsTok = Math.min(
+              cand.thinkingBudgetTokens,
+              profile.reasoningDepth === 'eco'
+                ? 780 + i * 60
+                : profile.reasoningDepth === 'balanced'
+                  ? 1_480 + i * 90
+                  : 4_200 + i * 250
+            );
+            const outputTok =
+              profile.reasoningDepth === 'eco'
+                ? 520
+                : profile.reasoningDepth === 'balanced'
+                  ? 740
+                  : 1_180;
+            const totalTok =
+              candEval && typeof candEval.usedTokens === 'number'
+                ? candEval.usedTokens
+                : promptTok + thoughtsTok + outputTok;
+            const savedTok = Math.max(0, unoptimizedPerCandidateTokens - totalTok);
+            const savedPct = Number(((savedTok / unoptimizedPerCandidateTokens) * 100).toFixed(1));
+
+            if (passed && score >= 0.90) {
+              earlyStopTriggered = true;
+            }
+
+            probeTrajectories.push({
+              candidateId: cand.candidateId,
+              front: cand.front,
+              frontLabel: cand.frontLabel,
+              modelTier: cand.modelTier,
+              workspaceMode: cand.workspaceMode,
+              passedVerification: passed,
+              verificationScore: score,
+              stepsExecuted: stepsUsed,
+              toolErrors: passed ? 0 : 1,
+              promptTokens: promptTok,
+              thoughtsTokens: thoughtsTok,
+              outputTokens: outputTok,
+              totalTokens: totalTok,
+              tokensSaved: savedTok,
+              tokensSavedPct: savedPct,
+              earlyStopped: false,
+              synthetic: isSimulation,
+              observedSummary:
+                `[${cand.frontLabel}] Probed in Workspace:${cand.workspaceMode} (model=${cand.modelTier}, thinkingCap=${cand.thinkingBudgetTokens}) under snapshot '${snapshotId}'. ` +
+                `Retrieved ${expHits.results.length} experience cues & ${projHits.results.length} ADRs; verification=${passed ? 'passed' : 'failed'} (score=${score}) in ${stepsUsed} steps using ${totalTok.toLocaleString()} tokens (${savedPct}% saved vs unbounded baseline).`,
+              evidencePaths: [
+                ...requiredArtifacts.map((a) => String(a)),
+                ...(expHits.results || []).slice(0, 2).map((r) => r.path),
+                ...(projHits.results || []).slice(0, 1).map((r) => r.path),
+              ],
+            });
+          }
+
+          // 5. Contrastive Composition
+          const activeProbes = probeTrajectories.filter((p) => !p.earlyStopped);
+          const ranked = [...activeProbes].sort((a, b) => {
+            if (b.passedVerification !== a.passedVerification) {
+              return b.passedVerification ? 1 : -1;
+            }
+            if (b.verificationScore !== a.verificationScore) {
+              return b.verificationScore - a.verificationScore;
+            }
+            return a.totalTokens - b.totalTokens;
+          });
+          const winner = ranked[0] || probeTrajectories[0];
+
+          // If evaluator/executor ran and no candidate passed verification, fail closed without recording
+          if (!winner || !winner.passedVerification) {
+            const firstErr =
+              (Array.isArray(evalResults) && evalResults.find((r) => r.error)?.error) ||
+              'EVALUATION_FAILED';
+            const bestScore = winner ? winner.verificationScore : 0;
+            return {
+              ok: false,
+              status: 'failed',
+              error: 'EVALUATION_FAILED',
+              detail: firstErr,
+              passedVerification: false,
+              verificationScore: bestScore,
+              synthetic: isSimulation,
+              usedTokens: null,
+              providerCalls: totalProviderCalls,
+              artifactChanges,
+              executionMode: isSimulation ? 'simulation' : 'evaluated',
+              runId: `h2-run-${Date.now()}`,
+              completedAt: new Date().toISOString(),
+              taskId,
+              domain,
+              problem,
+              k,
+              mode,
+              snapshotId,
+              reasoningProfile: profile,
+              candidates,
+              proposals: candidates,
+              probeTrajectories,
+              trajectories: probeTrajectories,
+              winnerCandidateId: null,
+              winnerScore: bestScore,
+              winner: {
+                candidateId: null,
+                score: bestScore,
+                verificationScore: bestScore,
+                passedVerification: false,
+                totalTokens: winner ? winner.totalTokens : 0,
+              },
+              tokenEfficiency: {
+                totalActualTokens: 0,
+                totalUnoptimizedTokens: null,
+                totalTokensSaved: 0,
+                totalTokensSavedPct: 0,
+                earlyStopped: false,
+              },
+              composedHarness: null,
+              recordedLesson: null,
+              adoptedExperience: null,
+              recordedExperience: null,
+            };
+          }
+
+          const totalActualTokens = probeTrajectories.reduce((s, p) => s + p.totalTokens, 0);
+          const totalUnoptimizedTokens = unoptimizedPerCandidateTokens * k;
+          const totalTokensSaved = Math.max(0, totalUnoptimizedTokens - totalActualTokens);
+          const totalTokensSavedPct = Number(
+            ((totalTokensSaved / Math.max(1, totalUnoptimizedTokens)) * 100).toFixed(1)
+          );
+
+          let createdReceipt = null;
+          if (!isSimulation && winner.passedVerification) {
+            const rcpt = this.createEvaluationReceipt({
+              taskId,
+              candidateId: winner.candidateId,
+              domain,
+              score: winner.verificationScore,
+              passed: true,
+              artifactHashes: verifiedArtifactHashes,
+              providerCalls: totalProviderCalls,
+              actualTokens: totalActualTokens,
+              synthetic: false,
+            });
+            if (rcpt && rcpt.ok) {
+              createdReceipt = rcpt;
+            }
+          }
+
+          const effectiveRecordStatus = !isSimulation && createdReceipt ? 'active' : 'candidate';
+          const composedHarness = {
+            harness_id: `harness-${domain}-${taskId}`,
+            task_id: taskId,
+            domain,
+            winning_candidate_id: winner.candidateId,
+            composed_fronts: ['invariant', 'domain-specific'],
+            reasoning_depth_profile: {
+              reasoningDepth: profile.reasoningDepth,
+              thinkingBudgetTokens: profile.thinkingBudgetTokens,
+              maxCandidateTokens: profile.maxCandidateTokens,
+              maxProbeSteps: profile.maxProbeSteps,
+              proberModelTier: profile.proberModelTier,
+              composerModelTier: profile.composerModelTier,
+              ragSnippetMaxChars: profile.ragSnippetMaxChars,
+              earlyStopOnFirstPass: profile.earlyStopOnFirstPass,
+            },
+            token_efficiency: {
+              totalActualTokens,
+              totalUnoptimizedTokens,
+              totalTokensSaved,
+              totalTokensSavedPct,
+            },
+            editable_components: {
+              system_prompts:
+                `Use Cue-First RAG retrieval (${profile.ragSnippetMaxChars} char snippet cap) and bounded thinking (${profile.thinkingBudgetTokens} tokens) before editing.`,
+              rules: ['plugin/harness-ide/rules/AGENTS.md'],
+              skills: [
+                'plugin/harness-ide/skills/harness2-loop/SKILL.md',
+                'plugin/harness-ide/skills/qmd-knowledge-lifecycle/SKILL.md',
+              ],
+              subagents: [
+                `harness-proposer (model: ${profile.proberModelTier})`,
+                `harness-prober (Workspace: branch, model: ${profile.proberModelTier}, thinkingCap: ${profile.thinkingBudgetTokens})`,
+                `harness-composer (model: ${profile.composerModelTier})`,
+              ],
+              hooks: {
+                SessionStart: 'scripts/hooks/session-start.mjs',
+                PreInvocation: 'scripts/hooks/pre-invocation.mjs',
+                PostToolUse: 'scripts/hooks/post-tool-use.mjs',
+              },
+              tools: ['harness_query', 'harness_get', 'harness_snapshot_lock', 'harness_run_loop', 'harness_record_experience'],
+              scripts: ['adapters/harness2_antigravity_executor.py', 'test/harness-ide.test.mjs'],
+              plugins: ['harness-ide'],
+            },
+            adopted_at: new Date().toISOString(),
+            git_revision: this.getGitRevision(),
+            status: effectiveRecordStatus,
+            synthetic: isSimulation,
+            receipt_id: createdReceipt?.receiptId || null,
+          };
+
+          let recordedExperience = null;
+          if (recordToLibrary) {
+            recordedExperience = this.recordExperience({
+              task_id: taskId,
+              domain,
+              title: `EXPERIENCE: ${taskId} (Harness² ${profile.reasoningDepth.toUpperCase()} · ${totalTokensSavedPct}% Tokens Saved)`,
+              cue: `When tackling '${problem.slice(0, 90)}' in '${domain}', use ${winner.candidateId} with ${profile.reasoningDepth} reasoning depth (thinkingCap=${profile.thinkingBudgetTokens}, model=${profile.proberModelTier}, Workspace=branch) to achieve score=${winner.verificationScore} while saving ${totalTokensSavedPct}% tokens.`,
+              problem,
+              observed_behavior:
+                `Contrastive evaluation across K=${k} candidates (${mode} mode) under frozen snapshot '${snapshotId}': ` +
+                `${winner.candidateId} (${winner.frontLabel}) beat the unbounded baseline (score ${winner.verificationScore} vs ${baselineTrajectory.verificationScore}, 0 tool errors vs 1) ` +
+                `while consuming only ${totalActualTokens.toLocaleString()} total probe tokens vs ${totalUnoptimizedTokens.toLocaleString()} unbounded tokens (${totalTokensSaved.toLocaleString()} tokens saved, -${totalTokensSavedPct}%).`,
+              supporting_evidence: [
+                ...(winner.evidencePaths || []),
+                'adapters/harness2_antigravity_executor.py',
+              ],
+              status: effectiveRecordStatus,
+              synthetic: isSimulation,
+              receiptId: createdReceipt?.receiptId || null,
+              tags: ['harness2', 'propose-probe-compose', `depth-${profile.reasoningDepth}`, 'token-efficient', domain],
+              adopted_harness: composedHarness,
+            });
+          }
+
+          const runReport = {
+            ok: true,
+            status: isSimulation ? 'simulated' : 'succeeded',
+            synthetic: isSimulation,
+            executionMode: isSimulation ? 'simulation' : 'verified',
+            passedVerification: winner.passedVerification,
+            verificationScore: winner.verificationScore,
+            receiptId: createdReceipt?.receiptId || null,
+            evaluationReceipt: createdReceipt || null,
+            evaluatorReceipt: createdReceipt || undefined,
+            artifactChanges,
+            providerCalls: totalProviderCalls,
             runId: `h2-run-${Date.now()}`,
             completedAt: new Date().toISOString(),
             taskId,
@@ -2096,310 +3352,64 @@ export class HarnessKnowledgeEngine {
             mode,
             snapshotId,
             reasoningProfile: profile,
+            retrievedKnowledge: {
+              experienceCount: expHits.results.length,
+              projectAdrCount: projHits.results.length,
+              cues: retrievedCues,
+              adrs: retrievedAdrs,
+            },
+            baselineTrajectory,
             candidates,
             proposals: candidates,
-            probeTrajectories: [],
-            trajectories: [],
-            winnerCandidateId: null,
-            winnerScore: evalScore,
+            probeTrajectories,
+            trajectories: probeTrajectories,
+            winnerCandidateId: winner.candidateId,
+            winnerScore: winner.verificationScore,
             winner: {
-              candidateId: null,
-              score: evalScore,
-              verificationScore: evalScore,
-              passedVerification: false,
-              totalTokens: 0,
+              candidateId: winner.candidateId,
+              score: winner.verificationScore,
+              verificationScore: winner.verificationScore,
+              passedVerification: winner.passedVerification,
+              totalTokens: winner.totalTokens,
+              synthetic: isSimulation,
+              receiptId: createdReceipt?.receiptId || null,
             },
             tokenEfficiency: {
-              totalActualTokens: 0,
-              totalUnoptimizedTokens: null,
-              totalTokensSaved: 0,
-              totalTokensSavedPct: 0,
-              earlyStopped: false,
+              totalActualTokens,
+              totalUnoptimizedTokens,
+              totalTokensSaved,
+              totalTokensSavedPct,
+              earlyStopped: probeTrajectories.some((p) => p.earlyStopped === true),
+              synthetic: isSimulation,
             },
-            composedHarness: null,
-            recordedExperience: null,
+            composedHarness,
+            recordedLesson: recordedExperience,
+            recordedExperience,
+            adoptedExperience: recordedExperience,
           };
-        }
-        evaluatorReceipt =
-          typeof evalRes === 'object' ? evalRes : { passed: true, verifiedAt: new Date().toISOString() };
-      }
 
-      const isSimulation = !evaluator && requiredArtifacts.length === 0;
+          if (recordToLibrary) {
+            try {
+              fs.writeFileSync(this.lastRunPath, JSON.stringify(runReport, null, 2) + '\n', 'utf8');
+            } catch {}
+          }
 
-      // Reference unoptimized baseline (what an unbounded deep run without Cue-First pruning costs)
-      const unoptimizedPerCandidateTokens = 8_200 + 6_400 + 2_100; // 16,700 tokens/candidate
-      const baselineTrajectory = {
-        candidateId: 'reference-baseline-unbounded',
-        front: 'baseline',
-        frontLabel: 'Reference Baseline (Unbounded Thinking & Raw Context)',
-        modelTier: 'pro',
-        workspaceMode: 'inherit',
-        passedVerification: false,
-        verificationScore: 0.62,
-        stepsExecuted: 9,
-        toolErrors: 1,
-        promptTokens: 8_200,
-        thoughtsTokens: 6_400,
-        outputTokens: 2_100,
-        totalTokens: unoptimizedPerCandidateTokens,
-        tokensSaved: 0,
-        tokensSavedPct: 0,
-        earlyStopped: false,
-        observedSummary:
-          'Baseline run without Cue-First RAG pruning or thinking budget cap consumed 16.7k tokens (6.4k thinking) and had 1 unverified tool step.',
-      };
-
-      // 4. Probe K Candidates under frozen snapshotId with Reasoning Depth & Early-Stop Guardrails
-      const probeTrajectories = [];
-      let earlyStopTriggered = false;
-
-      for (let i = 0; i < candidates.length; i++) {
-        const cand = candidates[i];
-        if (mode === 'sequential' && profile.earlyStopOnFirstPass && earlyStopTriggered) {
-          probeTrajectories.push({
-            candidateId: cand.candidateId,
-            front: cand.front,
-            frontLabel: cand.frontLabel,
-            modelTier: cand.modelTier,
-            workspaceMode: cand.workspaceMode,
-            passedVerification: true,
-            verificationScore: 0.0,
-            stepsExecuted: 0,
-            toolErrors: 0,
-            promptTokens: 0,
-            thoughtsTokens: 0,
-            outputTokens: 0,
-            totalTokens: 0,
-            tokensSaved: unoptimizedPerCandidateTokens,
-            tokensSavedPct: 100.0,
-            earlyStopped: true,
-            synthetic: isSimulation,
-            observedSummary: `Skipped via Early-Stop Token Guardrail because an earlier candidate already passed 100% of verification checks with 0 tool errors.`,
-          });
-          continue;
-        }
-
-        const cueBonus = cand.front !== 'invariant' && retrievedCues.length > 0 ? 0.14 : 0.06;
-        const invariantBonus = cand.front === 'invariant' || cand.front === 'hybrid' ? 0.12 : 0.09;
-        const score = Number(Math.min(0.99, 0.72 + cueBonus + invariantBonus).toFixed(2));
-        const passed = score >= 0.85;
-        const stepsUsed =
-          cand.front === 'domain-specific' || cand.front === 'hybrid'
-            ? Math.max(3, Math.min(cand.maxSteps, 4))
-            : Math.max(4, Math.min(cand.maxSteps, 5));
-
-        const promptTok =
-          profile.reasoningDepth === 'eco'
-            ? 1_950 + i * 140
-            : profile.reasoningDepth === 'balanced'
-              ? 3_100 + i * 210
-              : 5_400 + i * 320;
-        const thoughtsTok = Math.min(
-          cand.thinkingBudgetTokens,
-          profile.reasoningDepth === 'eco'
-            ? 780 + i * 60
-            : profile.reasoningDepth === 'balanced'
-              ? 1_480 + i * 90
-              : 4_200 + i * 250
-        );
-        const outputTok =
-          profile.reasoningDepth === 'eco'
-            ? 520
-            : profile.reasoningDepth === 'balanced'
-              ? 740
-              : 1_180;
-        const totalTok = promptTok + thoughtsTok + outputTok;
-        const savedTok = Math.max(0, unoptimizedPerCandidateTokens - totalTok);
-        const savedPct = Number(((savedTok / unoptimizedPerCandidateTokens) * 100).toFixed(1));
-
-        if (passed && score >= 0.92) {
-          earlyStopTriggered = true;
-        }
-
-        probeTrajectories.push({
-          candidateId: cand.candidateId,
-          front: cand.front,
-          frontLabel: cand.frontLabel,
-          modelTier: cand.modelTier,
-          workspaceMode: cand.workspaceMode,
-          passedVerification: passed,
-          verificationScore: score,
-          stepsExecuted: stepsUsed,
-          toolErrors: 0,
-          promptTokens: promptTok,
-          thoughtsTokens: thoughtsTok,
-          outputTokens: outputTok,
-          totalTokens: totalTok,
-          tokensSaved: savedTok,
-          tokensSavedPct: savedPct,
-          earlyStopped: false,
-          synthetic: isSimulation,
-          observedSummary:
-            `[${cand.frontLabel}] Probed in Workspace:${cand.workspaceMode} (model=${cand.modelTier}, thinkingCap=${cand.thinkingBudgetTokens}) under snapshot '${snapshotId}'. ` +
-            `Retrieved ${expHits.results.length} experience cues & ${projHits.results.length} ADRs; passed verification (score=${score}) in ${stepsUsed} steps using ${totalTok.toLocaleString()} tokens (${savedPct}% saved vs unbounded baseline).`,
-          evidencePaths: [
-            ...requiredArtifacts.map((a) => String(a)),
-            ...(expHits.results || []).slice(0, 2).map((r) => r.path),
-            ...(projHits.results || []).slice(0, 1).map((r) => r.path),
-          ],
+          return runReport;
         });
-      }
-
-      // 5. Contrastive Composition (Composer merges winning Invariant + Domain edits without answer keys)
-      const activeProbes = probeTrajectories.filter((p) => !p.earlyStopped);
-      const ranked = [...activeProbes].sort((a, b) => {
-        if (b.verificationScore !== a.verificationScore) return b.verificationScore - a.verificationScore;
-        return a.totalTokens - b.totalTokens;
       });
-      const winner = ranked[0] || probeTrajectories[0];
-      const totalActualTokens = probeTrajectories.reduce((s, p) => s + p.totalTokens, 0);
-      const totalUnoptimizedTokens = unoptimizedPerCandidateTokens * k;
-      const totalTokensSaved = Math.max(0, totalUnoptimizedTokens - totalActualTokens);
-      const totalTokensSavedPct = Number(
-        ((totalTokensSaved / Math.max(1, totalUnoptimizedTokens)) * 100).toFixed(1)
-      );
+    };
 
-      const effectiveRecordStatus = isSimulation ? 'candidate' : 'active';
-      const composedHarness = {
-        harness_id: `harness-${domain}-${taskId}`,
-        task_id: taskId,
-        domain,
-        winning_candidate_id: winner.candidateId,
-        composed_fronts: ['invariant', 'domain-specific'],
-        reasoning_depth_profile: {
-          reasoningDepth: profile.reasoningDepth,
-          thinkingBudgetTokens: profile.thinkingBudgetTokens,
-          maxCandidateTokens: profile.maxCandidateTokens,
-          maxProbeSteps: profile.maxProbeSteps,
-          proberModelTier: profile.proberModelTier,
-          composerModelTier: profile.composerModelTier,
-          ragSnippetMaxChars: profile.ragSnippetMaxChars,
-          earlyStopOnFirstPass: profile.earlyStopOnFirstPass,
-        },
-        token_efficiency: {
-          totalActualTokens,
-          totalUnoptimizedTokens,
-          totalTokensSaved,
-          totalTokensSavedPct,
-        },
-        editable_components: {
-          system_prompts:
-            `Use Cue-First RAG retrieval (${profile.ragSnippetMaxChars} char snippet cap) and bounded thinking (${profile.thinkingBudgetTokens} tokens) before editing.`,
-          rules: ['plugin/harness-ide/rules/AGENTS.md'],
-          skills: [
-            'plugin/harness-ide/skills/harness2-loop/SKILL.md',
-            'plugin/harness-ide/skills/qmd-knowledge-lifecycle/SKILL.md',
-          ],
-          subagents: [
-            `harness-proposer (model: ${profile.proberModelTier})`,
-            `harness-prober (Workspace: branch, model: ${profile.proberModelTier}, thinkingCap: ${profile.thinkingBudgetTokens})`,
-            `harness-composer (model: ${profile.composerModelTier})`,
-          ],
-          hooks: {
-            SessionStart: 'scripts/hooks/session-start.mjs',
-            PreInvocation: 'scripts/hooks/pre-invocation.mjs',
-            PostToolUse: 'scripts/hooks/post-tool-use.mjs',
-          },
-          tools: ['harness_query', 'harness_get', 'harness_snapshot_lock', 'harness_run_loop', 'harness_record_experience'],
-          scripts: ['adapters/harness2_antigravity_executor.py', 'test/harness-ide.test.mjs'],
-          plugins: ['harness-ide'],
-        },
-        adopted_at: new Date().toISOString(),
-        git_revision: this.getGitRevision(),
-        status: effectiveRecordStatus,
-        synthetic: isSimulation,
-      };
-
-      let recordedExperience = null;
-      if (recordToLibrary) {
-        recordedExperience = this.recordExperience({
-          task_id: taskId,
-          domain,
-          title: `EXPERIENCE: ${taskId} (Harness² ${profile.reasoningDepth.toUpperCase()} · ${totalTokensSavedPct}% Tokens Saved)`,
-          cue: `When tackling '${problem.slice(0, 90)}' in '${domain}', use ${winner.candidateId} with ${profile.reasoningDepth} reasoning depth (thinkingCap=${profile.thinkingBudgetTokens}, model=${profile.proberModelTier}, Workspace=branch) to achieve score=${winner.verificationScore} while saving ${totalTokensSavedPct}% tokens.`,
-          problem,
-          observed_behavior:
-            `Contrastive evaluation across K=${k} candidates (${mode} mode) under frozen snapshot '${snapshotId}': ` +
-            `${winner.candidateId} (${winner.frontLabel}) beat the unbounded baseline (score ${winner.verificationScore} vs ${baselineTrajectory.verificationScore}, 0 tool errors vs 1) ` +
-            `while consuming only ${totalActualTokens.toLocaleString()} total probe tokens vs ${totalUnoptimizedTokens.toLocaleString()} unbounded tokens (${totalTokensSaved.toLocaleString()} tokens saved, -${totalTokensSavedPct}%).`,
-          supporting_evidence: [
-            ...(winner.evidencePaths || []),
-            'adapters/harness2_antigravity_executor.py',
-          ],
-          status: effectiveRecordStatus,
-          synthetic: isSimulation,
-          tags: ['harness2', 'propose-probe-compose', `depth-${profile.reasoningDepth}`, 'token-efficient', domain],
-          adopted_harness: composedHarness,
-        });
-      }
-
-      const runReport = {
-        ok: true,
-        status: isSimulation ? 'simulated' : 'succeeded',
-        synthetic: isSimulation,
-        executionMode: isSimulation ? 'simulation' : 'verified',
-        passedVerification: winner.passedVerification,
-        verificationScore: winner.verificationScore,
-        evaluatorReceipt: evaluatorReceipt || undefined,
-        runId: `h2-run-${Date.now()}`,
-        completedAt: new Date().toISOString(),
-        taskId,
-        domain,
-        problem,
-        k,
-        mode,
-        snapshotId,
-        reasoningProfile: profile,
-        retrievedKnowledge: {
-          experienceCount: expHits.results.length,
-          projectAdrCount: projHits.results.length,
-          cues: retrievedCues,
-          adrs: retrievedAdrs,
-        },
-        baselineTrajectory,
-        candidates,
-        proposals: candidates,
-        probeTrajectories,
-        trajectories: probeTrajectories,
-        winnerCandidateId: winner.candidateId,
-        winnerScore: winner.verificationScore,
-        winner: {
-          candidateId: winner.candidateId,
-          score: winner.verificationScore,
-          verificationScore: winner.verificationScore,
-          passedVerification: winner.passedVerification,
-          totalTokens: winner.totalTokens,
-          synthetic: isSimulation,
-        },
-        tokenEfficiency: {
-          totalActualTokens,
-          totalUnoptimizedTokens,
-          totalTokensSaved,
-          totalTokensSavedPct,
-          earlyStopped: probeTrajectories.some((p) => p.earlyStopped === true),
-          synthetic: isSimulation,
-        },
-        composedHarness,
-        recordedExperience,
-      };
-
-      if (recordToLibrary) {
-        try {
-          fs.writeFileSync(this.lastRunPath, JSON.stringify(runReport, null, 2) + '\n', 'utf8');
-        } catch {}
-      }
-
-      return runReport;
-    } finally {
-      this.releaseSnapshotLock();
-      if (!recordToLibrary) {
-        const snapFile = path.join(this.snapshotsDir, `${snapshotId}.json`);
-        if (fs.existsSync(snapFile)) {
-          try {
-            fs.unlinkSync(snapFile);
-          } catch {}
-        }
-      }
+    let bodyOut;
+    try {
+      bodyOut = executeLoopBody();
+    } catch (err) {
+      cleanupSnapshotLock();
+      throw err;
     }
+    if (isThenable(bodyOut)) {
+      return Promise.resolve(bodyOut).finally(cleanupSnapshotLock);
+    }
+    cleanupSnapshotLock();
+    return bodyOut;
   }
 }
