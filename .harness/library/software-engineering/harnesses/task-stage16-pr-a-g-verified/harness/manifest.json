@@ -1,0 +1,10 @@
+{
+  "harness_id": "harness-software-engineering-task-stage16-pr-a-g-verified",
+  "task_id": "task-stage16-pr-a-g-verified",
+  "domain": "software-engineering",
+  "adopted_at": "2026-11-08T04:19:57.083Z",
+  "git_revision": "a9d2e21",
+  "status": "active",
+  "synthetic": false,
+  "receipt_id": "RCPT-1794111597004-8F42F873"
+}

@@ -52,16 +52,162 @@ function isPidAlive(pid) {
 }
 
 /**
+ * Single-pass lexical scanner that strips comments (and optionally string/template literals)
+ * while respecting JavaScript regex literals (`/pattern/flags`) so quotes or `//` inside
+ * regexes never corrupt subsequent executable code.
+ */
+function scanAndStripSource(sourceText, { stripStrings = false } = {}) {
+  const src = String(sourceText ?? '');
+  const len = src.length;
+  let out = '';
+  let i = 0;
+  let lastSignificantChar = '';
+
+  const isRegexAllowedAfter = (ch) => {
+    if (!ch) return true;
+    return '=(,[!&|:?;+-*%^~<>{\n\r'.includes(ch);
+  };
+
+  while (i < len) {
+    const ch = src[i];
+    const next = i + 1 < len ? src[i + 1] : '';
+
+    // 1. HTML comment <!-- ... -->
+    if (ch === '<' && src.startsWith('<!--', i)) {
+      const end = src.indexOf('-->', i + 4);
+      if (end === -1) break;
+      out += ' ';
+      i = end + 3;
+      continue;
+    }
+
+    // 2. Multi-line comment /* ... */
+    if (ch === '/' && next === '*') {
+      const end = src.indexOf('*/', i + 2);
+      if (end === -1) break;
+      out += ' ';
+      i = end + 2;
+      continue;
+    }
+
+    // 3. Single-line comment // ...
+    if (ch === '/' && next === '/') {
+      const end = src.indexOf('\n', i + 2);
+      if (end === -1) break;
+      out += '\n';
+      i = end + 1;
+      lastSignificantChar = '\n';
+      continue;
+    }
+
+    // 4. Python/shell line-start # comment
+    if (ch === '#' && (i === 0 || src[i - 1] === '\n' || src[i - 1] === '\r')) {
+      const end = src.indexOf('\n', i + 1);
+      if (end === -1) break;
+      out += '\n';
+      i = end + 1;
+      lastSignificantChar = '\n';
+      continue;
+    }
+
+    // 5. Regex literal /.../flags when in regex position
+    if (ch === '/' && next !== '/' && next !== '*' && isRegexAllowedAfter(lastSignificantChar)) {
+      let j = i + 1;
+      let inCharClass = false;
+      let validRegex = false;
+      while (j < len) {
+        const c = src[j];
+        if (c === '\\') {
+          j += 2;
+          continue;
+        }
+        if (c === '[') inCharClass = true;
+        else if (c === ']') inCharClass = false;
+        else if (c === '/' && !inCharClass) {
+          validRegex = true;
+          j += 1;
+          while (j < len && /[a-zA-Z]/.test(src[j])) j += 1;
+          break;
+        } else if ((c === '\n' || c === '\r') && !inCharClass) {
+          break;
+        }
+        j += 1;
+      }
+      if (validRegex) {
+        out += stripStrings ? ' / / ' : src.slice(i, j);
+        i = j;
+        lastSignificantChar = '/';
+        continue;
+      }
+    }
+
+    // 6. Single- or double-quoted string literal
+    if (ch === "'" || ch === '"') {
+      const quote = ch;
+      let j = i + 1;
+      while (j < len) {
+        const c = src[j];
+        if (c === '\\') {
+          j += 2;
+          continue;
+        }
+        if (c === quote || c === '\n' || c === '\r') {
+          if (c === quote) j += 1;
+          break;
+        }
+        j += 1;
+      }
+      out += stripStrings ? `${quote}${quote}` : src.slice(i, j);
+      i = j;
+      lastSignificantChar = quote;
+      continue;
+    }
+
+    // 7. Template literal `...`
+    if (ch === '`') {
+      let j = i + 1;
+      while (j < len) {
+        const c = src[j];
+        if (c === '\\') {
+          j += 2;
+          continue;
+        }
+        if (c === '`') {
+          j += 1;
+          break;
+        }
+        j += 1;
+      }
+      out += stripStrings ? '""' : src.slice(i, j);
+      i = j;
+      lastSignificantChar = '`';
+      continue;
+    }
+
+    out += ch;
+    if (!/\s/.test(ch)) {
+      lastSignificantChar = ch;
+    }
+    i += 1;
+  }
+
+  return out;
+}
+
+/**
  * Strips single-line (`//`, `#`) and multi-line (`/* ... *\/`, `<!-- ... -->`) comments
  * so comment-only mentions of a symbol cannot satisfy `consumerRefs` verification.
  */
 export function stripCodeComments(sourceText) {
-  const text = String(sourceText ?? '');
-  return text
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/(^|[^:\\])\/\/.*$/gm, '$1 ')
-    .replace(/^\s*#.*$/gm, ' ');
+  return scanAndStripSource(sourceText, { stripStrings: false });
+}
+
+/**
+ * Strips both comments and string literals (`'...'`, `"..."`, `` `...` ``) so symbols
+ * that appear only inside comments or string literals cannot satisfy `consumerRefs` symbol checks.
+ */
+export function stripCommentsAndStringLiterals(sourceText) {
+  return scanAndStripSource(sourceText, { stripStrings: true });
 }
 
 function writeJsonAtomic(filePath, data) {
@@ -96,19 +242,40 @@ export function resolveContainedRealPath(workspaceRoot, relOrAbsPath) {
   }
   const absCandidate = path.resolve(wsReal, rawStr);
 
-  // Walk up to find deepest existing ancestor and resolve symlinks via realpathSync
+  // Walk up to find deepest existing ancestor (including dangling symlinks via lstatSync)
   let cur = absCandidate;
   const tailSegments = [];
-  while (!fs.existsSync(cur)) {
+  while (true) {
+    let lstat = null;
+    try {
+      lstat = fs.lstatSync(cur);
+    } catch {
+      lstat = null;
+    }
+    if (lstat) {
+      if (lstat.isSymbolicLink()) {
+        try {
+          cur = fs.realpathSync(cur);
+        } catch {
+          const linkTarget = fs.readlinkSync(cur);
+          const resolvedLink = path.resolve(path.dirname(cur), linkTarget);
+          cur = resolveContainedRealPath(wsReal, resolvedLink);
+        }
+      } else {
+        try {
+          cur = fs.realpathSync(cur);
+        } catch {}
+      }
+      break;
+    }
     const parent = path.dirname(cur);
     if (parent === cur) break;
     tailSegments.unshift(path.basename(cur));
     cur = parent;
   }
 
-  const realAncestor = fs.existsSync(cur) ? fs.realpathSync(cur) : cur;
   const realFull =
-    tailSegments.length > 0 ? path.join(realAncestor, ...tailSegments) : realAncestor;
+    tailSegments.length > 0 ? path.join(cur, ...tailSegments) : cur;
 
   const normRoot = process.platform === 'win32' ? wsReal.toLowerCase() : wsReal;
   const normTarget = process.platform === 'win32' ? realFull.toLowerCase() : realFull;
@@ -241,7 +408,10 @@ export class ContextResilienceManager {
   // 1. REQUIREMENT LEDGER (CTX-03, CTX-06, CTX-07)
   // =========================================================================
   getLedgerPath(taskId) {
-    return path.join(this._resolveSafeTaskDir(taskId), 'requirements.json');
+    return resolveContainedRealPath(
+      this.workspaceRoot,
+      path.join(this._resolveSafeTaskDir(taskId), 'requirements.json')
+    );
   }
 
   loadRequirementLedger(taskId) {
@@ -279,16 +449,81 @@ export class ContextResilienceManager {
     return { file: '', symbol: null };
   }
 
-  _verifyEvidenceRefExists(evRef) {
-    const refStr = typeof evRef === 'string' ? evRef.trim() : String(evRef?.file || evRef?.receiptId || '').trim();
-    if (!refStr) return false;
+  _inspectEvidenceRef(evRef) {
+    const refStr =
+      typeof evRef === 'string'
+        ? evRef.trim()
+        : String(evRef?.file || evRef?.receiptId || '').trim();
+    if (!refStr) {
+      return { exists: false, validVerdict: false, reason: 'Empty evidence reference' };
+    }
     if (/^RCPT-[A-Z0-9-]+$/i.test(refStr)) {
-      const receiptPath = this._resolveWorkspaceFile(path.join('.harness', 'receipts', `${refStr}.json`));
-      return fs.existsSync(receiptPath) && fs.statSync(receiptPath).isFile();
+      const receiptPath = this._resolveWorkspaceFile(
+        path.join('.harness', 'receipts', `${refStr}.json`)
+      );
+      if (!fs.existsSync(receiptPath) || !fs.statSync(receiptPath).isFile()) {
+        return { exists: false, validVerdict: false, reason: 'Receipt file does not exist on disk' };
+      }
+      const parsed = readJsonSafe(receiptPath, null);
+      const validReceipt = Boolean(
+        parsed &&
+          typeof parsed === 'object' &&
+          parsed.passed === true &&
+          parsed.synthetic !== true &&
+          typeof parsed.signature === 'string' &&
+          parsed.signature.length === 64
+      );
+      return {
+        exists: true,
+        validVerdict: validReceipt,
+        reason: validReceipt ? 'Valid evaluation receipt' : 'Receipt is not a passing non-synthetic signed receipt',
+      };
     }
     const cleanFile = refStr.split('#')[0].trim();
     const full = this._resolveWorkspaceFile(cleanFile);
-    return fs.existsSync(full) && fs.statSync(full).isFile() && fs.statSync(full).size > 0;
+    if (!fs.existsSync(full) || !fs.statSync(full).isFile() || fs.statSync(full).size === 0) {
+      return { exists: false, validVerdict: false, reason: 'Evidence file does not exist on disk' };
+    }
+    if (!cleanFile.toLowerCase().endsWith('.json')) {
+      return {
+        exists: true,
+        validVerdict: false,
+        reason: 'Evidence reference must be a passing evaluation receipt (RCPT-*) or JSON verification verdict (.json), not a source or prose file',
+      };
+    }
+    const parsed = readJsonSafe(full, null);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { exists: true, validVerdict: false, reason: 'Evidence JSON is malformed or not an object' };
+    }
+    const passedFlag =
+      parsed.passed === true ||
+      parsed.passed_verification === true ||
+      parsed.passedVerification === true ||
+      (parsed.ok === true &&
+        parsed.passed !== false &&
+        parsed.passed_verification !== false &&
+        parsed.passedVerification !== false);
+    const notSynthetic = parsed.synthetic !== true;
+    const notFailedStatus =
+      parsed.status !== 'failed' &&
+      parsed.status !== 'simulated' &&
+      parsed.status !== 'error';
+    const exitOk =
+      (parsed.exitCode === undefined || parsed.exitCode === 0) &&
+      (parsed.returncode === undefined || parsed.returncode === 0);
+    const validVerdict = Boolean(passedFlag && notSynthetic && notFailedStatus && exitOk);
+    return {
+      exists: true,
+      validVerdict,
+      reason: validVerdict
+        ? 'Valid JSON verification verdict'
+        : 'Evidence JSON does not record a passing, non-synthetic verification verdict',
+    };
+  }
+
+  _verifyEvidenceRefExists(evRef) {
+    const check = this._inspectEvidenceRef(evRef);
+    return check.exists && check.validVerdict;
   }
 
   upsertRequirementLedger(taskId, { objective, userCorrection, requirements = [] } = {}) {
@@ -351,9 +586,16 @@ export class ContextResilienceManager {
             );
           }
           for (const evRef of merged.evidenceRefs) {
-            if (!this._verifyEvidenceRefExists(evRef)) {
+            const evCheck = this._inspectEvidenceRef(evRef);
+            const evLabel = typeof evRef === 'string' ? evRef : JSON.stringify(evRef);
+            if (!evCheck.exists) {
               throw new Error(
-                `CTX-06 violation for ${req.id}: evidence reference "${typeof evRef === 'string' ? evRef : JSON.stringify(evRef)}" does not exist on disk.`
+                `CTX-06 violation for ${req.id}: evidence reference "${evLabel}" does not exist on disk.`
+              );
+            }
+            if (!evCheck.validVerdict) {
+              throw new Error(
+                `CTX-06 violation for ${req.id}: evidence reference "${evLabel}" is not a valid passing verification verdict (${evCheck.reason}).`
               );
             }
           }
@@ -380,10 +622,10 @@ export class ContextResilienceManager {
             }
             const rawContent = fs.readFileSync(full, 'utf8');
             if (parsedRef.symbol) {
-              const codeWithoutComments = stripCodeComments(rawContent);
-              if (!codeWithoutComments.includes(parsedRef.symbol)) {
+              const codeWithoutCommentsAndStrings = stripCommentsAndStringLiterals(rawContent);
+              if (!codeWithoutCommentsAndStrings.includes(parsedRef.symbol)) {
                 throw new Error(
-                  `CTX-06 violation for ${req.id}: consumer file "${parsedRef.file}" does not reference symbol "${parsedRef.symbol}" in executable code (comments excluded).`
+                  `CTX-06 violation for ${req.id}: consumer file "${parsedRef.file}" does not reference symbol "${parsedRef.symbol}" in executable code (comments and string literals excluded).`
                 );
               }
             }
@@ -408,7 +650,10 @@ export class ContextResilienceManager {
   // 2. EXACT CONTRACT REGISTRY (CTX-01, CTX-02, CTX-05)
   // =========================================================================
   getContractsPath(taskId) {
-    return path.join(this._resolveSafeTaskDir(taskId), 'contracts.json');
+    return resolveContainedRealPath(
+      this.workspaceRoot,
+      path.join(this._resolveSafeTaskDir(taskId), 'contracts.json')
+    );
   }
 
   loadContractRegistry(taskId) {
@@ -660,10 +905,16 @@ export class ContextResilienceManager {
   ) {
     return this._withTaskLock(taskId, () => {
       const taskDir = this._resolveSafeTaskDir(taskId);
-      const checkpointsDir = path.join(taskDir, 'checkpoints');
+      const checkpointsDir = resolveContainedRealPath(
+        this.workspaceRoot,
+        path.join(taskDir, 'checkpoints')
+      );
       fs.mkdirSync(checkpointsDir, { recursive: true });
 
-      const currentPointerPath = path.join(checkpointsDir, 'current.json');
+      const currentPointerPath = resolveContainedRealPath(
+        this.workspaceRoot,
+        path.join(checkpointsDir, 'current.json')
+      );
       const prevCurrent = readJsonSafe(currentPointerPath, null);
       const nextRev = this._allocateNextCheckpointRevision(checkpointsDir, prevCurrent);
 
@@ -726,7 +977,10 @@ export class ContextResilienceManager {
         createdAt: new Date().toISOString(),
       };
 
-      const revFile = path.join(checkpointsDir, `rev-${nextRev}.json`);
+      const revFile = resolveContainedRealPath(
+        this.workspaceRoot,
+        path.join(checkpointsDir, `rev-${nextRev}.json`)
+      );
       writeJsonAtomic(revFile, checkpointPayload);
 
       // CTX-09: If interrupted before updating the current pointer, the preceding complete checkpoint remains intact
@@ -742,7 +996,14 @@ export class ContextResilienceManager {
   loadLatestCheckpoint(taskId) {
     return this._withTaskLock(taskId, () => {
       const taskDir = this._resolveSafeTaskDir(taskId);
-      const currentPointerPath = path.join(taskDir, 'checkpoints', 'current.json');
+      const checkpointsDir = resolveContainedRealPath(
+        this.workspaceRoot,
+        path.join(taskDir, 'checkpoints')
+      );
+      const currentPointerPath = resolveContainedRealPath(
+        this.workspaceRoot,
+        path.join(checkpointsDir, 'current.json')
+      );
       const current = readJsonSafe(currentPointerPath, null);
       if (!current) return null;
       const contractValidation = this.validateContracts(taskId);
@@ -807,12 +1068,27 @@ export class ContextResilienceManager {
         null;
 
       const recoveryToken = `REC-${taskId}-${workerId}-L${liveLedger.revision}-C${cp.checkpointRevision}`;
-      const acksFile = path.join(this._resolveSafeTaskDir(taskId), 'recovery-acks.json');
+      const packetDigest = sha256Text(
+        JSON.stringify({
+          taskId,
+          workerId,
+          checkpointRevision: cp.checkpointRevision,
+          ledgerRevision: liveLedger.revision,
+          openRequirements: liveOpenRequirements,
+          invalidatedRequirements,
+          materialUserCorrections: liveCorrections,
+        })
+      );
+      const acksFile = resolveContainedRealPath(
+        this.workspaceRoot,
+        path.join(this._resolveSafeTaskDir(taskId), 'recovery-acks.json')
+      );
       const acksState = readJsonSafe(acksFile, { taskId, workers: {} });
       acksState.workers[workerId] = {
         workerId,
         executorSessionId: resolvedSessionId,
         recoveryToken,
+        packetDigest,
         checkpointRevision: cp.checkpointRevision,
         ledgerRevision: liveLedger.revision,
         status: 'pending_acknowledgment',
@@ -828,6 +1104,8 @@ export class ContextResilienceManager {
         parentId: worker.parentId,
         executorSessionId: resolvedSessionId,
         checkpointRevision: cp.checkpointRevision,
+        ledgerRevision: liveLedger.revision,
+        packetDigest,
         ownership: worker.ownership,
         openChecks: mergedOpenChecks,
         openRequirements: liveOpenRequirements,
@@ -843,10 +1121,15 @@ export class ContextResilienceManager {
 
   /**
    * Confirms that a resumed worker received and acknowledged its authoritative recovery packet.
+   * Requires a matching `recoveryToken`, verifies that the live ledger and checkpoint have not
+   * advanced past the issued packet (`STALE_RECOVERY_PACKET`), and validates session/revision fields.
    */
   acknowledgeRecoveryPacket(taskId, workerId, recoveryTokenOrOptions = null) {
     return this._withTaskLock(taskId, () => {
-      const acksFile = path.join(this._resolveSafeTaskDir(taskId), 'recovery-acks.json');
+      const acksFile = resolveContainedRealPath(
+        this.workspaceRoot,
+        path.join(this._resolveSafeTaskDir(taskId), 'recovery-acks.json')
+      );
       const acksState = readJsonSafe(acksFile, { taskId, workers: {} });
       const entry = acksState.workers?.[workerId];
       if (!entry) {
@@ -858,9 +1141,21 @@ export class ContextResilienceManager {
       }
       const suppliedToken =
         typeof recoveryTokenOrOptions === 'string'
-          ? recoveryTokenOrOptions
-          : recoveryTokenOrOptions?.recoveryToken || recoveryTokenOrOptions?.recovery_token || null;
-      if (suppliedToken && entry.recoveryToken !== suppliedToken) {
+          ? recoveryTokenOrOptions.trim()
+          : String(
+              recoveryTokenOrOptions?.recoveryToken ||
+                recoveryTokenOrOptions?.recovery_token ||
+                ''
+            ).trim();
+      if (!suppliedToken) {
+        return {
+          ok: false,
+          acknowledged: false,
+          error: 'RECOVERY_TOKEN_REQUIRED',
+          expectedToken: entry.recoveryToken,
+        };
+      }
+      if (entry.recoveryToken !== suppliedToken) {
         return {
           ok: false,
           acknowledged: false,
@@ -868,19 +1163,76 @@ export class ContextResilienceManager {
           expectedToken: entry.recoveryToken,
         };
       }
+
+      if (recoveryTokenOrOptions && typeof recoveryTokenOrOptions === 'object') {
+        if (
+          recoveryTokenOrOptions.checkpointRevision !== undefined &&
+          Number(recoveryTokenOrOptions.checkpointRevision) !== Number(entry.checkpointRevision)
+        ) {
+          return {
+            ok: false,
+            acknowledged: false,
+            error: 'CHECKPOINT_REVISION_MISMATCH',
+          };
+        }
+        if (
+          recoveryTokenOrOptions.ledgerRevision !== undefined &&
+          Number(recoveryTokenOrOptions.ledgerRevision) !== Number(entry.ledgerRevision)
+        ) {
+          return {
+            ok: false,
+            acknowledged: false,
+            error: 'LEDGER_REVISION_MISMATCH',
+          };
+        }
+        if (
+          recoveryTokenOrOptions.packetDigest &&
+          entry.packetDigest &&
+          String(recoveryTokenOrOptions.packetDigest) !== String(entry.packetDigest)
+        ) {
+          return {
+            ok: false,
+            acknowledged: false,
+            error: 'PACKET_DIGEST_MISMATCH',
+          };
+        }
+        if (
+          entry.executorSessionId &&
+          recoveryTokenOrOptions.executorSessionId !== undefined &&
+          recoveryTokenOrOptions.executorSessionId !== entry.executorSessionId
+        ) {
+          return {
+            ok: false,
+            acknowledged: false,
+            error: 'EXECUTOR_SESSION_ID_MISMATCH',
+          };
+        }
+      }
+
+      // Verify that neither the requirement ledger nor checkpoint has advanced since the recovery packet was issued
+      const contractValidation = this.validateContracts(taskId);
+      const liveLedger = this.loadRequirementLedger(taskId);
+      const currentPointerPath = resolveContainedRealPath(
+        this.workspaceRoot,
+        path.join(this._resolveSafeTaskDir(taskId), 'checkpoints', 'current.json')
+      );
+      const latestCp = readJsonSafe(currentPointerPath, null);
       if (
-        recoveryTokenOrOptions &&
-        typeof recoveryTokenOrOptions === 'object' &&
-        recoveryTokenOrOptions.executorSessionId &&
-        entry.executorSessionId &&
-        entry.executorSessionId !== recoveryTokenOrOptions.executorSessionId
+        Number(liveLedger.revision) !== Number(entry.ledgerRevision) ||
+        (latestCp && Number(latestCp.checkpointRevision) !== Number(entry.checkpointRevision))
       ) {
         return {
           ok: false,
           acknowledged: false,
-          error: 'EXECUTOR_SESSION_ID_MISMATCH',
+          error: 'STALE_RECOVERY_PACKET',
+          packetLedgerRevision: entry.ledgerRevision,
+          currentLedgerRevision: liveLedger.revision,
+          packetCheckpointRevision: entry.checkpointRevision,
+          currentCheckpointRevision: latestCp?.checkpointRevision ?? null,
+          contractIssuesCount: contractValidation.issues.length,
         };
       }
+
       entry.status = 'acknowledged';
       entry.acknowledgedAt = new Date().toISOString();
       writeJsonAtomic(acksFile, acksState);
@@ -891,6 +1243,9 @@ export class ContextResilienceManager {
         workerId,
         executorSessionId: entry.executorSessionId || null,
         recoveryToken: entry.recoveryToken,
+        checkpointRevision: entry.checkpointRevision,
+        ledgerRevision: entry.ledgerRevision,
+        packetDigest: entry.packetDigest,
         acknowledgedAt: entry.acknowledgedAt,
       };
     });
@@ -980,7 +1335,14 @@ export class ContextResilienceManager {
   recordAttemptProgress(taskId, { madeProgress = false, maxStagnantAttempts = 3 } = {}) {
     return this._withTaskLock(taskId, () => {
       const taskDir = this._resolveSafeTaskDir(taskId);
-      const statePath = path.join(taskDir, 'progress-guard.json');
+      const statePath = resolveContainedRealPath(
+        this.workspaceRoot,
+        path.join(taskDir, 'progress-guard.json')
+      );
+      const aliasStatePath = resolveContainedRealPath(
+        this.workspaceRoot,
+        path.join(taskDir, 'state.json')
+      );
       const state = readJsonSafe(statePath, {
         taskId,
         stagnantAttempts: 0,
@@ -998,14 +1360,16 @@ export class ContextResilienceManager {
           state.status = 'escalated_focused_restart';
         }
       }
+      state.shouldStopRetryLoop = state.stagnantAttempts >= maxStagnantAttempts;
       state.updatedAt = new Date().toISOString();
       writeJsonAtomic(statePath, state);
+      writeJsonAtomic(aliasStatePath, state);
 
       return {
         ...state,
-        shouldStopRetryLoop: state.stagnantAttempts >= maxStagnantAttempts,
+        shouldStopRetryLoop: state.shouldStopRetryLoop,
         recommendedAction:
-          state.stagnantAttempts >= maxStagnantAttempts
+          state.shouldStopRetryLoop
             ? 'Stop expanding prompt; rotate to a focused worker from durable checkpoint or escalate to user.'
             : 'Continue next requirement.',
       };
@@ -1015,6 +1379,8 @@ export class ContextResilienceManager {
   /**
    * Lists active tasks in `.harness/tasks/` and builds a compact, bounded context-resilience
    * injection summary for `PreInvocation` hooks so active tasks automatically survive compaction.
+   * Prioritizes task ID/ledger revision, Latest Correction, Open Requirements, and Stale Contracts
+   * BEFORE the truncated Objective so critical recovery signals are never truncated away.
    */
   buildActiveTasksHookPacket(maxChars = 900) {
     if (!fs.existsSync(this.tasksRoot)) return null;
@@ -1034,16 +1400,21 @@ export class ContextResilienceManager {
           continue;
         }
         const parts = [`[Task ${taskId} (rev ${ledger.revision})]`];
-        if (ledger.objective) parts.push(`Objective: ${ledger.objective}`);
+        if (corrections.length > 0) {
+          const latestCorr = corrections[corrections.length - 1];
+          parts.push(`Latest Correction: "${String(latestCorr.correction || '').slice(0, 220)}"`);
+        }
         if (openReqs.length > 0) {
           parts.push(`Open Reqs: ${openReqs.map((r) => `${r.id}(${r.state})`).join(', ')}`);
         }
         if (issues.length > 0) {
           parts.push(`Stale Contracts: ${issues.map((i) => `${i.code}:${i.contractId}`).join(', ')}`);
         }
-        if (corrections.length > 0) {
-          const latestCorr = corrections[corrections.length - 1];
-          parts.push(`Latest Correction: "${latestCorr.correction}"`);
+        if (ledger.objective) {
+          const cleanObj = String(ledger.objective).trim();
+          parts.push(
+            `Objective: ${cleanObj.length > 140 ? `${cleanObj.slice(0, 137)}...` : cleanObj}`
+          );
         }
         summaries.push(parts.join(' | '));
       } catch {}

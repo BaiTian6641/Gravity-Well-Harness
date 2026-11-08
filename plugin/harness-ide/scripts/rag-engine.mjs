@@ -281,20 +281,28 @@ export class HarnessKnowledgeEngine {
   _resolveRealPathWithNonExistentTail(targetPath) {
     let cur = path.resolve(targetPath);
     const tailSegments = [];
+    const visitedLinks = new Set();
     while (true) {
-      if (fs.existsSync(cur)) {
-        const realBase = fs.realpathSync(cur);
-        return tailSegments.length > 0 ? path.resolve(realBase, ...tailSegments) : realBase;
-      }
       try {
         const lstat = fs.lstatSync(cur);
         if (lstat.isSymbolicLink()) {
+          if (visitedLinks.has(cur)) {
+            throw new Error(`Symlink loop detected at ${cur}`);
+          }
+          visitedLinks.add(cur);
           const linkTarget = fs.readlinkSync(cur);
           cur = path.resolve(path.dirname(cur), linkTarget);
           continue;
         }
-      } catch {
+      } catch (err) {
+        if (err && err.message && err.message.includes('Symlink loop')) {
+          throw err;
+        }
         // Path segment does not exist yet
+      }
+      if (fs.existsSync(cur)) {
+        const realBase = fs.realpathSync(cur);
+        return tailSegments.length > 0 ? path.resolve(realBase, ...tailSegments) : realBase;
       }
       const parent = path.dirname(cur);
       if (parent === cur) {
@@ -328,6 +336,15 @@ export class HarnessKnowledgeEngine {
     } catch {
       return false;
     }
+  }
+
+  assertContainedPath(targetPath, label = 'path') {
+    if (!this._isPathInsideWorkspace(targetPath)) {
+      throw new Error(
+        `Path containment violation for ${label}: "${targetPath}" escapes workspace root "${this.workspaceRoot}"`
+      );
+    }
+    return targetPath;
   }
 
   loadConfig() {
@@ -805,7 +822,40 @@ export class HarnessKnowledgeEngine {
       return this.buildIndex();
     }
     try {
-      return JSON.parse(fs.readFileSync(this.indexFilePath, 'utf8'));
+      const parsed = JSON.parse(fs.readFileSync(this.indexFilePath, 'utf8'));
+      const config = this.loadConfig();
+      if (config.rag?.autoIndexOnChange !== false) {
+        const indexedAtMs = Date.parse(parsed?.indexedAt || '') || 0;
+        const collections = config.rag?.collections || {};
+        const currentFiles = [];
+        for (const colSpec of Object.values(collections)) {
+          const relPaths = [colSpec.path, ...(colSpec.extraPaths || [])].filter(Boolean);
+          for (const rel of relPaths) {
+            const absDir = path.resolve(this.workspaceRoot, rel);
+            if (!this._isPathInsideWorkspace(absDir) || !fs.existsSync(absDir)) continue;
+            currentFiles.push(...this._walkMarkdownFiles(absDir));
+          }
+        }
+        const prevPaths = new Map(
+          (parsed?.documents || []).map((d) => [String(d.path || '').replace(/\\/g, '/'), d])
+        );
+        if (currentFiles.length !== prevPaths.size) {
+          return this.buildIndex();
+        }
+        for (const fp of currentFiles) {
+          try {
+            const relFp = path.relative(this.workspaceRoot, fp).replace(/\\/g, '/');
+            const prevDoc = prevPaths.get(relFp);
+            const st = fs.statSync(fp);
+            if (!prevDoc || st.mtimeMs > indexedAtMs || st.mtime.toISOString() !== prevDoc.mtime_iso) {
+              return this.buildIndex();
+            }
+          } catch {
+            return this.buildIndex();
+          }
+        }
+      }
+      return parsed;
     } catch {
       return this.buildIndex();
     }
@@ -832,7 +882,6 @@ export class HarnessKnowledgeEngine {
             const raw = fs.readFileSync(lockFile, 'utf8');
             if (raw) {
               const info = JSON.parse(raw);
-              const lockAge = Date.now() - Number(info.acquiredAt || 0);
               let pidAlive = true;
               if (info.pid && Number.isInteger(info.pid) && info.pid !== process.pid) {
                 try {
@@ -843,7 +892,7 @@ export class HarnessKnowledgeEngine {
                   }
                 }
               }
-              if (!pidAlive || lockAge > Math.max(timeoutMs * 6, 30000)) {
+              if (!pidAlive) {
                 try {
                   fs.unlinkSync(lockFile);
                 } catch {}
@@ -1355,10 +1404,69 @@ export class HarnessKnowledgeEngine {
     const b = 0.75;
 
     const scored = candidates.map((doc) => {
+      let effectiveDoc = doc;
+      if (useFrozenDocs && doc.blobHash) {
+        const blobPath = path.join(this.snapshotBlobsDir, `${doc.blobHash}.md`);
+        if (this._isPathInsideWorkspace(blobPath) && fs.existsSync(blobPath)) {
+          try {
+            const blobRaw = fs.readFileSync(blobPath, 'utf8');
+            const actualHash = crypto.createHash('sha256').update(blobRaw, 'utf8').digest('hex');
+            if (actualHash === doc.blobHash) {
+              const parsedBlob = String(doc.path || '').endsWith('.json')
+                ? { metadata: {}, body: blobRaw }
+                : parseFrontmatter(blobRaw);
+              const blobBody = parsedBlob.body || blobRaw;
+              const blobTitle = parsedBlob.metadata?.title || doc.title || doc.docid;
+              const blobCue = parsedBlob.metadata?.cue || doc.cue || '';
+              const blobTags = Array.isArray(parsedBlob.metadata?.tags)
+                ? parsedBlob.metadata.tags
+                : doc.tags || [];
+              const blobHeadings = (blobBody.match(/^#{1,3}\s+.+$/gm) || [])
+                .map((h) => h.replace(/^#{1,3}\s+/, '').trim())
+                .join(' ');
+              const weightedText = [
+                blobTitle, blobTitle, blobTitle,
+                blobCue, blobCue,
+                blobTags.join(' '), blobTags.join(' '),
+                blobHeadings,
+                doc.domain || 'general',
+                blobBody
+              ].join('\n');
+              const blobTokens = tokenize(weightedText, false);
+              const blobTf = {};
+              for (const t of blobTokens) {
+                blobTf[t] = (blobTf[t] || 0) + 1;
+              }
+              const boostTokens = tokenize(`${blobTitle} ${blobCue} ${blobTags.join(' ')}`, false);
+              const blobVec = computeDenseVector(
+                `${blobTitle}\n${blobCue}\n${blobHeadings}\n${blobBody}`,
+                boostTokens
+              );
+              const blobSections = this._extractSections(blobBody, blobTitle);
+              const blobExcerpt = blobBody.replace(/^#+\s+.+$/gm, '').trim().slice(0, 360);
+              effectiveDoc = {
+                ...doc,
+                title: blobTitle,
+                cue: blobCue,
+                sections: blobSections,
+                excerpt: blobExcerpt,
+                tf: blobTf,
+                termFreqs: blobTf,
+                tokenCount: blobTokens.length,
+                length: blobTokens.length,
+                vector: blobVec
+              };
+            }
+          } catch {
+            // Fallback to stored doc metadata if blob read fails
+          }
+        }
+      }
+
       // 1. BM25 score
       let bm25 = 0;
-      const docTf = doc.tf || doc.termFreqs || {};
-      const docLen = doc.tokenCount || doc.length || 1;
+      const docTf = effectiveDoc.tf || effectiveDoc.termFreqs || {};
+      const docLen = effectiveDoc.tokenCount || effectiveDoc.length || 1;
       for (const qt of qTokens) {
         const tf = docTf[qt] || 0;
         if (tf > 0) {
@@ -1370,12 +1478,15 @@ export class HarnessKnowledgeEngine {
       }
 
       // 2. Semantic Vector cosine similarity
-      const vecScore = Math.max(0, cosineSimilarity(qVec, doc.vector));
+      const vecScore = Math.max(0, cosineSimilarity(qVec, effectiveDoc.vector));
 
       // Best matching section snippet
-      let bestSection = doc.sections?.[0] || { heading: doc.title, content: doc.excerpt };
+      let bestSection = effectiveDoc.sections?.[0] || {
+        heading: effectiveDoc.title,
+        content: effectiveDoc.excerpt
+      };
       let bestSecOverlap = -1;
-      for (const sec of doc.sections || []) {
+      for (const sec of effectiveDoc.sections || []) {
         const secTokens = new Set(tokenize(`${sec.heading} ${sec.content}`, false));
         let overlap = 0;
         for (const qt of qTokens) {
@@ -1388,15 +1499,15 @@ export class HarnessKnowledgeEngine {
       }
 
       return {
-        doc,
+        doc: effectiveDoc,
         bm25,
         vecScore,
         bestSection
       };
     });
 
-    const byLex = [...scored].sort((a, bItem) => bItem.bm25 - a.bm25);
-    const byVec = [...scored].sort((a, bItem) => bItem.vecScore - a.vecScore);
+    const byLex = scored.filter((item) => item.bm25 > 0).sort((a, bItem) => bItem.bm25 - a.bm25);
+    const byVec = scored.filter((item) => item.vecScore > 0).sort((a, bItem) => bItem.vecScore - a.vecScore);
 
     const lexRankMap = new Map();
     const vecRankMap = new Map();
@@ -1406,9 +1517,11 @@ export class HarnessKnowledgeEngine {
     const rrfK = 60;
     const finalResults = scored
       .map((item) => {
-        const rLex = lexRankMap.get(item.doc.docid) || 999;
-        const rVec = vecRankMap.get(item.doc.docid) || 999;
-        const rrfScore = 1 / (rrfK + rLex) + 1 / (rrfK + rVec);
+        const rLex = lexRankMap.get(item.doc.docid);
+        const rVec = vecRankMap.get(item.doc.docid);
+        const lexPart = rLex ? 1 / (rrfK + rLex) : 0;
+        const vecPart = rVec ? 1 / (rrfK + rVec) : 0;
+        const rrfScore = lexPart + vecPart;
         const provenanceBoost = item.doc.status === 'active' ? 1.05 : 0.9;
 
         let combinedScore = rrfScore * provenanceBoost;
@@ -1421,7 +1534,7 @@ export class HarnessKnowledgeEngine {
         };
       })
       .filter((item) => item.bm25 > 0 || item.vecScore >= 0.18)
-      .sort((a, bItem) => bItem.combinedScore - a.combinedScore)
+      .sort((a, bItem) => bItem.combinedScore - a.combinedScore || bItem.bm25 - a.bm25)
       .slice(0, topK)
       .map((item) =>
         this._formatSearchResult(
@@ -1471,6 +1584,7 @@ export class HarnessKnowledgeEngine {
       score: Number(score.toFixed(4)),
       lexScore: Number(bm25.toFixed(4)),
       vecScore: Number(vecScore.toFixed(4)),
+      snippet: bestSection ? String(bestSection.content || '').slice(0, cap) : undefined,
       matchedSection: bestSection
         ? {
             heading: bestSection.heading,
@@ -1791,10 +1905,19 @@ export class HarnessKnowledgeEngine {
       candidateId: String(core.candidateId || ''),
       domain: String(core.domain || 'software-engineering'),
       gitRevision: String(core.gitRevision || 'HEAD'),
+      harnessDigest: core.harnessDigest ? String(core.harnessDigest) : null,
+      evaluatorId: String(core.evaluatorId || 'custom-evaluator'),
+      checks: Array.isArray(core.checks) ? core.checks : [],
       score: Number(core.score),
       passed: core.passed === true,
       artifactHashes: sortedArtifactHashes,
-      synthetic: Boolean(core.synthetic)
+      providerCalls: Number(core.providerCalls ?? 0),
+      actualTokens:
+        core.actualTokens !== undefined && core.actualTokens !== null
+          ? Number(core.actualTokens)
+          : null,
+      synthetic: Boolean(core.synthetic),
+      lessonDigest: core.lessonDigest ? String(core.lessonDigest) : null
     });
     const key = this._getOrCreateReceiptKey();
     return crypto.createHmac('sha256', key).update(canonical, 'utf8').digest('hex');
@@ -1808,6 +1931,10 @@ export class HarnessKnowledgeEngine {
     domain = 'software-engineering',
     gitRevision = null,
     git_revision = null,
+    harnessDigest = null,
+    harness_digest = null,
+    lessonDigest = null,
+    lesson_digest = null,
     evaluatorId = 'custom-evaluator',
     evaluator_id = null,
     checks = [],
@@ -1893,6 +2020,38 @@ export class HarnessKnowledgeEngine {
       verifiedHashes[String(relPath).replace(/\\/g, '/')] = actualSha256;
     }
 
+    let resolvedHarnessDigest = harnessDigest || harness_digest || null;
+    let resolvedLessonDigest = lessonDigest || lesson_digest || null;
+    const existingTaskDir = path.join(
+      this.harnessDir,
+      'library',
+      resolvedDomain,
+      'harnesses',
+      resolvedTaskId
+    );
+    if (!resolvedHarnessDigest && this._isPathInsideWorkspace(existingTaskDir)) {
+      const existingManifest = path.join(existingTaskDir, 'harness', 'manifest.json');
+      if (this._isPathInsideWorkspace(existingManifest) && fs.existsSync(existingManifest)) {
+        try {
+          resolvedHarnessDigest = crypto
+            .createHash('sha256')
+            .update(fs.readFileSync(existingManifest, 'utf8'), 'utf8')
+            .digest('hex');
+        } catch {}
+      }
+    }
+    if (!resolvedLessonDigest && this._isPathInsideWorkspace(existingTaskDir)) {
+      const existingExp = path.join(existingTaskDir, 'EXPERIENCE.md');
+      if (this._isPathInsideWorkspace(existingExp) && fs.existsSync(existingExp)) {
+        try {
+          resolvedLessonDigest = crypto
+            .createHash('sha256')
+            .update(fs.readFileSync(existingExp, 'utf8'), 'utf8')
+            .digest('hex');
+        } catch {}
+      }
+    }
+
     const receiptId = `RCPT-${Date.now()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
     const normScore = Number(score.toFixed(4));
     const corePayload = {
@@ -1901,6 +2060,7 @@ export class HarnessKnowledgeEngine {
       candidateId: resolvedCandidateId,
       domain: resolvedDomain,
       gitRevision: resolvedGitRev,
+      harnessDigest: resolvedHarnessDigest ? String(resolvedHarnessDigest) : null,
       evaluatorId: resolvedEvaluatorId,
       checks: Array.isArray(checks) ? checks : [],
       score: normScore,
@@ -1909,6 +2069,7 @@ export class HarnessKnowledgeEngine {
       providerCalls: Number(providerCalls ?? provider_calls ?? 0),
       actualTokens: actualTokens ?? actual_tokens ?? null,
       synthetic: false,
+      lessonDigest: resolvedLessonDigest ? String(resolvedLessonDigest) : null,
       createdAt: new Date().toISOString()
     };
     const signature = this._signReceiptPayload(corePayload);
@@ -1919,6 +2080,7 @@ export class HarnessKnowledgeEngine {
     };
 
     const receiptFile = path.join(this.receiptsDir, `${receiptId}.json`);
+    this.assertContainedPath(receiptFile, 'receiptFile');
     const tmpFile = `${receiptFile}.tmp.${process.pid}.${Date.now()}`;
     fs.writeFileSync(tmpFile, JSON.stringify(storedReceipt, null, 2) + '\n', {
       encoding: 'utf8',
@@ -1930,7 +2092,13 @@ export class HarnessKnowledgeEngine {
 
   verifyEvaluationReceipt(
     receiptIdOrObj,
-    { expectedTaskId = null, expectedCandidateId = null } = {}
+    {
+      expectedTaskId = null,
+      expectedCandidateId = null,
+      expectedDomain = null,
+      expectedLessonDigest = null,
+      expectedHarnessDigest = null
+    } = {}
   ) {
     if (!receiptIdOrObj || typeof receiptIdOrObj === 'boolean') {
       return {
@@ -2008,11 +2176,59 @@ export class HarnessKnowledgeEngine {
         }
       }
 
+      if (expectedDomain) {
+        const normExpDom = String(expectedDomain).toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+        const normActDom = String(stored.domain || '').toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+        if (normExpDom !== normActDom) {
+          return {
+            valid: false,
+            error: 'RECEIPT_DOMAIN_MISMATCH'
+          };
+        }
+      }
+
       if (expectedCandidateId && stored.candidateId !== expectedCandidateId) {
         return {
           valid: false,
           error: 'RECEIPT_CANDIDATE_ID_MISMATCH'
         };
+      }
+
+      if (expectedHarnessDigest && stored.harnessDigest && stored.harnessDigest !== expectedHarnessDigest) {
+        return {
+          valid: false,
+          error: 'RECEIPT_HARNESS_DIGEST_MISMATCH'
+        };
+      }
+
+      if (expectedLessonDigest) {
+        if (!stored.lessonDigest || stored.lessonDigest !== expectedLessonDigest) {
+          return {
+            valid: false,
+            error: 'RECEIPT_LESSON_DIGEST_MISMATCH'
+          };
+        }
+      } else if (stored.lessonDigest && stored.taskId && stored.domain) {
+        const boundExpPath = path.join(
+          this.harnessDir,
+          'library',
+          String(stored.domain),
+          'harnesses',
+          String(stored.taskId),
+          'EXPERIENCE.md'
+        );
+        if (this._isPathInsideWorkspace(boundExpPath) && fs.existsSync(boundExpPath)) {
+          const liveLessonDigest = crypto
+            .createHash('sha256')
+            .update(fs.readFileSync(boundExpPath, 'utf8'), 'utf8')
+            .digest('hex');
+          if (liveLessonDigest !== stored.lessonDigest) {
+            return {
+              valid: false,
+              error: 'RECEIPT_LESSON_DIGEST_MISMATCH'
+            };
+          }
+        }
       }
 
       const artifactHashes = stored.artifactHashes || {};
@@ -2071,7 +2287,6 @@ export class HarnessKnowledgeEngine {
     evaluation_receipt_id = null,
     evaluationReceipt = null,
     evaluation_receipt = null,
-    allowUnverifiedActive = false,
     tags = ['harness2', 'experience'],
     adopted_harness = null
   }) {
@@ -2099,11 +2314,18 @@ export class HarnessKnowledgeEngine {
       adopted_harness?.receiptId ||
       adopted_harness?.receipt_id ||
       null;
+    const expectedCandidateId =
+      adopted_harness?.winning_candidate_id ||
+      adopted_harness?.candidate_id ||
+      adopted_harness?.candidateId ||
+      null;
 
     let verifiedReceipt = null;
     if (candidateReceiptRef && !isSynthetic) {
       const check = this.verifyEvaluationReceipt(candidateReceiptRef, {
-        expectedTaskId: safeTaskId
+        expectedTaskId: safeTaskId,
+        expectedDomain: safeDomain,
+        expectedCandidateId
       });
       if (check.valid) {
         verifiedReceipt = check.receipt;
@@ -2113,101 +2335,147 @@ export class HarnessKnowledgeEngine {
     let effectiveStatus = status || 'candidate';
     if (isSynthetic) {
       effectiveStatus = 'candidate';
-    } else if (effectiveStatus === 'active' && !verifiedReceipt && !allowUnverifiedActive) {
+    } else if (effectiveStatus === 'active' && !verifiedReceipt) {
       effectiveStatus = 'candidate';
     }
 
     const taskDir = path.join(this.harnessDir, 'library', safeDomain, 'harnesses', safeTaskId);
     const harnessSubdir = path.join(taskDir, 'harness');
+    this.assertContainedPath(taskDir, 'taskDir');
+    this.assertContainedPath(harnessSubdir, 'harnessSubdir');
     fs.mkdirSync(harnessSubdir, { recursive: true });
 
     const manifestPath = path.join(harnessSubdir, 'manifest.json');
-    const manifestPayload = adopted_harness
-      ? {
-          ...adopted_harness,
-          status: effectiveStatus,
-          synthetic: isSynthetic,
-          receipt_id: verifiedReceipt?.receiptId || null
-        }
-      : {
-          harness_id: `harness-${safeDomain}-${safeTaskId}`,
-          task_id: safeTaskId,
-          domain: safeDomain,
-          adopted_at: nowIso,
-          git_revision: gitRev,
-          status: effectiveStatus,
-          synthetic: isSynthetic,
-          receipt_id: verifiedReceipt?.receiptId || null
-        };
-    fs.writeFileSync(manifestPath, JSON.stringify(manifestPayload, null, 2) + '\n', 'utf8');
-
+    this.assertContainedPath(manifestPath, 'manifestPath');
     const relManifestPath = path.relative(this.workspaceRoot, manifestPath).replace(/\\/g, '/');
-    const evidenceList = Array.isArray(supporting_evidence)
-      ? [...supporting_evidence]
-      : [String(supporting_evidence)];
-    if (!evidenceList.includes(relManifestPath)) {
-      evidenceList.unshift(relManifestPath);
-    }
-    if (verifiedReceipt) {
-      const relReceiptPath = `.harness/receipts/${verifiedReceipt.receiptId}.json`;
-      if (!evidenceList.includes(relReceiptPath)) {
-        evidenceList.push(relReceiptPath);
-      }
-    }
 
     const expTitle = title || `EXPERIENCE: ${safeTaskId}`;
     const expCue =
       cue ||
       `When encountering tasks matching '${safeTaskId}' in domain '${safeDomain}', apply the verified harness configuration.`;
 
-    const expMd = [
-      '---',
-      `docid: ${docid}`,
-      `title: "${expTitle.replace(/"/g, '\\"')}"`,
-      'collection: experiment-knowledge',
-      `domain: ${safeDomain}`,
-      `task_id: ${safeTaskId}`,
-      `status: ${effectiveStatus}`,
-      `synthetic: ${isSynthetic}`,
-      `receipt_id: ${verifiedReceipt?.receiptId || 'null'}`,
-      'repo: Harness2-RAG-antigravity',
-      `git_revision: ${gitRev}`,
-      `created_at: "${nowIso}"`,
-      `cue: "${expCue.replace(/"/g, '\\"')}"`,
-      `tags: [${tags.join(', ')}]`,
-      'evidence_links:',
-      ...evidenceList.map((e) => `  - "${e}"`),
-      '---',
-      '',
-      `# ${expTitle}`,
-      '',
-      '## 1. What Task or Problem Produced This Lesson?',
-      `- **Task ID**: \`${safeTaskId}\``,
-      `- **Problem**: ${problem || 'Task-level Propose-Probe-Compose refinement.'}`,
-      '',
-      '## 2. Which Repository and Revision Did It Apply To?',
-      '- **Repository**: `Harness2-RAG-antigravity`',
-      `- **Git Revision**: \`${gitRev}\``,
-      `- **Domain**: \`${safeDomain}\``,
-      '',
-      '## 3. What Was Actually Observed?',
-      observed_behavior || 'Behavioral improvement verified across candidate probes.',
-      '',
-      '## 4. Which Evidence Supports the Conclusion?',
-      ...evidenceList.map((e) => `- \`${e}\``),
-      '',
-      '## 5. Is the Conclusion Still Current?',
-      `- **Status**: \`${effectiveStatus}\``,
-      `- **Recorded At**: \`${nowIso}\``,
-      ''
-    ].join('\n');
+    const buildLessonArtifacts = (statusVal, rcptObj) => {
+      const mPayload = adopted_harness
+        ? {
+            ...adopted_harness,
+            status: statusVal,
+            synthetic: isSynthetic,
+            receipt_id: rcptObj?.receiptId || null
+          }
+        : {
+            harness_id: `harness-${safeDomain}-${safeTaskId}`,
+            task_id: safeTaskId,
+            domain: safeDomain,
+            adopted_at: nowIso,
+            git_revision: gitRev,
+            status: statusVal,
+            synthetic: isSynthetic,
+            receipt_id: rcptObj?.receiptId || null
+          };
+      const evList = Array.isArray(supporting_evidence)
+        ? [...supporting_evidence]
+        : [String(supporting_evidence)];
+      if (!evList.includes(relManifestPath)) {
+        evList.unshift(relManifestPath);
+      }
+      if (rcptObj) {
+        const relReceiptPath = `.harness/receipts/${rcptObj.receiptId}.json`;
+        if (!evList.includes(relReceiptPath)) {
+          evList.push(relReceiptPath);
+        }
+      }
+      const mdStr = [
+        '---',
+        `docid: ${docid}`,
+        `title: "${expTitle.replace(/"/g, '\\"')}"`,
+        'collection: experiment-knowledge',
+        `domain: ${safeDomain}`,
+        `task_id: ${safeTaskId}`,
+        `status: ${statusVal}`,
+        `synthetic: ${isSynthetic}`,
+        `receipt_id: ${rcptObj?.receiptId || 'null'}`,
+        'repo: Harness2-RAG-antigravity',
+        `git_revision: ${gitRev}`,
+        `created_at: "${nowIso}"`,
+        `cue: "${expCue.replace(/"/g, '\\"')}"`,
+        `tags: [${tags.join(', ')}]`,
+        'evidence_links:',
+        ...evList.map((e) => `  - "${e}"`),
+        '---',
+        '',
+        `# ${expTitle}`,
+        '',
+        '## 1. What Task or Problem Produced This Lesson?',
+        `- **Task ID**: \`${safeTaskId}\``,
+        `- **Problem**: ${problem || 'Task-level Propose-Probe-Compose refinement.'}`,
+        '',
+        '## 2. Which Repository and Revision Did It Apply To?',
+        '- **Repository**: `Harness2-RAG-antigravity`',
+        `- **Git Revision**: \`${gitRev}\``,
+        `- **Domain**: \`${safeDomain}\``,
+        '',
+        '## 3. What Was Actually Observed?',
+        observed_behavior || 'Behavioral improvement verified across candidate probes.',
+        '',
+        '## 4. Which Evidence Supports the Conclusion?',
+        ...evList.map((e) => `- \`${e}\``),
+        '',
+        '## 5. Is the Conclusion Still Current?',
+        `- **Status**: \`${statusVal}\``,
+        `- **Recorded At**: \`${nowIso}\``,
+        ''
+      ].join('\n');
+      return {
+        manifestStr: JSON.stringify(mPayload, null, 2) + '\n',
+        expMd: mdStr
+      };
+    };
+
+    let built = buildLessonArtifacts(effectiveStatus, verifiedReceipt);
+    if (verifiedReceipt) {
+      const candidateLessonDigest = crypto
+        .createHash('sha256')
+        .update(built.expMd, 'utf8')
+        .digest('hex');
+      const candidateHarnessDigest = crypto
+        .createHash('sha256')
+        .update(built.manifestStr, 'utf8')
+        .digest('hex');
+
+      if (
+        (verifiedReceipt.lessonDigest && verifiedReceipt.lessonDigest !== candidateLessonDigest) ||
+        (verifiedReceipt.harnessDigest && verifiedReceipt.harnessDigest !== candidateHarnessDigest)
+      ) {
+        // Receipt was already sealed to a different lesson/harness payload — reject reuse
+        verifiedReceipt = null;
+        if (effectiveStatus === 'active') {
+          effectiveStatus = 'candidate';
+        }
+        built = buildLessonArtifacts(effectiveStatus, null);
+      } else if (!verifiedReceipt.lessonDigest || !verifiedReceipt.harnessDigest) {
+        verifiedReceipt.lessonDigest = candidateLessonDigest;
+        verifiedReceipt.harnessDigest = verifiedReceipt.harnessDigest || candidateHarnessDigest;
+        verifiedReceipt.signature = this._signReceiptPayload(verifiedReceipt);
+        const receiptFile = path.join(this.receiptsDir, `${verifiedReceipt.receiptId}.json`);
+        this.assertContainedPath(receiptFile, 'receiptFile');
+        const tmpFile = `${receiptFile}.tmp.${process.pid}.${Date.now()}`;
+        fs.writeFileSync(tmpFile, JSON.stringify(verifiedReceipt, null, 2) + '\n', {
+          encoding: 'utf8',
+          mode: 0o600
+        });
+        fs.renameSync(tmpFile, receiptFile);
+      }
+    }
 
     const expFilePath = path.join(taskDir, 'EXPERIENCE.md');
-    fs.writeFileSync(expFilePath, expMd, 'utf8');
+    this.assertContainedPath(expFilePath, 'expFilePath');
+    fs.writeFileSync(manifestPath, built.manifestStr, 'utf8');
+    fs.writeFileSync(expFilePath, built.expMd, 'utf8');
 
     // Update domain INDEX.md and root INDEX.md only when effectiveStatus === 'active' and not synthetic
-    if (effectiveStatus === 'active' && !isSynthetic) {
+    if (effectiveStatus === 'active' && !isSynthetic && verifiedReceipt) {
       const domainIndexPath = path.join(this.harnessDir, 'library', safeDomain, 'INDEX.md');
+      this.assertContainedPath(domainIndexPath, 'domainIndexPath');
       if (!fs.existsSync(domainIndexPath)) {
         fs.writeFileSync(
           domainIndexPath,
@@ -2237,6 +2505,7 @@ export class HarnessKnowledgeEngine {
       }
 
       const rootIndexPath = path.join(this.harnessDir, 'library', 'INDEX.md');
+      this.assertContainedPath(rootIndexPath, 'rootIndexPath');
       if (fs.existsSync(rootIndexPath)) {
         const rootContent = fs.readFileSync(rootIndexPath, 'utf8');
         if (!rootContent.includes(safeTaskId)) {
@@ -2256,6 +2525,7 @@ export class HarnessKnowledgeEngine {
       task_id: safeTaskId,
       domain: safeDomain,
       status: effectiveStatus,
+      downgradedFromActive: status === 'active' && effectiveStatus !== 'active',
       synthetic: isSynthetic,
       receiptId: verifiedReceipt?.receiptId || null,
       experiencePath: relExpPath,
@@ -2314,6 +2584,12 @@ export class HarnessKnowledgeEngine {
       };
     }
 
+    const absExpPath = path.resolve(this.workspaceRoot, expDoc.path);
+    this.assertContainedPath(absExpPath, 'experiencePath');
+    const actualLessonDigest = fs.existsSync(absExpPath)
+      ? crypto.createHash('sha256').update(fs.readFileSync(absExpPath, 'utf8'), 'utf8').digest('hex')
+      : null;
+
     const candidateReceiptId =
       receiptId ||
       receipt_id ||
@@ -2327,7 +2603,9 @@ export class HarnessKnowledgeEngine {
       null;
 
     const receiptCheck = this.verifyEvaluationReceipt(candidateReceiptId, {
-      expectedTaskId: expDoc.task_id || undefined
+      expectedTaskId: expDoc.task_id || undefined,
+      expectedDomain: expDoc.domain || undefined,
+      expectedLessonDigest: actualLessonDigest
     });
 
     if (!receiptCheck.valid) {
@@ -2347,6 +2625,7 @@ export class HarnessKnowledgeEngine {
     const nowIso = new Date().toISOString();
     const adrTitle = title || `${slug}: Promoted Architecture Rule from ${expDoc.task_id || expDoc.docid}`;
     const adrPath = path.join(this.harnessDir, 'knowledge', 'project', `${slug}.md`);
+    this.assertContainedPath(adrPath, 'adrPath');
     const relReceiptPath = `.harness/receipts/${receiptCheck.receiptId}.json`;
 
     const adrMd = [
@@ -2589,6 +2868,40 @@ export class HarnessKnowledgeEngine {
         ? false
         : (options.allowSimulation ?? options.allow_simulation ?? true);
 
+    // Enforce supervisor stop if task has escalated due to repeated no-progress attempts (PR E)
+    const taskStatePath = path.join(this.harnessDir, 'tasks', taskId, 'state.json');
+    if (
+      this._isPathInsideWorkspace(taskStatePath) &&
+      fs.existsSync(taskStatePath) &&
+      options.acknowledgedEscalation !== true &&
+      options.focusedRestart !== true
+    ) {
+      try {
+        const taskState = JSON.parse(fs.readFileSync(taskStatePath, 'utf8'));
+        if (
+          taskState?.shouldStopRetryLoop === true ||
+          taskState?.status === 'escalated_focused_restart' ||
+          taskState?.escalation?.shouldStopRetryLoop === true ||
+          taskState?.escalation?.status === 'escalated_focused_restart'
+        ) {
+          return {
+            ok: false,
+            status: 'escalated_stop',
+            error: 'ESCALATED_NO_PROGRESS_STOP',
+            escalation: taskState.escalation || taskState,
+            passedVerification: false,
+            verificationScore: null,
+            synthetic: false,
+            taskId,
+            domain,
+            recordedLesson: null,
+            adoptedExperience: null,
+            recordedExperience: null,
+          };
+        }
+      } catch {}
+    }
+
     // Snapshot pre-run state of requiredArtifacts before any execution
     const preRunArtifacts = new Map();
     for (const reqFile of requiredArtifacts) {
@@ -2600,10 +2913,11 @@ export class HarnessKnowledgeEngine {
         fs.existsSync(absFile) &&
         fs.statSync(absFile).isFile() &&
         fs.statSync(absFile).size > 0;
-      const sha256 = exists
-        ? crypto.createHash('sha256').update(fs.readFileSync(absFile)).digest('hex')
+      const rawBytes = exists ? fs.readFileSync(absFile) : null;
+      const sha256 = rawBytes
+        ? crypto.createHash('sha256').update(rawBytes).digest('hex')
         : null;
-      preRunArtifacts.set(relStr, { absFile, inside, exists, sha256 });
+      preRunArtifacts.set(relStr, { absFile, inside, exists, sha256, rawBytes });
     }
 
     // 1. Freeze Snapshot Isolation Lock with unique ownerRunId
@@ -2778,8 +3092,133 @@ export class HarnessKnowledgeEngine {
         };
       }
 
+      const runId =
+        options.runId ||
+        options.run_id ||
+        `h2-run-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+      const runsBaseDir = path.join(this.runtimeDir, 'runs', runId);
+      this.assertContainedPath(runsBaseDir, 'runsBaseDir');
+      fs.mkdirSync(runsBaseDir, { recursive: true });
+
+      const candidateDirs = candidates.map((cand) => {
+        const cDir = path.join(runsBaseDir, cand.candidateId);
+        this.assertContainedPath(cDir, 'candidateDir');
+        fs.mkdirSync(cDir, { recursive: true });
+        return cDir;
+      });
+
+      const restoreWorkspaceBaseline = () => {
+        for (const [relStr, pre] of preRunArtifacts.entries()) {
+          if (!pre.inside) continue;
+          if (pre.exists && pre.rawBytes) {
+            fs.mkdirSync(path.dirname(pre.absFile), { recursive: true });
+            fs.writeFileSync(pre.absFile, pre.rawBytes);
+          } else if (!pre.exists && fs.existsSync(pre.absFile)) {
+            try {
+              fs.unlinkSync(pre.absFile);
+            } catch {}
+          }
+        }
+      };
+
+      const stageBaselineIntoCandidateDir = (candDir) => {
+        for (const [relStr, pre] of preRunArtifacts.entries()) {
+          if (!pre.inside || !pre.exists || !pre.rawBytes) continue;
+          const candFile = path.resolve(candDir, relStr);
+          if (this._isPathInsideWorkspace(candFile)) {
+            fs.mkdirSync(path.dirname(candFile), { recursive: true });
+            fs.writeFileSync(candFile, pre.rawBytes);
+          }
+        }
+      };
+
+      const candArtifactStates = candidates.map((cand, idx) => ({
+        candidateId: cand.candidateId,
+        candidateDir: candidateDirs[idx],
+        hashes: {},
+        changes: 0,
+        missing: [],
+      }));
+
+      const captureCandidateArtifacts = (idx) => {
+        const candDir = candidateDirs[idx];
+        const state = candArtifactStates[idx];
+        state.hashes = {};
+        state.changes = 0;
+        state.missing = [];
+
+        for (const reqFile of requiredArtifacts) {
+          const relStr = String(reqFile);
+          const pre = preRunArtifacts.get(relStr);
+          const wsFile = path.resolve(this.workspaceRoot, relStr);
+          const candFile = path.resolve(candDir, relStr);
+
+          const wsExists =
+            this._isPathInsideWorkspace(wsFile) &&
+            fs.existsSync(wsFile) &&
+            fs.statSync(wsFile).isFile() &&
+            fs.statSync(wsFile).size > 0;
+          if (wsExists && executor) {
+            const wsBuf = fs.readFileSync(wsFile);
+            const wsSha = crypto.createHash('sha256').update(wsBuf).digest('hex');
+            if (!pre || !pre.exists || pre.sha256 !== wsSha) {
+              if (this._isPathInsideWorkspace(candFile)) {
+                fs.mkdirSync(path.dirname(candFile), { recursive: true });
+                fs.writeFileSync(candFile, wsBuf);
+              }
+            }
+          }
+
+          const targetFile =
+            this._isPathInsideWorkspace(candFile) &&
+            fs.existsSync(candFile) &&
+            fs.statSync(candFile).isFile() &&
+            fs.statSync(candFile).size > 0
+              ? candFile
+              : wsExists
+                ? wsFile
+                : null;
+
+          if (!targetFile) {
+            state.missing.push(relStr);
+          } else {
+            const targetBuf = fs.readFileSync(targetFile);
+            if (targetFile !== candFile && this._isPathInsideWorkspace(candFile)) {
+              fs.mkdirSync(path.dirname(candFile), { recursive: true });
+              fs.writeFileSync(candFile, targetBuf);
+            }
+            const postSha256 = crypto.createHash('sha256').update(targetBuf).digest('hex');
+            state.hashes[relStr.replace(/\\/g, '/')] = postSha256;
+            if (!pre || !pre.exists || pre.sha256 !== postSha256) {
+              state.changes++;
+            }
+          }
+        }
+      };
+
+      const materializeCandidateArtifactsToWorkspace = (idx) => {
+        const candDir = candidateDirs[idx];
+        for (const reqFile of requiredArtifacts) {
+          const relStr = String(reqFile);
+          const candFile = path.resolve(candDir, relStr);
+          const wsFile = path.resolve(this.workspaceRoot, relStr);
+          if (
+            this._isPathInsideWorkspace(candFile) &&
+            this._isPathInsideWorkspace(wsFile) &&
+            fs.existsSync(candFile) &&
+            fs.statSync(candFile).isFile()
+          ) {
+            fs.mkdirSync(path.dirname(wsFile), { recursive: true });
+            fs.writeFileSync(wsFile, fs.readFileSync(candFile));
+          }
+        }
+      };
+
       const probeContext = {
         workspaceRoot: this.workspaceRoot,
+        rootWorkspaceRoot: this.workspaceRoot,
+        runsBaseDir,
+        runId,
         taskId,
         domain,
         problem,
@@ -2789,18 +3228,36 @@ export class HarnessKnowledgeEngine {
       };
 
       const runExecutorIfAny = () => {
-        if (!executor) return null;
+        if (!executor) {
+          for (let idx = 0; idx < candidates.length; idx++) {
+            stageBaselineIntoCandidateDir(candidateDirs[idx]);
+            captureCandidateArtifacts(idx);
+          }
+          return null;
+        }
         const execResults = [];
         const stepExec = (idx) => {
           if (idx >= candidates.length) return execResults;
           const cand = candidates[idx];
-          const callArg = {
+          const candDir = candidateDirs[idx];
+          restoreWorkspaceBaseline();
+          stageBaselineIntoCandidateDir(candDir);
+          const candContext = {
             ...probeContext,
-            ...cand,
-            candidate: cand,
-            candidateIndex: idx,
+            workspaceRoot: candDir,
+            candidateDir: candDir,
+            rootWorkspaceRoot: this.workspaceRoot,
           };
-          return chainMaybeAsync(executor(callArg, probeContext), (out) => {
+          const callArg = {
+            ...candContext,
+            ...cand,
+            candidate: { ...cand, id: cand.candidateId, candidateDir: candDir },
+            candidateIndex: idx,
+            candidateDir: candDir,
+          };
+          return chainMaybeAsync(executor(callArg, candContext), (out) => {
+            captureCandidateArtifacts(idx);
+            restoreWorkspaceBaseline();
             execResults.push(out);
             return stepExec(idx + 1);
           });
@@ -2809,37 +3266,21 @@ export class HarnessKnowledgeEngine {
       };
 
       return chainMaybeAsync(runExecutorIfAny(), (execResult) => {
-        // Check post-executor state of requiredArtifacts
-        const verifiedArtifactHashes = {};
-        let artifactChanges = 0;
-        if (requiredArtifacts.length > 0) {
-          const missingArtifacts = [];
-          for (const reqFile of requiredArtifacts) {
-            const relStr = String(reqFile);
-            const absFile = path.resolve(this.workspaceRoot, relStr);
-            const existsAndNonEmpty =
-              this._isPathInsideWorkspace(absFile) &&
-              fs.existsSync(absFile) &&
-              fs.statSync(absFile).isFile() &&
-              fs.statSync(absFile).size > 0;
-            if (!existsAndNonEmpty) {
-              missingArtifacts.push(relStr);
-            } else {
-              const postSha256 = crypto
-                .createHash('sha256')
-                .update(fs.readFileSync(absFile))
-                .digest('hex');
-              verifiedArtifactHashes[relStr.replace(/\\/g, '/')] = postSha256;
-              const pre = preRunArtifacts.get(relStr);
-              if (!pre || !pre.exists || pre.sha256 !== postSha256) {
-                artifactChanges++;
-              }
-            }
-          }
+        const maxArtifactChanges = candArtifactStates.reduce(
+          (maxC, st) => Math.max(maxC, st.changes),
+          0
+        );
+        const anyCandidateHasAllArtifacts =
+          requiredArtifacts.length === 0 ||
+          candArtifactStates.some((st) => st.missing.length === 0);
 
-          if (missingArtifacts.length > 0) {
-            const failedTrajectories = candidates.map((cand) => ({
+        // Check post-executor state of requiredArtifacts
+        if (requiredArtifacts.length > 0) {
+          if (!anyCandidateHasAllArtifacts) {
+            const missingArtifacts = candArtifactStates[0]?.missing || requiredArtifacts.map(String);
+            const failedTrajectories = candidates.map((cand, idx) => ({
               candidateId: cand.candidateId,
+              candidateDir: candidateDirs[idx],
               front: cand.front,
               frontLabel: cand.frontLabel,
               modelTier: cand.modelTier,
@@ -2870,7 +3311,7 @@ export class HarnessKnowledgeEngine {
               providerCalls: 0,
               artifactChanges: 0,
               executionMode: 'artifact-verification',
-              runId: `h2-run-${Date.now()}`,
+              runId,
               completedAt: new Date().toISOString(),
               taskId,
               domain,
@@ -2907,7 +3348,7 @@ export class HarnessKnowledgeEngine {
           }
 
           // Pre-existing unchanged files on disk without an executor or evaluator do NOT count as execution
-          if (artifactChanges === 0 && !executor && !evaluator) {
+          if (maxArtifactChanges === 0 && !executor && !evaluator) {
             return {
               ok: false,
               status: 'failed',
@@ -2919,7 +3360,7 @@ export class HarnessKnowledgeEngine {
               providerCalls: 0,
               artifactChanges: 0,
               executionMode: 'artifact-verification',
-              runId: `h2-run-${Date.now()}`,
+              runId,
               completedAt: new Date().toISOString(),
               taskId,
               domain,
@@ -2962,14 +3403,27 @@ export class HarnessKnowledgeEngine {
           const step = (idx) => {
             if (idx >= candidates.length) return results;
             const cand = candidates[idx];
-            const callArg = {
-              ... probeContext,
-              ...cand,
-              candidate: cand,
-              candidateIndex: idx,
-              executorResult: execResult,
+            const candDir = candidateDirs[idx];
+            restoreWorkspaceBaseline();
+            materializeCandidateArtifactsToWorkspace(idx);
+            const candContext = {
+              ...probeContext,
+              workspaceRoot: candDir,
+              candidateDir: candDir,
+              rootWorkspaceRoot: this.workspaceRoot,
             };
-            return chainMaybeAsync(evaluator(callArg, probeContext), (rawOut) => {
+            const candExecOut = Array.isArray(execResult) ? execResult[idx] : execResult;
+            const callArg = {
+              ...candContext,
+              ...cand,
+              candidate: { ...cand, id: cand.candidateId, candidateDir: candDir },
+              candidateIndex: idx,
+              candidateDir: candDir,
+              executorResult: candExecOut,
+              allExecutorResults: execResult,
+            };
+            return chainMaybeAsync(evaluator(callArg, candContext), (rawOut) => {
+              restoreWorkspaceBaseline();
               results.push(this._parseEvaluatorOutput(rawOut, passThreshold));
               return step(idx + 1);
             });
@@ -2978,7 +3432,67 @@ export class HarnessKnowledgeEngine {
         };
 
         return chainMaybeAsync(evaluateCandidatesMaybeAsync(), (evalResults) => {
-          const isSimulation = !evaluator && !(executor && artifactChanges > 0);
+          // A file change without an independent evaluator is delivered/implemented, NEVER verified!
+          if (!evaluator && executor && maxArtifactChanges > 0) {
+            const bestDeliveredIdx = candArtifactStates.findIndex(
+              (st) => st.missing.length === 0 && st.changes > 0
+            );
+            if (bestDeliveredIdx >= 0) {
+              materializeCandidateArtifactsToWorkspace(bestDeliveredIdx);
+            }
+            if (allowSimulation === false) {
+              return {
+                ok: false,
+                status: 'delivered_unverified',
+                delivered: true,
+                error: 'INDEPENDENT_EVALUATOR_REQUIRED_FOR_VERIFICATION',
+                passedVerification: false,
+                verificationScore: null,
+                synthetic: false,
+                usedTokens: null,
+                providerCalls: 0,
+                artifactChanges: maxArtifactChanges,
+                executionMode: 'delivered-unverified',
+                receiptId: null,
+                evaluationReceipt: null,
+                runId,
+                completedAt: new Date().toISOString(),
+                taskId,
+                domain,
+                problem,
+                k,
+                mode,
+                snapshotId,
+                reasoningProfile: profile,
+                candidates,
+                proposals: candidates,
+                probeTrajectories: [],
+                trajectories: [],
+                winnerCandidateId: null,
+                winnerScore: null,
+                winner: {
+                  candidateId: null,
+                  score: null,
+                  verificationScore: null,
+                  passedVerification: false,
+                  totalTokens: null,
+                },
+                tokenEfficiency: {
+                  totalActualTokens: null,
+                  totalUnoptimizedTokens: null,
+                  totalTokensSaved: 0,
+                  totalTokensSavedPct: 0,
+                  earlyStopped: false,
+                },
+                composedHarness: null,
+                recordedLesson: null,
+                adoptedExperience: null,
+                recordedExperience: null,
+              };
+            }
+          }
+
+          const isSimulation = !evaluator;
           if (isSimulation && allowSimulation === false) {
             return {
               ok: false,
@@ -2989,9 +3503,9 @@ export class HarnessKnowledgeEngine {
               synthetic: false,
               usedTokens: null,
               providerCalls: 0,
-              artifactChanges,
+              artifactChanges: maxArtifactChanges,
               executionMode: 'verified-required',
-              runId: `h2-run-${Date.now()}`,
+              runId,
               completedAt: new Date().toISOString(),
               taskId,
               domain,
@@ -3057,9 +3571,12 @@ export class HarnessKnowledgeEngine {
 
           for (let i = 0; i < candidates.length; i++) {
             const cand = candidates[i];
+            const candState = candArtifactStates[i];
+            const candExecOut = Array.isArray(execResult) ? execResult[i] : null;
             if (mode === 'sequential' && profile.earlyStopOnFirstPass && earlyStopTriggered) {
               probeTrajectories.push({
                 candidateId: cand.candidateId,
+                candidateDir: candidateDirs[i],
                 front: cand.front,
                 frontLabel: cand.frontLabel,
                 modelTier: cand.modelTier,
@@ -3085,12 +3602,15 @@ export class HarnessKnowledgeEngine {
             let score;
             let passed;
             if (candEval) {
-              score = candEval.score;
-              passed = candEval.passed;
-              totalProviderCalls += candEval.providerCalls || 0;
-            } else if (!isSimulation && artifactChanges > 0) {
-              score = 1.0;
-              passed = true;
+              if (requiredArtifacts.length > 0 && candState.missing.length > 0) {
+                score = 0;
+                passed = false;
+              } else {
+                score = candEval.score;
+                passed = candEval.passed;
+              }
+              totalProviderCalls +=
+                (candEval.providerCalls || 0) + Number(candExecOut?.providerCalls || 0);
             } else {
               const cueBonus = cand.front !== 'invariant' && retrievedCues.length > 0 ? 0.14 : 0.06;
               const invariantBonus = cand.front === 'invariant' || cand.front === 'hybrid' ? 0.12 : 0.09;
@@ -3099,36 +3619,63 @@ export class HarnessKnowledgeEngine {
             }
 
             const stepsUsed =
-              cand.front === 'domain-specific' || cand.front === 'hybrid'
-                ? Math.max(3, Math.min(cand.maxSteps, 4))
-                : Math.max(4, Math.min(cand.maxSteps, 5));
+              typeof candExecOut?.stepsExecuted === 'number'
+                ? candExecOut.stepsExecuted
+                : cand.front === 'domain-specific' || cand.front === 'hybrid'
+                  ? Math.max(3, Math.min(cand.maxSteps, 4))
+                  : Math.max(4, Math.min(cand.maxSteps, 5));
 
-            const promptTok =
-              profile.reasoningDepth === 'eco'
-                ? 1_950 + i * 140
-                : profile.reasoningDepth === 'balanced'
-                  ? 3_100 + i * 210
-                  : 5_400 + i * 320;
-            const thoughtsTok = Math.min(
-              cand.thinkingBudgetTokens,
-              profile.reasoningDepth === 'eco'
-                ? 780 + i * 60
-                : profile.reasoningDepth === 'balanced'
-                  ? 1_480 + i * 90
-                  : 4_200 + i * 250
-            );
-            const outputTok =
-              profile.reasoningDepth === 'eco'
-                ? 520
-                : profile.reasoningDepth === 'balanced'
-                  ? 740
-                  : 1_180;
-            const totalTok =
+            const observedCandTokens =
               candEval && typeof candEval.usedTokens === 'number'
                 ? candEval.usedTokens
-                : promptTok + thoughtsTok + outputTok;
-            const savedTok = Math.max(0, unoptimizedPerCandidateTokens - totalTok);
-            const savedPct = Number(((savedTok / unoptimizedPerCandidateTokens) * 100).toFixed(1));
+                : typeof candExecOut?.observedTokens === 'number'
+                  ? candExecOut.observedTokens
+                  : typeof candExecOut?.usedTokens === 'number'
+                    ? candExecOut.usedTokens
+                    : typeof candExecOut?.totalTokens === 'number'
+                      ? candExecOut.totalTokens
+                      : null;
+
+            let promptTok = null;
+            let thoughtsTok = null;
+            let outputTok = null;
+            let totalTok = null;
+            let savedTok = 0;
+            let savedPct = 0;
+
+            if (isSimulation) {
+              promptTok =
+                profile.reasoningDepth === 'eco'
+                  ? 1_950 + i * 140
+                  : profile.reasoningDepth === 'balanced'
+                    ? 3_100 + i * 210
+                    : 5_400 + i * 320;
+              thoughtsTok = Math.min(
+                cand.thinkingBudgetTokens,
+                profile.reasoningDepth === 'eco'
+                  ? 780 + i * 60
+                  : profile.reasoningDepth === 'balanced'
+                    ? 1_480 + i * 90
+                    : 4_200 + i * 250
+              );
+              outputTok =
+                profile.reasoningDepth === 'eco'
+                  ? 520
+                  : profile.reasoningDepth === 'balanced'
+                    ? 740
+                    : 1_180;
+              totalTok =
+                observedCandTokens !== null ? observedCandTokens : promptTok + thoughtsTok + outputTok;
+              savedTok = Math.max(0, unoptimizedPerCandidateTokens - totalTok);
+              savedPct = Number(((savedTok / unoptimizedPerCandidateTokens) * 100).toFixed(1));
+            } else if (observedCandTokens !== null) {
+              promptTok = candExecOut?.promptTokens ?? null;
+              thoughtsTok = candExecOut?.thoughtsTokens ?? null;
+              outputTok = candExecOut?.outputTokens ?? null;
+              totalTok = observedCandTokens;
+              savedTok = Math.max(0, unoptimizedPerCandidateTokens - totalTok);
+              savedPct = Number(((savedTok / unoptimizedPerCandidateTokens) * 100).toFixed(1));
+            }
 
             if (passed && score >= 0.90) {
               earlyStopTriggered = true;
@@ -3136,6 +3683,8 @@ export class HarnessKnowledgeEngine {
 
             probeTrajectories.push({
               candidateId: cand.candidateId,
+              candidateDir: candidateDirs[i],
+              candidateIndex: i,
               front: cand.front,
               frontLabel: cand.frontLabel,
               modelTier: cand.modelTier,
@@ -3154,7 +3703,10 @@ export class HarnessKnowledgeEngine {
               synthetic: isSimulation,
               observedSummary:
                 `[${cand.frontLabel}] Probed in Workspace:${cand.workspaceMode} (model=${cand.modelTier}, thinkingCap=${cand.thinkingBudgetTokens}) under snapshot '${snapshotId}'. ` +
-                `Retrieved ${expHits.results.length} experience cues & ${projHits.results.length} ADRs; verification=${passed ? 'passed' : 'failed'} (score=${score}) in ${stepsUsed} steps using ${totalTok.toLocaleString()} tokens (${savedPct}% saved vs unbounded baseline).`,
+                `Retrieved ${expHits.results.length} experience cues & ${projHits.results.length} ADRs; verification=${passed ? 'passed' : 'failed'} (score=${score}) in ${stepsUsed} steps` +
+                (totalTok !== null
+                  ? ` using ${totalTok.toLocaleString()} tokens (${savedPct}% saved vs unbounded baseline).`
+                  : '.'),
               evidencePaths: [
                 ...requiredArtifacts.map((a) => String(a)),
                 ...(expHits.results || []).slice(0, 2).map((r) => r.path),
@@ -3172,12 +3724,13 @@ export class HarnessKnowledgeEngine {
             if (b.verificationScore !== a.verificationScore) {
               return b.verificationScore - a.verificationScore;
             }
-            return a.totalTokens - b.totalTokens;
+            return (a.totalTokens ?? Number.MAX_SAFE_INTEGER) - (b.totalTokens ?? Number.MAX_SAFE_INTEGER);
           });
           const winner = ranked[0] || probeTrajectories[0];
 
           // If evaluator/executor ran and no candidate passed verification, fail closed without recording
           if (!winner || !winner.passedVerification) {
+            restoreWorkspaceBaseline();
             const firstErr =
               (Array.isArray(evalResults) && evalResults.find((r) => r.error)?.error) ||
               'EVALUATION_FAILED';
@@ -3190,11 +3743,11 @@ export class HarnessKnowledgeEngine {
               passedVerification: false,
               verificationScore: bestScore,
               synthetic: isSimulation,
-              usedTokens: null,
+              usedTokens: winner ? winner.totalTokens : null,
               providerCalls: totalProviderCalls,
-              artifactChanges,
+              artifactChanges: maxArtifactChanges,
               executionMode: isSimulation ? 'simulation' : 'evaluated',
-              runId: `h2-run-${Date.now()}`,
+              runId,
               completedAt: new Date().toISOString(),
               taskId,
               domain,
@@ -3214,10 +3767,10 @@ export class HarnessKnowledgeEngine {
                 score: bestScore,
                 verificationScore: bestScore,
                 passedVerification: false,
-                totalTokens: winner ? winner.totalTokens : 0,
+                totalTokens: winner ? winner.totalTokens : null,
               },
               tokenEfficiency: {
-                totalActualTokens: 0,
+                totalActualTokens: null,
                 totalUnoptimizedTokens: null,
                 totalTokensSaved: 0,
                 totalTokensSavedPct: 0,
@@ -3230,12 +3783,34 @@ export class HarnessKnowledgeEngine {
             };
           }
 
-          const totalActualTokens = probeTrajectories.reduce((s, p) => s + p.totalTokens, 0);
-          const totalUnoptimizedTokens = unoptimizedPerCandidateTokens * k;
-          const totalTokensSaved = Math.max(0, totalUnoptimizedTokens - totalActualTokens);
-          const totalTokensSavedPct = Number(
-            ((totalTokensSaved / Math.max(1, totalUnoptimizedTokens)) * 100).toFixed(1)
-          );
+          const winnerIdx =
+            typeof winner.candidateIndex === 'number'
+              ? winner.candidateIndex
+              : candidates.findIndex((c) => c.candidateId === winner.candidateId);
+          if (winnerIdx >= 0 && requiredArtifacts.length > 0) {
+            materializeCandidateArtifactsToWorkspace(winnerIdx);
+          }
+          const winnerArtifactState =
+            (winnerIdx >= 0 ? candArtifactStates[winnerIdx] : candArtifactStates[0]) || {
+              hashes: {},
+              changes: 0,
+            };
+          const verifiedArtifactHashes = winnerArtifactState.hashes || {};
+          const artifactChanges = winnerArtifactState.changes || maxArtifactChanges;
+
+          const anyObservedTokens = probeTrajectories.some((p) => typeof p.totalTokens === 'number');
+          const totalActualTokens = anyObservedTokens
+            ? probeTrajectories.reduce((s, p) => s + (p.totalTokens || 0), 0)
+            : null;
+          const totalUnoptimizedTokens = anyObservedTokens ? unoptimizedPerCandidateTokens * k : null;
+          const totalTokensSaved =
+            totalActualTokens !== null && totalUnoptimizedTokens !== null
+              ? Math.max(0, totalUnoptimizedTokens - totalActualTokens)
+              : 0;
+          const totalTokensSavedPct =
+            totalActualTokens !== null && totalUnoptimizedTokens !== null
+              ? Number(((totalTokensSaved / Math.max(1, totalUnoptimizedTokens)) * 100).toFixed(1))
+              : 0;
 
           let createdReceipt = null;
           if (!isSimulation && winner.passedVerification) {
@@ -3317,8 +3892,10 @@ export class HarnessKnowledgeEngine {
               problem,
               observed_behavior:
                 `Contrastive evaluation across K=${k} candidates (${mode} mode) under frozen snapshot '${snapshotId}': ` +
-                `${winner.candidateId} (${winner.frontLabel}) beat the unbounded baseline (score ${winner.verificationScore} vs ${baselineTrajectory.verificationScore}, 0 tool errors vs 1) ` +
-                `while consuming only ${totalActualTokens.toLocaleString()} total probe tokens vs ${totalUnoptimizedTokens.toLocaleString()} unbounded tokens (${totalTokensSaved.toLocaleString()} tokens saved, -${totalTokensSavedPct}%).`,
+                `${winner.candidateId} (${winner.frontLabel}) beat the unbounded baseline (score ${winner.verificationScore} vs ${baselineTrajectory.verificationScore}, 0 tool errors vs 1)` +
+                (totalActualTokens !== null && totalUnoptimizedTokens !== null
+                  ? ` while consuming only ${totalActualTokens.toLocaleString()} total probe tokens vs ${totalUnoptimizedTokens.toLocaleString()} unbounded tokens (${totalTokensSaved.toLocaleString()} tokens saved, -${totalTokensSavedPct}%).`
+                  : '.'),
               supporting_evidence: [
                 ...(winner.evidencePaths || []),
                 'adapters/harness2_antigravity_executor.py',
@@ -3338,12 +3915,13 @@ export class HarnessKnowledgeEngine {
             executionMode: isSimulation ? 'simulation' : 'verified',
             passedVerification: winner.passedVerification,
             verificationScore: winner.verificationScore,
+            usedTokens: totalActualTokens,
             receiptId: createdReceipt?.receiptId || null,
             evaluationReceipt: createdReceipt || null,
             evaluatorReceipt: createdReceipt || undefined,
             artifactChanges,
             providerCalls: totalProviderCalls,
-            runId: `h2-run-${Date.now()}`,
+            runId,
             completedAt: new Date().toISOString(),
             taskId,
             domain,
@@ -3367,6 +3945,7 @@ export class HarnessKnowledgeEngine {
             winnerScore: winner.verificationScore,
             winner: {
               candidateId: winner.candidateId,
+              candidateDir: winner.candidateDir,
               score: winner.verificationScore,
               verificationScore: winner.verificationScore,
               passedVerification: winner.passedVerification,

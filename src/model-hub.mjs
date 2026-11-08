@@ -1779,8 +1779,11 @@ export function isDemoOrSimulationMode(options = {}, cfg = null) {
   if (
     options.allowSimulation === true ||
     options.allow_simulation === true ||
+    options.simulate === true ||
     options.executionMode === 'demo' ||
     options.execution_mode === 'demo' ||
+    options.executionMode === 'simulation' ||
+    options.execution_mode === 'simulation' ||
     options.demoMode === true ||
     options.demo_mode === true ||
     options.strictExecution === false ||
@@ -1817,7 +1820,33 @@ export function isExplicitStrictMode(options = {}, cfg = null) {
 export function isStrictExecution(options = {}, cfg = null) {
   if (isExplicitStrictMode(options, cfg)) return true;
   if (isDemoOrSimulationMode(options, cfg)) return false;
-  return false;
+  return true;
+}
+
+export function isTaskEscalatedStopped(workspaceRoot, taskId) {
+  if (!taskId || typeof taskId !== 'string') return false;
+  const safeId = taskId.trim();
+  if (!safeId || safeId.includes('..') || safeId.includes('/') || safeId.includes('\\')) {
+    return false;
+  }
+  try {
+    const stateFile = path.join(
+      path.resolve(workspaceRoot || process.cwd()),
+      '.harness',
+      'tasks',
+      safeId,
+      'state.json'
+    );
+    if (!fs.existsSync(stateFile)) return false;
+    const stateData = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    return Boolean(
+      stateData &&
+        (stateData.shouldStopRetryLoop === true ||
+          stateData.status === 'escalated_focused_restart')
+    );
+  } catch {
+    return false;
+  }
 }
 
 export const resolveStrictMode = isStrictExecution;
@@ -1882,13 +1911,25 @@ export function saveMessageBus(workspaceRoot, bus) {
  * durable idempotency, and honest delivery state transitions (F04).
  */
 export async function injectOrConveySwarmMessage(workspaceRoot, input = {}) {
+  const taskIdForStop = input.taskId || input.task_id || null;
+  if (taskIdForStop && isTaskEscalatedStopped(workspaceRoot, taskIdForStop)) {
+    return {
+      ok: false,
+      status: 'escalated_focused_restart',
+      error: 'ESCALATED_NO_PROGRESS_STOP',
+      taskId: taskIdForStop,
+      shouldStopRetryLoop: true,
+    };
+  }
+
   const cfg = loadHubConfig(workspaceRoot);
   const lockTimeoutMs = Number(input.lockTimeoutMs || 5000);
 
   const fromAgent = input.fromAgent || input.from_agent || 'main-orchestrator';
   const toAgent = input.toAgent || input.to_agent || 'harness-proposer';
   const fromModel = input.fromModel || input.from_model || cfg.activeModelId || 'deepseek-v4-pro';
-  const explicitToModel = input.toModel ?? input.to_model;
+  const explicitToModel =
+    input.toModel ?? input.to_model ?? input.targetModelId ?? input.target_model_id;
   const matchedExplicitToModel =
     explicitToModel !== undefined && explicitToModel !== null && String(explicitToModel).trim() !== ''
       ? findModelInCatalog(explicitToModel)
@@ -1922,63 +1963,18 @@ export async function injectOrConveySwarmMessage(workspaceRoot, input = {}) {
   const msgId =
     requestedId || `msg-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
 
-  // 1. Check durable idempotency under exclusive message bus lock BEFORE dispatching any model call
-  const idempotencyCheck = withMessageBusLock(
-    workspaceRoot,
-    () => {
-      const bus = loadMessageBus(workspaceRoot);
-      if (requestedId) {
-        const existing = bus.messages.find((m) => m && m.id === requestedId);
-        if (existing) {
-          return {
-            duplicate: true,
-            ok: existing.status !== 'DELIVERY_FAILED',
-            idempotentDuplicate: true,
-            status: existing.status,
-            ...(existing.error ? { error: existing.error } : {}),
-            message: existing,
-            busRevision: bus.revision,
-          };
-        }
-        if (Array.isArray(bus.consumedIds) && bus.consumedIds.includes(requestedId)) {
-          const tombstoned = {
-            id: requestedId,
-            fromAgent,
-            toAgent,
-            fromModel,
-            toModel,
-            direction: messageType,
-            priority,
-            reasoningDepth,
-            content,
-            workspaceRoot: path.resolve(workspaceRoot || process.cwd()),
-            status: 'DELIVERED',
-            dispatchState: 'recipient_acknowledged',
-            consumed: true,
-            deliveries: {
-              [toAgent]: { state: 'consumed', ackedAt: new Date().toISOString() },
-            },
-            pendingForPreInvocation: false,
-          };
-          return {
-            duplicate: true,
-            ok: true,
-            idempotentDuplicate: true,
-            status: 'DELIVERED',
-            message: tombstoned,
-            busRevision: bus.revision,
-          };
-        }
-      }
-      return { duplicate: false, busRevision: bus.revision };
-    },
-    lockTimeoutMs
-  );
+  const shouldExecuteModel =
+    input.executeTargetModel !== false &&
+    input.executeModelCall !== false &&
+    toAgent !== 'main-orchestrator' &&
+    toAgent !== 'all';
 
-  if (idempotencyCheck.duplicate) {
-    const { duplicate, ...dupResponse } = idempotencyCheck;
-    return dupResponse;
-  }
+  // Enforce provider enablement even when executeTargetModel is false if a specific provider model was targeted
+  const targetProvider = matchedExplicitToModel?.provider || resolvedToModel?.provider;
+  const targetProviderDisabled =
+    toAgent !== 'all' &&
+    ((targetProvider === 'deepseek-official' && cfg.providers?.deepseek?.enabled === false) ||
+      (targetProvider === 'opencode-go' && cfg.providers?.opencodeGo?.enabled === false));
 
   const nowIso = new Date().toISOString();
   const entry = {
@@ -1994,101 +1990,23 @@ export async function injectOrConveySwarmMessage(workspaceRoot, input = {}) {
     workspaceRoot: path.resolve(workspaceRoot || process.cwd()),
     runId: input.runId || input.run_id || null,
     candidateId: input.candidateId || input.candidate_id || null,
-    status: 'QUEUED',
-    dispatchState: 'accepted_queued',
+    status: shouldExecuteModel ? 'IN_FLIGHT' : 'QUEUED',
+    dispatchState: shouldExecuteModel ? 'in_flight' : 'accepted_queued',
     executorCompleted: false,
     consumed: false,
     deliveries: {},
-    pendingForPreInvocation: true,
+    pendingForPreInvocation: !shouldExecuteModel,
     createdAt: nowIso,
     deliveredAt: null,
     replySummary: null,
   };
 
-  // Enforce provider enablement even when executeTargetModel is false if a specific provider model was targeted
-  const targetProvider = matchedExplicitToModel?.provider || resolvedToModel?.provider;
-  const targetProviderDisabled =
-    toAgent !== 'all' &&
-    ((targetProvider === 'deepseek-official' && cfg.providers?.deepseek?.enabled === false) ||
-      (targetProvider === 'opencode-go' && cfg.providers?.opencodeGo?.enabled === false));
-
-  if (input.executeTargetModel !== false && toAgent !== 'main-orchestrator' && toAgent !== 'all') {
-    const modelReply = await invokeUnifiedModel(workspaceRoot, {
-      modelId: toModel,
-      reasoningDepth,
-      systemPrompt: `You are ${toAgent} running on model ${toModel} (reasoningDepth=${reasoningDepth}) inside Gravity Well Harness. Receive the ${messageType} from ${fromAgent} (${fromModel}) and respond with a concise, high-signal action report or peer critique.`,
-      prompt: content,
-      strictExecution: input.strictExecution ?? input.strict_execution,
-      allowSimulation: input.allowSimulation ?? input.allow_simulation,
-      executionMode: input.executionMode ?? input.execution_mode,
-      demoMode: input.demoMode ?? input.demo_mode,
-      timeoutMs: input.timeoutMs ?? input.timeout_ms,
-      endpoint: input.endpoint,
-      baseUrl: input.baseUrl ?? input.base_url,
-    });
-
-    if (!modelReply || modelReply.ok !== true) {
-      entry.status = 'DELIVERY_FAILED';
-      entry.dispatchState = 'delivery_failed';
-      entry.executorCompleted = false;
-      entry.error = modelReply?.error || 'Target model execution failed';
-      entry.failureStatus = modelReply?.status || 'failed';
-      entry.deliveredAt = null;
-      entry.pendingForPreInvocation = false;
-      entry.replySummary = null;
-      entry.reasoningPreview = null;
-      entry.providerUsed = modelReply?.provider || targetProvider || 'unknown';
-      entry.executionMode = modelReply?.mode || 'failed';
-
-      const failedSave = withMessageBusLock(
-        workspaceRoot,
-        () => {
-          const bus = loadMessageBus(workspaceRoot);
-          const existing = bus.messages.find((m) => m && m.id === entry.id);
-          if (existing) {
-            return { existing, busRevision: bus.revision };
-          }
-          bus.messages.unshift(entry);
-          bus.revision = (bus.revision || 1) + 1;
-          const saved = saveMessageBus(workspaceRoot, bus);
-          return { existing: null, busRevision: saved.revision };
-        },
-        lockTimeoutMs
-      );
-
-      if (failedSave.existing) {
-        return {
-          ok: failedSave.existing.status !== 'DELIVERY_FAILED',
-          idempotentDuplicate: true,
-          status: failedSave.existing.status,
-          ...(failedSave.existing.error ? { error: failedSave.existing.error } : {}),
-          message: failedSave.existing,
-          busRevision: failedSave.busRevision,
-        };
-      }
-
-      return {
-        ok: false,
-        status: modelReply?.status || 'delivery_failed',
-        error: entry.error,
-        message: entry,
-        busRevision: failedSave.busRevision,
-      };
-    }
-
-    entry.status = 'DELIVERED';
-    entry.dispatchState = 'executor_completed';
-    entry.executorCompleted = true;
-    entry.deliveredAt = new Date().toISOString();
-    entry.replySummary = modelReply.content?.slice(0, 360) || '';
-    entry.reasoningPreview = modelReply.reasoningContent?.slice(0, 280) || '';
-    entry.providerUsed = modelReply.provider;
-    entry.executionMode = modelReply.mode;
-  } else if (
+  if (
     targetProviderDisabled &&
-    explicitToModel !== undefined &&
-    explicitToModel !== null &&
-    String(explicitToModel).trim() !== ''
+    (shouldExecuteModel ||
+      (explicitToModel !== undefined &&
+        explicitToModel !== null &&
+        String(explicitToModel).trim() !== ''))
   ) {
     entry.status = 'DELIVERY_FAILED';
     entry.dispatchState = 'delivery_failed';
@@ -2123,46 +2041,164 @@ export async function injectOrConveySwarmMessage(workspaceRoot, input = {}) {
     };
   }
 
-  const savedResult = withMessageBusLock(
+  // 1. Atomically check durable idempotency AND reserve the message ID on the bus BEFORE dispatching any model call
+  const reservation = withMessageBusLock(
     workspaceRoot,
     () => {
       const bus = loadMessageBus(workspaceRoot);
-      const existing = bus.messages.find((m) => m && m.id === entry.id);
+      const existing = bus.messages.find((m) => m && m.id === msgId);
       if (existing) {
         return {
           duplicate: true,
-          existing,
+          ok: existing.status !== 'DELIVERY_FAILED',
+          idempotentDuplicate: true,
+          status: existing.status,
+          ...(existing.error ? { error: existing.error } : {}),
+          message: existing,
+          busRevision: bus.revision,
+        };
+      }
+      if (requestedId && Array.isArray(bus.consumedIds) && bus.consumedIds.includes(requestedId)) {
+        const tombstoned = {
+          id: requestedId,
+          fromAgent,
+          toAgent,
+          fromModel,
+          toModel,
+          direction: messageType,
+          priority,
+          reasoningDepth,
+          content,
+          workspaceRoot: path.resolve(workspaceRoot || process.cwd()),
+          status: 'DELIVERED',
+          dispatchState: 'recipient_acknowledged',
+          consumed: true,
+          deliveries: {
+            [toAgent]: { state: 'consumed', ackedAt: new Date().toISOString() },
+          },
+          pendingForPreInvocation: false,
+        };
+        return {
+          duplicate: true,
+          ok: true,
+          idempotentDuplicate: true,
+          status: 'DELIVERED',
+          message: tombstoned,
           busRevision: bus.revision,
         };
       }
       bus.messages.unshift(entry);
       bus.revision = (bus.revision || 1) + 1;
       const saved = saveMessageBus(workspaceRoot, bus);
-      return {
-        duplicate: false,
-        existing: entry,
-        busRevision: saved.revision,
-      };
+      return { duplicate: false, busRevision: saved.revision };
     },
     lockTimeoutMs
   );
 
-  if (savedResult.duplicate) {
+  if (reservation.duplicate) {
+    const { duplicate, ...dupResponse } = reservation;
+    return dupResponse;
+  }
+
+  if (!shouldExecuteModel) {
     return {
-      ok: savedResult.existing.status !== 'DELIVERY_FAILED',
-      idempotentDuplicate: true,
-      status: savedResult.existing.status,
-      ...(savedResult.existing.error ? { error: savedResult.existing.error } : {}),
-      message: savedResult.existing,
-      busRevision: savedResult.busRevision,
+      ok: true,
+      status: entry.status,
+      message: entry,
+      busRevision: reservation.busRevision,
     };
   }
+
+  // 2. Execute target model outside the file lock (reservation prevents duplicate concurrent execution)
+  const modelReply = await invokeUnifiedModel(workspaceRoot, {
+    modelId: toModel,
+    reasoningDepth,
+    systemPrompt: `You are ${toAgent} running on model ${toModel} (reasoningDepth=${reasoningDepth}) inside Gravity Well Harness. Receive the ${messageType} from ${fromAgent} (${fromModel}) and respond with a concise, high-signal action report or peer critique.`,
+    prompt: content,
+    strictExecution: input.strictExecution ?? input.strict_execution,
+    allowSimulation: input.allowSimulation ?? input.allow_simulation,
+    executionMode: input.executionMode ?? input.execution_mode,
+    demoMode: input.demoMode ?? input.demo_mode,
+    timeoutMs: input.timeoutMs ?? input.timeout_ms,
+    endpoint: input.endpoint,
+    baseUrl: input.baseUrl ?? input.base_url,
+    fetchImpl: input.fetchImpl,
+  });
+
+  if (!modelReply || modelReply.ok !== true) {
+    entry.status = 'DELIVERY_FAILED';
+    entry.dispatchState = 'delivery_failed';
+    entry.executorCompleted = false;
+    entry.error = modelReply?.error || 'Target model execution failed';
+    entry.failureStatus = modelReply?.status || 'failed';
+    entry.deliveredAt = null;
+    entry.pendingForPreInvocation = false;
+    entry.replySummary = null;
+    entry.reasoningPreview = null;
+    entry.providerUsed = modelReply?.provider || targetProvider || 'unknown';
+    entry.executionMode = modelReply?.mode || 'failed';
+
+    const failedSave = withMessageBusLock(
+      workspaceRoot,
+      () => {
+        const bus = loadMessageBus(workspaceRoot);
+        const idx = bus.messages.findIndex((m) => m && m.id === entry.id);
+        if (idx >= 0) {
+          bus.messages[idx] = { ...bus.messages[idx], ...entry };
+        } else {
+          bus.messages.unshift(entry);
+        }
+        bus.revision = (bus.revision || 1) + 1;
+        const saved = saveMessageBus(workspaceRoot, bus);
+        return { busRevision: saved.revision };
+      },
+      lockTimeoutMs
+    );
+
+    return {
+      ok: false,
+      status: modelReply?.status || 'delivery_failed',
+      error: entry.error,
+      message: entry,
+      busRevision: failedSave.busRevision,
+    };
+  }
+
+  const isSimulatedReply = Boolean(modelReply.synthetic === true || modelReply.status === 'simulated');
+  entry.status = isSimulatedReply ? 'SIMULATED' : 'DELIVERED';
+  entry.dispatchState = isSimulatedReply ? 'simulated_unexecuted' : 'executor_completed';
+  entry.executorCompleted = !isSimulatedReply;
+  entry.synthetic = isSimulatedReply;
+  entry.deliveredAt = new Date().toISOString();
+  entry.pendingForPreInvocation = true;
+  entry.replySummary = modelReply.content?.slice(0, 360) || '';
+  entry.reasoningPreview = modelReply.reasoningContent?.slice(0, 280) || '';
+  entry.providerUsed = modelReply.provider;
+  entry.executionMode = modelReply.mode;
+
+  const finalSave = withMessageBusLock(
+    workspaceRoot,
+    () => {
+      const bus = loadMessageBus(workspaceRoot);
+      const idx = bus.messages.findIndex((m) => m && m.id === entry.id);
+      if (idx >= 0) {
+        bus.messages[idx] = { ...bus.messages[idx], ...entry };
+      } else {
+        bus.messages.unshift(entry);
+      }
+      bus.revision = (bus.revision || 1) + 1;
+      const saved = saveMessageBus(workspaceRoot, bus);
+      return { busRevision: saved.revision };
+    },
+    lockTimeoutMs
+  );
 
   return {
     ok: true,
     status: entry.status,
+    synthetic: isSimulatedReply,
     message: entry,
-    busRevision: savedResult.busRevision,
+    busRevision: finalSave.busRevision,
   };
 }
 
@@ -2200,7 +2236,7 @@ export function consumePendingSwarmMessages(workspaceRoot, targetAgent, options 
 
       for (const m of bus.messages) {
         if (!m || typeof m !== 'object') continue;
-        if (m.status === 'DELIVERY_FAILED') continue;
+        if (m.status === 'DELIVERY_FAILED' || m.status === 'IN_FLIGHT') continue;
         if (resolvedOptions.runId && m.runId && m.runId !== resolvedOptions.runId) continue;
         if (
           resolvedOptions.candidateId &&
@@ -2318,7 +2354,7 @@ export function consumePendingInjectedMessages(
 
       for (const m of bus.messages) {
         if (!m || typeof m !== 'object') continue;
-        if (m.status === 'DELIVERY_FAILED') continue;
+        if (m.status === 'DELIVERY_FAILED' || m.status === 'IN_FLIGHT') continue;
         if (
           m.fromAgent === 'main-orchestrator' &&
           Boolean(m.replySummary) &&
@@ -2373,6 +2409,17 @@ function classifyExceptionStatus(err) {
  * 3. Bidirectional Peer Model Delegation (`delegateToPeerModel`)
  */
 export async function invokeUnifiedModel(workspaceRoot, options = {}) {
+  const taskIdForStop = options.taskId || options.task_id || null;
+  if (taskIdForStop && isTaskEscalatedStopped(workspaceRoot, taskIdForStop)) {
+    return {
+      ok: false,
+      status: 'escalated_focused_restart',
+      error: 'ESCALATED_NO_PROGRESS_STOP',
+      taskId: taskIdForStop,
+      shouldStopRetryLoop: true,
+    };
+  }
+
   const cfg = loadHubConfig(workspaceRoot);
   const explicitModelId = options.modelId ?? options.model_id;
 
@@ -2495,7 +2542,7 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
     }
 
     const deepseekSecret = resolveSecretCredential('DEEPSEEK_API_KEY');
-    if (!deepseekSecret.hasKey && isStrict) {
+    if (!deepseekSecret.hasKey && isStrict && !isCustomOrMockedFetch) {
       return {
         ok: false,
         status: 'unauthorized',
@@ -2694,7 +2741,7 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
       'OPENCODE_API_KEY',
       'OPENCODE_ZEN_API_KEY',
     ]);
-    if (!opencodeSecret.hasKey && isStrict) {
+    if (!opencodeSecret.hasKey && isStrict && !isCustomOrMockedFetch) {
       return {
         ok: false,
         status: 'unauthorized',
@@ -2869,7 +2916,17 @@ export async function invokeUnifiedModel(workspaceRoot, options = {}) {
     }
   }
 
-  // 3. Deterministic Co-Op Synthesis (supports bidirectional cross-model calling in offline/test environments when simulation is permitted)
+  // 3. Deterministic Co-Op Synthesis (ONLY permitted when simulation/demo mode is explicitly enabled)
+  if (isStrict && !isDemoMode) {
+    return {
+      ok: false,
+      status: 'unauthorized',
+      error: `Missing live provider credentials or live response for ${modelMeta.id} (${modelMeta.provider}) in strict execution mode`,
+      modelId: modelMeta.id,
+      provider: modelMeta.provider,
+    };
+  }
+
   const reasoningTrace = modelMeta.supportsThinking
     ? `[${modelMeta.name} · depth=${reasoningDepth.toUpperCase()} · effort=${reasoningEffort} · cap=${depthProfile.thinkingBudgetTokens} tok] 1. Parsed task constraint & consulted .harness/library/INDEX.md cues. 2. Verified wire protocol (${modelMeta.wireFormat} -> ${modelMeta.endpoint}). 3. Synthesized token-efficient response.`
     : '';
@@ -3388,6 +3445,20 @@ export async function runSelfImprovementCoopCycle(
 ) {
   const cfg = loadHubConfig(workspaceRoot);
   const taskId = options.taskId || options.task_id || `rsi-${Date.now()}`;
+  if (isTaskEscalatedStopped(workspaceRoot, taskId)) {
+    return {
+      ok: false,
+      status: 'escalated_focused_restart',
+      error: 'ESCALATED_NO_PROGRESS_STOP',
+      taskId,
+      shouldStopRetryLoop: true,
+    };
+  }
+
+  const isStrict = isStrictExecution(options, cfg);
+  const isDemo = isDemoOrSimulationMode(options, cfg);
+  const allowSim = isDemo && !isExplicitStrictMode(options, cfg);
+
   const taskDescription =
     options.problem ||
     options.task ||
@@ -3431,9 +3502,10 @@ export async function runSelfImprovementCoopCycle(
     type: 'PEER_CRITIQUE',
     priority: 'high',
     reasoningDepth,
-    strictExecution: options.strictExecution ?? options.strict_execution,
-    allowSimulation: options.allowSimulation ?? options.allow_simulation,
+    strictExecution: isStrict,
+    allowSimulation: allowSim,
     executionMode: options.executionMode ?? options.execution_mode,
+    demoMode: isDemo,
     content: `[Self-Improvement Proposal from ${proposerModel}] Enforce Cue-First RAG retrieval before code edits, control DeepSeek reasoning_effort (none/low/high/max), and route branched probes across OpenCode Go (${proberAModel}, ${proberBModel}) under frozen Snapshot Isolation.`,
   });
 
@@ -3445,9 +3517,10 @@ export async function runSelfImprovementCoopCycle(
     type: 'PEER_CRITIQUE',
     priority: 'high',
     reasoningDepth,
-    strictExecution: options.strictExecution ?? options.strict_execution,
-    allowSimulation: options.allowSimulation ?? options.allow_simulation,
+    strictExecution: isStrict,
+    allowSimulation: allowSim,
     executionMode: options.executionMode ?? options.execution_mode,
+    demoMode: isDemo,
     content: `[Peer Cross-Verification from ${proberAModel} to ${proberBModel}] Verified isolated branch probe and token guardrail compliance.`,
   });
 
@@ -3461,35 +3534,66 @@ export async function runSelfImprovementCoopCycle(
     mode: 'sequential',
     earlyStopOnFirstPass: true,
     adoptWinner: recordToLibrary,
-    strictExecution: options.strictExecution ?? options.strict_execution,
-    allowSimulation: options.allowSimulation ?? options.allow_simulation,
+    strictExecution: isStrict,
+    allowSimulation: allowSim,
+    executionMode: options.executionMode ?? options.execution_mode,
+    demoMode: isDemo,
+    executor: options.executor,
     evaluator: options.evaluator,
     requiredArtifacts: options.requiredArtifacts ?? options.required_artifacts,
   });
 
-  // Step 3: Broadcast the newly adopted Self-Improvement Cue to all swarm agents
-  const cueBroadcast = await injectOrConveySwarmMessage(workspaceRoot, {
-    fromAgent: 'harness-composer',
-    toAgent: 'all',
-    fromModel: composerModel,
-    toModel: cfg.activeModelId,
-    type: 'SELF_IMPROVE_CUE',
-    priority: 'high',
-    reasoningDepth,
-    content: `[Adopted Self-Improvement Lesson ${loopResult.adoptedExperience?.docid || 'EXP-RSI'}] Winner: ${loopResult.winner?.candidateId || 'none'} (score=${loopResult.winner?.score || 0}, saved=${loopResult.tokenEfficiency?.totalTokensSavedPct || 0}% tokens). Cue: ${loopResult.winner?.cue || loopResult.winner?.distilledCue || ''}`,
-    executeTargetModel: false,
-  });
+  const cycleVerified = Boolean(
+    loopResult.ok === true &&
+      loopResult.passedVerification === true &&
+      !loopResult.synthetic &&
+      loopResult.receiptId
+  );
 
-  const updatedCfg = saveHubConfig(workspaceRoot, {
-    selfImprovement: {
-      ...cfg.selfImprovement,
-      completedCycles: (cfg.selfImprovement?.completedCycles || 1) + 1,
-      lastCycleAt: new Date().toISOString(),
-    },
-  });
+  // Step 3: Broadcast the newly adopted Self-Improvement Cue ONLY when verification actually succeeded (or in explicit demo mode)
+  let cueBroadcast = null;
+  let updatedCfg = cfg;
+  if (cycleVerified) {
+    cueBroadcast = await injectOrConveySwarmMessage(workspaceRoot, {
+      fromAgent: 'harness-composer',
+      toAgent: 'all',
+      fromModel: composerModel,
+      toModel: cfg.activeModelId,
+      type: 'SELF_IMPROVE_CUE',
+      priority: 'high',
+      reasoningDepth,
+      content: `[Adopted Self-Improvement Lesson ${loopResult.adoptedExperience?.docid || 'EXP-RSI'}] Winner: ${loopResult.winner?.candidateId || 'none'} (score=${loopResult.winner?.score || 0}, saved=${loopResult.tokenEfficiency?.totalTokensSavedPct || 0}% tokens). Cue: ${loopResult.winner?.cue || loopResult.winner?.distilledCue || ''}`,
+      executeTargetModel: false,
+    });
+    updatedCfg = saveHubConfig(workspaceRoot, {
+      selfImprovement: {
+        ...cfg.selfImprovement,
+        completedCycles: (cfg.selfImprovement?.completedCycles || 1) + 1,
+        lastCycleAt: new Date().toISOString(),
+      },
+    });
+  } else if (allowSim && loopResult.ok) {
+    cueBroadcast = await injectOrConveySwarmMessage(workspaceRoot, {
+      fromAgent: 'harness-composer',
+      toAgent: 'all',
+      fromModel: composerModel,
+      toModel: cfg.activeModelId,
+      type: 'SELF_IMPROVE_CUE_DEMO',
+      priority: 'normal',
+      reasoningDepth,
+      content: `[Simulated Self-Improvement Preview] Winner: ${loopResult.winner?.candidateId || 'none'} (score=${loopResult.winner?.score || 0}).`,
+      executeTargetModel: false,
+    });
+  }
+
+  const overallOk = cycleVerified || (allowSim && loopResult.ok && critiqueMsgA.ok && critiqueMsgB.ok);
 
   return {
-    ok: loopResult.ok !== false && critiqueMsgA.ok !== false && critiqueMsgB.ok !== false,
+    ok: overallOk,
+    status: cycleVerified ? 'succeeded' : allowSim && overallOk ? 'simulated' : 'failed',
+    synthetic: Boolean(loopResult.synthetic || allowSim),
+    passedVerification: cycleVerified,
+    receiptId: loopResult.receiptId || null,
     cycleNumber: updatedCfg.selfImprovement.completedCycles,
     taskId,
     task: taskDescription,
@@ -3510,7 +3614,7 @@ export async function runSelfImprovementCoopCycle(
     },
     peerCritiques: [critiqueMsgA.message, critiqueMsgB.message],
     critiqueMessage: critiqueMsgA.message,
-    cueBroadcast: cueBroadcast.message,
+    cueBroadcast: cueBroadcast ? cueBroadcast.message : null,
     winner: {
       ...(loopResult.winner || {}),
       modelId: proberAModel,

@@ -1,0 +1,40 @@
+{
+  "ok": true,
+  "receiptId": "RCPT-1794111597004-8F42F873",
+  "taskId": "task-stage16-pr-a-g-verified",
+  "candidateId": "CAND-STAGE16-PR-A-G",
+  "domain": "software-engineering",
+  "gitRevision": "a9d2e21",
+  "harnessDigest": "54d84bed08f96e122b1f5c7855b936744d5b9d6d215b75b02488746a7c20790e",
+  "evaluatorId": "node-test-runner-18-suites",
+  "checks": [
+    {
+      "name": "npm test (18/18 suites)",
+      "passed": true
+    },
+    {
+      "name": "AST & grammar check across all .mjs/.js/.json/.py files",
+      "passed": true
+    }
+  ],
+  "score": 1,
+  "passed": true,
+  "artifactHashes": {
+    "src/rag-engine.mjs": "56ea0bc4cdb1eaafe46fff28156540a4078a8b8c3fe9376090c29bff47288f6f",
+    "src/secret-vault.mjs": "3cf0b4f6348ed8f82a3bed1072d4f58d276bfeabb03967b4d29e244b6f40c525",
+    "src/model-hub.mjs": "636bcf5f1f508707b9868faf003331fbf9d2e258900d0cf0f6cf60b881299869",
+    "src/context-resilience.mjs": "a9ce0e3bcea48df763622be18feebab4b127523425ef55a1ba347b421e7db4fb",
+    "mcp/harness-rag-server.mjs": "733c047e33b4e4da2404cacbee94efc00725ed76a6cad72f493710f4694512f8",
+    "plugin/harness-ide/scripts/mcp-entry.mjs": "733c047e33b4e4da2404cacbee94efc00725ed76a6cad72f493710f4694512f8",
+    "plugin/harness-ide/rules/gravity-well-default.md": "8b8b8ac2c9768b127e32ef95738fbf68c877a4b893d9eefe8e18e01d5e4a67c4",
+    "sidecars/harness-ide-monitor/server.mjs": "16ff3a2430966fa7fe26812d8ab39c55dffb161eacf15ab5784a9da33cdc3b36",
+    "adapters/harness2_antigravity_executor.py": "36d137ce20e82077d1c0afd2f79e73c6177d8dab0daecc266cb6a58aecb824fd",
+    "test/harness-ide.test.mjs": "3fd8593f8cf49b7a5e52c085429e52b32c7d5424e7e2185e6324fa527f7da0b5"
+  },
+  "providerCalls": 0,
+  "actualTokens": null,
+  "synthetic": false,
+  "lessonDigest": "604828709d8b194de360f2b1c5f9b0f2e351e27ed5e17514a682268a2e1ea1ae",
+  "createdAt": "2026-11-08T04:19:57.004Z",
+  "signature": "df5e942f6d22b27bcdff1594b3df791f7a55f64dcb214b604b5a0191ff4c879c"
+}

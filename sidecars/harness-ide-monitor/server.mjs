@@ -212,35 +212,60 @@ function mutateSubagentLifecycle(workspaceRoot, payload = {}) {
     }
   }
 
-  // Synchronize telemetry.json (both top-level subagents and per-session subagents) when completing or resetting
-  if (action === 'reset' || action === 'complete' || action === 'complete_all') {
-    const telFile = path.join(workspaceRoot, '.harness', 'runtime', 'telemetry.json');
-    if (fs.existsSync(telFile)) {
-      try {
-        const tel = JSON.parse(fs.readFileSync(telFile, 'utf8'));
-        let changed = false;
-        const markList = (list) => {
-          if (!Array.isArray(list)) return;
-          for (const s of list) {
-            if (action === 'reset' || action === 'complete_all' || !nodeId || s.id === nodeId) {
-              if (s.status !== 'COMPLETED') {
-                s.status = 'COMPLETED';
-                s.completedAt = nowIso;
-                changed = true;
-              }
+  // Synchronize telemetry.json (both top-level subagents and per-session subagents) on all lifecycle transitions
+  const telFile = path.join(workspaceRoot, '.harness', 'runtime', 'telemetry.json');
+  if (fs.existsSync(telFile)) {
+    try {
+      const tel = JSON.parse(fs.readFileSync(telFile, 'utf8'));
+      let changed = false;
+      const targetIds = new Set(
+        action === 'recall_all' || action === 'complete_all'
+          ? Array.isArray(payload.nodeIds)
+            ? payload.nodeIds
+            : []
+          : nodeId
+            ? [nodeId]
+            : []
+      );
+      const syncSubList = (list) => {
+        if (!Array.isArray(list)) return;
+        for (const s of list) {
+          if (!s || typeof s !== 'object') continue;
+          const matches =
+            action === 'reset' ||
+            (action === 'complete_all' && targetIds.size === 0) ||
+            targetIds.has(s.id);
+          if (!matches) continue;
+          if (action === 'reset' || action === 'complete' || action === 'complete_all') {
+            if (s.status !== 'COMPLETED') {
+              s.status = 'COMPLETED';
+              s.completedAt = nowIso;
+              changed = true;
             }
+          } else if (action === 'cancel' || action === 'kill') {
+            if (s.status !== 'CANCELLED') {
+              s.status = 'CANCELLED';
+              s.cancelledAt = nowIso;
+              changed = true;
+            }
+          } else if (action === 'recall' || action === 'recall_all') {
+            s.status = 'RUNNING';
+            s.recalled = true;
+            s.recallCount = Number(s.recallCount || 0) + 1;
+            s.recalledAt = nowIso;
+            changed = true;
           }
-        };
-        markList(tel.subagents);
-        for (const sess of Object.values(tel.sessions || {})) {
-          markList(sess?.subagents);
         }
-        if (changed) {
-          fs.writeFileSync(telFile, JSON.stringify(tel, null, 2), 'utf8');
-        }
-      } catch {
-        // ignore telemetry sync errors
+      };
+      syncSubList(tel.subagents);
+      for (const sess of Object.values(tel.sessions || {})) {
+        syncSubList(sess?.subagents);
       }
+      if (changed) {
+        fs.writeFileSync(telFile, JSON.stringify(tel, null, 2), 'utf8');
+      }
+    } catch {
+      // ignore telemetry sync errors
     }
   }
 
@@ -295,11 +320,14 @@ try {
         options.sessionToken ||
         process.env.AGY_SIDECAR_TOKEN ||
         crypto.randomBytes(24).toString('hex');
-      this.requireAuth = Boolean(
-        options.requireAuth ??
-          (process.env.HARNESS_REQUIRE_HTTP_AUTH === '1' ||
-            process.env.HARNESS_REQUIRE_HTTP_AUTH === 'true')
-      );
+      this.requireAuth =
+        options.requireAuth !== undefined
+          ? Boolean(options.requireAuth)
+          : process.env.HARNESS_REQUIRE_HTTP_AUTH === '0' ||
+              process.env.HARNESS_REQUIRE_HTTP_AUTH === 'false'
+            ? false
+            : true;
+      this.demoMode = Boolean(options.demoMode);
       this.allowUnregisteredWorkspaces = Boolean(options.allowUnregisteredWorkspaces);
       this.registeredWorkspaces = new Set(DEFAULT_REGISTERED_WORKSPACES);
       if (options.workspaceRoot && fs.existsSync(options.workspaceRoot)) {
@@ -353,7 +381,10 @@ try {
             : '';
           const headerToken = String(req.headers?.['x-sidecar-token'] || '').trim();
           const queryToken = String(urlObj.searchParams.get('token') || '').trim();
-          const suppliedToken = headerToken || bearerToken || queryToken;
+          const cookieHeader = String(req.headers?.cookie || '');
+          const cookieMatch = cookieHeader.match(/(?:^|;\s*)agy_sidecar_token=([^;]+)/);
+          const cookieToken = cookieMatch ? decodeURIComponent(cookieMatch[1].trim()) : '';
+          const suppliedToken = headerToken || bearerToken || queryToken || cookieToken;
           const hasValidToken = Boolean(suppliedToken && suppliedToken === this.sessionToken);
 
           if (suppliedToken && !hasValidToken) {
@@ -369,12 +400,6 @@ try {
             req.headers?.['x-sidecar-require-auth'] === '1';
 
           if (this.apis.has(pathname)) {
-            if (enforceAuth && !hasValidToken) {
-              res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
-              res.end(JSON.stringify({ ok: false, error: 'Unauthorized sidecar token' }));
-              return;
-            }
-
             const allowedMethods = this.apiMethods.get(pathname);
             if (allowedMethods && allowedMethods.size > 0 && !allowedMethods.has(reqMethod)) {
               res.writeHead(405, {
@@ -382,6 +407,12 @@ try {
                 Allow: Array.from(allowedMethods).join(', '),
               });
               res.end(JSON.stringify({ ok: false, error: 'Method Not Allowed' }));
+              return;
+            }
+
+            if (enforceAuth && !hasValidToken) {
+              res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+              res.end(JSON.stringify({ ok: false, error: 'Unauthorized sidecar token' }));
               return;
             }
 
@@ -421,15 +452,24 @@ try {
               }
             }
             const handler = this.apis.get(pathname);
+            const serverSecurity = Object.freeze({
+              authenticated: hasValidToken,
+              registeredWorkspaces: this.registeredWorkspaces,
+              allowUnregisteredWorkspaces: Boolean(this.allowUnregisteredWorkspaces),
+              defaultWorkspaceRoot: this.defaultWorkspaceRoot,
+              appDemoMode: Boolean(this.demoMode),
+            });
             const out = await handler({
+              ...parsedBody,
               req,
               body: parsedBody,
               query: Object.fromEntries(urlObj.searchParams.entries()),
               authenticated: hasValidToken,
               registeredWorkspaces: this.registeredWorkspaces,
-              allowUnregisteredWorkspaces: this.allowUnregisteredWorkspaces,
+              allowUnregisteredWorkspaces: Boolean(this.allowUnregisteredWorkspaces),
               defaultWorkspaceRoot: this.defaultWorkspaceRoot,
-              ...parsedBody,
+              appDemoMode: Boolean(this.demoMode),
+              serverSecurity,
             });
             if (
               out instanceof ResponseClass ||
@@ -472,6 +512,13 @@ try {
             }
             res.writeHead(out?.status || 200, {
               'Content-Type': contentType,
+              ...(contentType.includes('text/html')
+                ? {
+                    'Set-Cookie': `agy_sidecar_token=${encodeURIComponent(
+                      this.sessionToken
+                    )}; HttpOnly; SameSite=Strict; Path=/`,
+                  }
+                : {}),
               ...(out?.headers || {}),
             });
             res.end(bodyStr);
@@ -703,15 +750,11 @@ export async function resolveWorkspaceContext(reqPayload = {}, reqContext = {}) 
   let resolutionSource = 'default';
 
   const explicitRoot = payload.workspaceRoot ?? reqPayload?.query?.workspaceRoot;
+  const sec = reqContext?.serverSecurity || reqPayload?.serverSecurity || null;
   const validationOptions = {
-    registeredWorkspaces:
-      reqContext?.registeredWorkspaces ||
-      reqPayload?.registeredWorkspaces ||
-      DEFAULT_REGISTERED_WORKSPACES,
-    allowUnregisteredWorkspaces: Boolean(
-      reqContext?.allowUnregisteredWorkspaces ?? reqPayload?.allowUnregisteredWorkspaces
-    ),
-    authenticated: Boolean(reqContext?.authenticated ?? reqPayload?.authenticated),
+    registeredWorkspaces: sec ? sec.registeredWorkspaces : DEFAULT_REGISTERED_WORKSPACES,
+    allowUnregisteredWorkspaces: sec ? Boolean(sec.allowUnregisteredWorkspaces) : false,
+    authenticated: sec ? Boolean(sec.authenticated) : false,
     requireAuthForUnregistered: Boolean(reqContext?.requireAuthForUnregistered),
   };
 
@@ -721,11 +764,8 @@ export async function resolveWorkspaceContext(reqPayload = {}, reqContext = {}) 
     resolutionSource = payload.pinnedWorkspace ? 'user_pinned' : 'explicit_request';
   }
   // 2. If app has a bound defaultWorkspaceRoot
-  else if (
-    (reqContext?.defaultWorkspaceRoot || reqPayload?.defaultWorkspaceRoot) &&
-    fs.existsSync(reqContext?.defaultWorkspaceRoot || reqPayload?.defaultWorkspaceRoot)
-  ) {
-    chosenRoot = fs.realpathSync(reqContext?.defaultWorkspaceRoot || reqPayload?.defaultWorkspaceRoot);
+  else if (sec?.defaultWorkspaceRoot && fs.existsSync(sec.defaultWorkspaceRoot)) {
+    chosenRoot = fs.realpathSync(sec.defaultWorkspaceRoot);
     resolutionSource = 'app_default';
   }
   // 3. If host pushed workspace
@@ -1125,7 +1165,11 @@ function inspectTelemetryActivity(workspaceRoot, activeBrain = null, telemetryOv
       !workspaceRoot ||
       path.resolve(s.workspaceRoot).toLowerCase() === path.resolve(workspaceRoot).toLowerCase()
   );
-  const telEvents = Array.isArray(tel?.recentEvents) ? tel.recentEvents : [];
+  const telEvents = Array.isArray(tel?.recentEvents)
+    ? tel.recentEvents
+    : Array.isArray(tel?.events)
+      ? tel.events
+      : [];
   const telSubs = [
     ...(Array.isArray(tel?.subagents) ? tel.subagents : []),
     ...telSessions.flatMap((s) => (Array.isArray(s?.subagents) ? s.subagents : [])),
@@ -1141,6 +1185,19 @@ function inspectTelemetryActivity(workspaceRoot, activeBrain = null, telemetryOv
   const hasTranscriptSteps = Boolean(activeBrain && Number(activeBrain.totalSteps || 0) > 0);
   const hasHookActivity = recordedToolCalls > 0 || telEvents.length > 0 || uniqueSubs.length > 0;
   const hasRealTranscriptOrEvents = hasTranscriptSteps || hasHookActivity;
+  const explicitObservedTokens =
+    typeof tel?.observedTokens === 'number' && tel.observedTokens >= 0
+      ? tel.observedTokens
+      : typeof tel?.totalTokens === 'number' && tel.totalTokens >= 0
+        ? tel.totalTokens
+        : null;
+  const hasTranscriptChars = Boolean(
+    activeBrain &&
+      (Number(activeBrain.userChars || 0) > 0 ||
+        Number(activeBrain.assistantChars || 0) > 0 ||
+        Number(activeBrain.thinkingChars || 0) > 0)
+  );
+  const hasObservedTokenTelemetry = explicitObservedTokens !== null || hasTranscriptChars;
   return {
     tel,
     telSessions,
@@ -1150,6 +1207,9 @@ function inspectTelemetryActivity(workspaceRoot, activeBrain = null, telemetryOv
     hasTranscriptSteps,
     hasHookActivity,
     hasRealTranscriptOrEvents,
+    explicitObservedTokens,
+    hasTranscriptChars,
+    hasObservedTokenTelemetry,
   };
 }
 
@@ -1219,12 +1279,13 @@ export function buildSwarmFormations(
   const demoMode = Boolean(options.demoMode);
   const hasObservedActivity =
     activity.hasRealTranscriptOrEvents || liveSubagents.length > 0 || demoMode;
+  const hasTokenCounts = activity.hasObservedTokenTelemetry || demoMode;
 
   const mainSteps = hasObservedActivity
     ? Math.max(1, activeBrain?.totalSteps || activity.recordedToolCalls || (demoMode ? 12 : 1))
     : 0;
   const mainDurationSec = hasObservedActivity
-    ? activeBrain?.activeDurationSec || Math.max(12, mainSteps * 6)
+    ? activeBrain?.activeDurationSec || (demoMode ? Math.max(12, mainSteps * 6) : 0)
     : 0;
   const mainDuration = formatDurationSec(mainDurationSec);
   const lockActive = Boolean(ragStatus?.snapshotIsolationLock?.active);
@@ -1236,24 +1297,28 @@ export function buildSwarmFormations(
     ragDocuments[0] ||
     null;
 
-  // Deterministic metrics for Main Orchestrator from Context Analytics
-  const mainTotalTokens = hasObservedActivity
-    ? (contextAnalytics?.tokenStats?.totalTokens ?? mainSteps * 4_200)
-    : 0;
-  const mainContextTokens = hasObservedActivity
-    ? (contextAnalytics?.currentWindow?.usedTokens ?? Math.min(420_000, mainSteps * 1_650))
-    : 0;
-  const mainContextPct = hasObservedActivity
-    ? (contextAnalytics?.currentWindow?.usedPct ??
-      Number(((mainContextTokens / 512_000) * 100).toFixed(1)))
-    : 0;
-  const mainCostUsd = hasObservedActivity
-    ? Number((mainTotalTokens * 0.00000145).toFixed(2))
-    : 0;
+  // Deterministic metrics for Main Orchestrator from Context Analytics (null when token telemetry is unavailable)
+  const mainTotalTokens = hasTokenCounts
+    ? (contextAnalytics?.tokenStats?.observedTokens ??
+      contextAnalytics?.tokenStats?.totalTokens ??
+      (demoMode ? mainSteps * 4_200 : null))
+    : null;
+  const mainContextTokens = hasTokenCounts
+    ? (contextAnalytics?.currentWindow?.observedTokens ??
+      contextAnalytics?.currentWindow?.usedTokens ??
+      (demoMode ? Math.min(420_000, mainSteps * 1_650) : null))
+    : null;
+  const mainContextPct =
+    mainContextTokens !== null
+      ? (contextAnalytics?.currentWindow?.usedPct ??
+        Number(((mainContextTokens / 512_000) * 100).toFixed(1)))
+      : null;
+  const mainCostUsd =
+    mainTotalTokens !== null ? Number((mainTotalTokens * 0.00000145).toFixed(2)) : null;
 
   const winCats = contextAnalytics?.currentWindow?.categories || [];
   const getCatPct = (key, fallback) => {
-    if (!hasObservedActivity) return 0;
+    if (!hasTokenCounts || mainContextPct === null) return 0;
     const found = winCats.find((c) => c.key === key);
     return found ? Math.max(2, Math.round((found.pct || fallback) * (mainContextPct / 100) * 2.1)) : fallback;
   };
@@ -1270,7 +1335,7 @@ export function buildSwarmFormations(
   );
   const freePct = Math.max(8, 100 - usedDnaSum);
 
-  // Scale Tier 1-3 Harness² subagent metrics deterministically
+  // Scale Tier 1-3 Harness² subagent metrics deterministically (used ONLY when demoMode is enabled)
   const proposerSteps = Math.max(12, Math.round(mainSteps * 0.28));
   const proposerTokens = 210_000 + proposerSteps * 7_400;
   const proposerCtx = 64_000 + proposerSteps * 1_600;
@@ -1310,11 +1375,13 @@ export function buildSwarmFormations(
     isCurrent: true,
     status: hasObservedActivity ? 'RUNNING' : 'IDLE',
     totalTokens: mainTotalTokens,
-    totalTokensFormatted: formatCompactNumber(mainTotalTokens),
+    totalTokensFormatted:
+      mainTotalTokens !== null ? formatCompactNumber(mainTotalTokens) : 'unavailable',
     contextTokens: mainContextTokens,
-    contextTokensFormatted: formatCompactNumber(mainContextTokens),
+    contextTokensFormatted:
+      mainContextTokens !== null ? formatCompactNumber(mainContextTokens) : 'unavailable',
     costUsd: mainCostUsd,
-    costFormatted: `$${mainCostUsd.toFixed(2)}`,
+    costFormatted: mainCostUsd !== null ? `$${mainCostUsd.toFixed(2)}` : 'unavailable',
     durationFormatted: `${mainDuration} · ${mainSteps} steps`,
     steps: mainSteps,
     contextUsedPct: mainContextPct,
@@ -1339,7 +1406,8 @@ export function buildSwarmFormations(
   };
 
   // Formation 1: Live Session + Gravity Well Harness² Recursive Formation
-  const liveNodes = !hasObservedActivity
+  // In production (!demoMode), liveNodes ONLY includes rootOrchestratorNode + actually observed liveSubagents!
+  const liveNodes = !demoMode
     ? [rootOrchestratorNode]
     : [
         rootOrchestratorNode,
@@ -2414,7 +2482,13 @@ export function buildContextAndTokenAnalytics(arg1, arg2 = null, arg3 = [], arg4
   const demoMode = Boolean(options.demoMode);
   const hasRealTranscriptOrEvents = activity.hasRealTranscriptOrEvents;
   const hasObservedOrDemo = hasRealTranscriptOrEvents || demoMode;
-  const telemetryQuality = hasRealTranscriptOrEvents
+  const hasTokenCounts = activity.hasObservedTokenTelemetry || demoMode;
+  const telemetryQuality = activity.hasObservedTokenTelemetry
+    ? 'observed'
+    : demoMode
+      ? 'simulated'
+      : 'unavailable';
+  const eventsQuality = hasRealTranscriptOrEvents
     ? 'observed'
     : demoMode
       ? 'simulated'
@@ -2427,7 +2501,7 @@ export function buildContextAndTokenAnalytics(arg1, arg2 = null, arg3 = [], arg4
     ? Math.max(1, activeBrain?.userTurns || activity.telSessions.length || 1)
     : 0;
   const modelReplies = hasObservedOrDemo
-    ? Math.max(1, activeBrain?.modelReplies || Math.ceil(steps * 0.5))
+    ? (activeBrain?.modelReplies ?? (demoMode ? Math.max(1, Math.ceil(steps * 0.5)) : 0))
     : 0;
   const reads = hasObservedOrDemo
     ? (activeBrain?.readOps ??
@@ -2444,39 +2518,49 @@ export function buildContextAndTokenAnalytics(arg1, arg2 = null, arg3 = [], arg4
   const userInputs = turns;
   const ioTotal = userInputs + reads + writes + searches;
 
-  const ragInjected = hasObservedOrDemo
+  const ragInjected = hasTokenCounts
     ? Math.max(ragDocuments.length, activeBrain?.ragInjections || 0)
-    : 0;
+    : activeBrain?.ragInjections || 0;
   const compacted = steps > 45 ? 1 : 0;
   const pruned = 0;
   const contextEventsTotal = ragInjected + compacted + pruned;
-  const skillsLoaded = hasObservedOrDemo ? Math.max(1, activeBrain?.skillInjections || 2) : 0;
+  const skillsLoaded = hasTokenCounts
+    ? Math.max(1, activeBrain?.skillInjections || 2)
+    : activeBrain?.skillInjections || 0;
 
-  // Deterministic token counts scaled strictly by recorded transcript/hook activity (zero wall-clock drift)
-  const sysTokens = hasObservedOrDemo ? 4_200 : 0;
-  const toolDefTokens = hasObservedOrDemo ? 14_800 : 0;
-  const userTokens = hasObservedOrDemo
-    ? Math.max(600, Math.round((activeBrain?.userChars || turns * 1_200) / 3.2))
+  // Token counts: ONLY reported when actual token telemetry or transcript character counts exist, or when demoMode is true!
+  const sysTokens = demoMode ? 4_200 : 0;
+  const toolDefTokens = demoMode ? 14_800 : 0;
+  const userTokens = hasTokenCounts
+    ? demoMode
+      ? Math.max(600, Math.round((activeBrain?.userChars || turns * 1_200) / 3.2))
+      : Math.round(Number(activeBrain?.userChars || 0) / 4.0)
     : 0;
-  const ragTokens = hasObservedOrDemo ? ragInjected * 1_450 : 0;
-  const skillTokens = hasObservedOrDemo ? skillsLoaded * 1_800 : 0;
-  const assistantTokens = hasObservedOrDemo
-    ? Math.max(
-        1_200,
-        Math.round(((activeBrain?.assistantChars || steps * 1_600) + steps * 800) * 1.0)
-      )
+  const ragTokens = demoMode ? ragInjected * 1_450 : Math.round(Number(activeBrain?.ragChars || 0) / 4.0);
+  const skillTokens = demoMode ? skillsLoaded * 1_800 : 0;
+  const assistantTokens = hasTokenCounts
+    ? demoMode
+      ? Math.max(
+          1_200,
+          Math.round(((activeBrain?.assistantChars || steps * 1_600) + steps * 800) * 1.0)
+        )
+      : Math.round(Number(activeBrain?.assistantChars || 0) / 4.0)
     : 0;
-  const toolResultTokens = hasObservedOrDemo
-    ? Math.max(
-        1_800,
-        Math.round(((activeBrain?.toolResultsChars || steps * 2_400) + steps * 1_200) * 1.0)
-      )
+  const toolResultTokens = hasTokenCounts
+    ? demoMode
+      ? Math.max(
+          1_800,
+          Math.round(((activeBrain?.toolResultsChars || steps * 2_400) + steps * 1_200) * 1.0)
+        )
+      : Math.round(Number(activeBrain?.toolResultsChars || 0) / 4.0)
     : 0;
-  const outputThinkingTokens = hasObservedOrDemo
-    ? Math.max(400, Math.round(((activeBrain?.thinkingChars || steps * 900) + 600) / 3.0))
+  const outputThinkingTokens = hasTokenCounts
+    ? demoMode
+      ? Math.max(400, Math.round(((activeBrain?.thinkingChars || steps * 900) + 600) / 3.0))
+      : Math.round(Number(activeBrain?.thinkingChars || 0) / 4.0)
     : 0;
 
-  const totalSessionTokens =
+  const computedSumTokens =
     sysTokens +
     toolDefTokens +
     userTokens +
@@ -2485,9 +2569,12 @@ export function buildContextAndTokenAnalytics(arg1, arg2 = null, arg3 = [], arg4
     assistantTokens +
     toolResultTokens +
     outputThinkingTokens;
+  const totalSessionTokens = hasTokenCounts
+    ? (activity.explicitObservedTokens ?? computedSumTokens)
+    : null;
 
   const pct = (val) =>
-    totalSessionTokens > 0
+    totalSessionTokens && totalSessionTokens > 0
       ? Number(((val / Math.max(1, totalSessionTokens)) * 100).toFixed(1))
       : 0;
 
@@ -2568,20 +2655,38 @@ export function buildContextAndTokenAnalytics(arg1, arg2 = null, arg3 = [], arg4
 
   // Current Context Window (Next Request Snapshot)
   const maxWindowTokens = 512_000;
-  const winSys = hasObservedOrDemo ? 4_200 : 0;
-  const winTools = hasObservedOrDemo ? 14_800 : 0;
-  const winUser = hasObservedOrDemo ? Math.min(8_500, Math.max(400, Math.round(userTokens * 0.5))) : 0;
-  const winRag = hasObservedOrDemo ? Math.min(18_000, ragDocuments.length * 1_450) : 0;
-  const winSkill = hasObservedOrDemo ? Math.min(12_000, skillsLoaded * 1_800) : 0;
-  const winAssistant = hasObservedOrDemo ? Math.min(84_000, steps * 480) : 0;
-  const winToolRes = hasObservedOrDemo ? Math.min(148_000, steps * 1_120) : 0;
-  const usedWindowTokens =
-    winSys + winTools + winUser + winRag + winSkill + winAssistant + winToolRes;
+  const winSys = demoMode ? 4_200 : 0;
+  const winTools = demoMode ? 14_800 : 0;
+  const winUser = hasTokenCounts
+    ? demoMode
+      ? Math.min(8_500, Math.max(400, Math.round(userTokens * 0.5)))
+      : userTokens
+    : 0;
+  const winRag = demoMode ? Math.min(18_000, ragDocuments.length * 1_450) : ragTokens;
+  const winSkill = demoMode ? Math.min(12_000, skillsLoaded * 1_800) : skillTokens;
+  const winAssistant = hasTokenCounts
+    ? demoMode
+      ? Math.min(84_000, steps * 480)
+      : assistantTokens
+    : 0;
+  const winToolRes = hasTokenCounts
+    ? demoMode
+      ? Math.min(148_000, steps * 1_120)
+      : toolResultTokens
+    : 0;
+  const usedWindowTokens = hasTokenCounts
+    ? (activity.tel?.usedTokens ??
+      (winSys + winTools + winUser + winRag + winSkill + winAssistant + winToolRes))
+    : null;
   const usedWindowPct =
-    usedWindowTokens > 0 ? Number(((usedWindowTokens / maxWindowTokens) * 100).toFixed(1)) : 0;
+    usedWindowTokens !== null && usedWindowTokens > 0
+      ? Number(((usedWindowTokens / maxWindowTokens) * 100).toFixed(1))
+      : null;
 
   const winPct = (v) =>
-    usedWindowTokens > 0 ? Math.max(1, Math.round((v / Math.max(1, usedWindowTokens)) * 100)) : 0;
+    usedWindowTokens && usedWindowTokens > 0
+      ? Math.max(1, Math.round((v / Math.max(1, usedWindowTokens)) * 100))
+      : 0;
 
   const currentWindowCategories = [
     {
@@ -2741,9 +2846,9 @@ export function buildContextAndTokenAnalytics(arg1, arg2 = null, arg3 = [], arg4
     },
   ];
 
-  // Step-by-Step Context Trend (deterministic; empty when no observed events)
+  // Step-by-Step Context Trend (deterministic; empty when token telemetry is unavailable)
   const stepTrends = [];
-  if (hasObservedOrDemo) {
+  if (hasTokenCounts) {
     const bucketCount = Math.min(20, Math.max(10, steps));
     for (let i = 1; i <= bucketCount; i++) {
       const ratio = i / bucketCount;
@@ -2796,18 +2901,25 @@ export function buildContextAndTokenAnalytics(arg1, arg2 = null, arg3 = [], arg4
   const subCount = hasObservedOrDemo
     ? (activeBrain?.subagents?.length ?? activity.telSubs.length)
     : 0;
-  const subTokens = hasObservedOrDemo ? subCount * 32_000 : 0;
-  const liveOutputSpeed = hasObservedOrDemo ? 228 : 0;
-  const liveCacheHitPct = hasObservedOrDemo ? 94.2 : 0;
+  const subTokens = demoMode ? subCount * 32_000 : (activity.tel?.subagentTokens ?? null);
+  const liveOutputSpeed = demoMode
+    ? 228
+    : (activity.tel?.outputSpeedTokPerSec ?? activeBrain?.outputSpeedTokPerSec ?? null);
+  const liveCacheHitPct = demoMode
+    ? 94.2
+    : (activity.tel?.cacheHitPct ?? activeBrain?.cacheHitPct ?? null);
+  const networkTotalTokens =
+    totalSessionTokens !== null ? totalSessionTokens + (subTokens || 0) : null;
 
   return {
     telemetryQuality,
+    eventsQuality,
     observedSteps: steps,
     observedSubagentCount: subCount,
-    observedTokens: hasObservedOrDemo ? totalSessionTokens : null,
-    usedTokens: hasObservedOrDemo ? usedWindowTokens : null,
+    observedTokens: totalSessionTokens,
+    usedTokens: usedWindowTokens,
     totalSteps: steps,
-    totalTokens: hasObservedOrDemo ? totalSessionTokens : null,
+    totalTokens: totalSessionTokens,
     flowSummary: {
       io: {
         total: ioTotal,
@@ -2833,20 +2945,24 @@ export function buildContextAndTokenAnalytics(arg1, arg2 = null, arg3 = [], arg4
         topTools,
       },
       agentNetwork: {
-        totalTokens: totalSessionTokens + subTokens,
-        totalFormatted: formatCompactNumber(totalSessionTokens + subTokens),
+        totalTokens: networkTotalTokens,
+        totalFormatted:
+          networkTotalTokens !== null ? formatCompactNumber(networkTotalTokens) : 'unavailable',
         mainAgentTokens: totalSessionTokens,
-        mainAgentFormatted: formatCompactNumber(totalSessionTokens),
+        mainAgentFormatted:
+          totalSessionTokens !== null ? formatCompactNumber(totalSessionTokens) : 'unavailable',
         subagentCount: subCount,
         subagentTokens: subTokens,
-        subagentFormatted: formatCompactNumber(subTokens),
+        subagentFormatted:
+          subTokens !== null ? formatCompactNumber(subTokens) : 'unavailable',
       },
     },
     tokenStats: {
       quality: telemetryQuality,
-      observedTokens: hasObservedOrDemo ? totalSessionTokens : null,
+      observedTokens: totalSessionTokens,
       totalTokens: totalSessionTokens,
-      totalFormatted: formatCompactNumber(totalSessionTokens),
+      totalFormatted:
+        totalSessionTokens !== null ? formatCompactNumber(totalSessionTokens) : 'unavailable',
       cacheHitPct: liveCacheHitPct,
       categories: tokenCategories,
     },
@@ -2860,12 +2976,15 @@ export function buildContextAndTokenAnalytics(arg1, arg2 = null, arg3 = [], arg4
     currentWindow: {
       quality: telemetryQuality,
       modelName: 'Gemini 4 Argon (High) · Gravity Well Harness',
-      observedTokens: hasObservedOrDemo ? usedWindowTokens : null,
+      observedTokens: usedWindowTokens,
+      totalTokens: usedWindowTokens,
       usedTokens: usedWindowTokens,
-      usedFormatted: formatCompactNumber(usedWindowTokens),
+      usedFormatted:
+        usedWindowTokens !== null ? formatCompactNumber(usedWindowTokens) : 'unavailable',
       maxTokens: maxWindowTokens,
       maxFormatted: formatCompactNumber(maxWindowTokens),
       usedPct: usedWindowPct,
+      cacheHitPct: liveCacheHitPct,
       categories: currentWindowCategories,
     },
     stepTrends,
@@ -2879,7 +2998,8 @@ async function gatherSwarmState(
   ragStatus,
   ragDocuments,
   activeBrain = null,
-  contextAnalytics = null
+  contextAnalytics = null,
+  options = {}
 ) {
   const { workspaceRoot, lsConnected } = workspaceContext;
   const mcpServers = [];
@@ -2963,7 +3083,7 @@ async function gatherSwarmState(
     ragStatus,
     contextAnalytics,
     ragDocuments,
-    { telemetry: hookTelemetry }
+    { telemetry: hookTelemetry, demoMode: Boolean(options?.demoMode) }
   );
 
   const recentEvents =
@@ -3174,16 +3294,20 @@ export function createHarnessMonitorApp(options = {}) {
     const lifecycleState = loadSubagentLifecycle(workspaceRoot);
     const activeBrain = resolveWorkspaceBrainTranscript(wsCtx);
     const hookTelemetry = loadWorkspaceTelemetry(workspaceRoot);
+    const isDemo = Boolean(
+      reqData?.demoMode ?? reqData?.body?.demoMode ?? reqData?.appDemoMode
+    );
     const contextAnalytics = buildContextAndTokenAnalytics(wsCtx, activeBrain, index.documents, {
       telemetry: hookTelemetry,
-      demoMode: Boolean(reqData?.demoMode ?? reqData?.body?.demoMode),
+      demoMode: isDemo,
     });
     const swarm = await gatherSwarmState(
       wsCtx,
       status,
       index.documents,
       activeBrain,
-      contextAnalytics
+      contextAnalytics,
+      { demoMode: isDemo }
     );
 
     const experiences = index.documents.filter(
@@ -3532,11 +3656,11 @@ export function createHarnessMonitorApp(options = {}) {
 
       if (action === 'promote') {
         const res = engine.promoteExperienceToProjectKnowledge({
-          ...payload,
-          task_id_or_docid: payload.task_id_or_docid,
-          adr_id: payload.adr_id,
+          task_id_or_docid: payload.task_id_or_docid || payload.experienceDocId,
+          adr_id: payload.adr_id || payload.adrId,
           title: payload.title,
           summary: payload.summary,
+          domain: payload.domain,
           receiptId: payload.receipt_id ?? payload.receiptId,
           evaluationReceipt: payload.evaluation_receipt ?? payload.evaluationReceipt,
         });
@@ -3544,17 +3668,16 @@ export function createHarnessMonitorApp(options = {}) {
       }
 
       const res = engine.recordExperience({
-        ...payload,
-        task_id: payload.task_id || `task-${Date.now()}`,
+        task_id: payload.task_id || payload.taskId || `task-${Date.now()}`,
         domain: payload.domain || 'software-engineering',
         title: payload.title,
         cue: payload.cue,
         problem: payload.problem,
-        observed_behavior: payload.observed_behavior,
-        supporting_evidence: payload.supporting_evidence || [],
-        status: payload.status || 'active',
+        observed_behavior: payload.observed_behavior ?? payload.observedBehavior,
+        supporting_evidence: payload.supporting_evidence || payload.supportingEvidence || [],
+        status: payload.status || 'candidate',
         tags: payload.tags || ['harness2', 'experience'],
-        adopted_harness: payload.adopted_harness || null,
+        adopted_harness: payload.adopted_harness || payload.adoptedHarness || null,
         receiptId: payload.receipt_id ?? payload.receiptId,
         evaluationReceipt: payload.evaluation_receipt ?? payload.evaluationReceipt,
         synthetic: payload.synthetic,
@@ -3590,9 +3713,9 @@ export function createHarnessMonitorApp(options = {}) {
 
       if (
         !isRecordedWorker &&
-        !activity.hasRealTranscriptOrEvents &&
         payload.demoMode !== true &&
-        payload.allowTemplatePreview !== true
+        payload.allowTemplatePreview !== true &&
+        !reqData?.appDemoMode
       ) {
         return {
           status: 409,
@@ -3636,14 +3759,16 @@ export function createHarnessMonitorApp(options = {}) {
     const engine = new HarnessKnowledgeEngine(wsCtx.workspaceRoot);
     const strictExec = payload.strictExecution ?? payload.strict_execution;
     const explicitAllowSim = payload.allowSimulation ?? payload.allow_simulation;
+    const isDemo = payload.demoMode ?? payload.demo_mode ?? reqData?.appDemoMode;
     const resolvedAllowSim =
       explicitAllowSim !== undefined
         ? Boolean(explicitAllowSim)
         : strictExec === true
           ? false
-          : undefined;
+          : isDemo === true
+            ? true
+            : undefined;
     const report = await engine.runHarness2Loop({
-      ...payload,
       task_id: payload.task_id || payload.taskId || `task-${Date.now()}`,
       domain: payload.domain || 'software-engineering',
       problem: payload.problem || 'Optimize execution harness with token-efficient reasoning depth.',
@@ -3658,6 +3783,7 @@ export function createHarnessMonitorApp(options = {}) {
       requiredArtifacts: payload.requiredArtifacts ?? payload.required_artifacts,
       allowSimulation: resolvedAllowSim,
       strictExecution: strictExec,
+      demoMode: isDemo,
       passThreshold: payload.passThreshold ?? payload.pass_threshold,
     });
     return { ok: report?.ok !== false, ...report };
@@ -3691,7 +3817,7 @@ export function createHarnessMonitorApp(options = {}) {
       strictExecution: payload.strictExecution ?? payload.strict_execution,
       allowSimulation: payload.allowSimulation ?? payload.allow_simulation,
       executionMode: payload.executionMode ?? payload.execution_mode,
-      demoMode: payload.demoMode ?? payload.demo_mode,
+      demoMode: payload.demoMode ?? payload.demo_mode ?? reqData?.appDemoMode,
       timeoutMs: payload.timeoutMs ?? payload.timeout_ms,
       endpoint: payload.endpoint,
       baseUrl: payload.baseUrl || payload.base_url,
@@ -3714,7 +3840,7 @@ export function createHarnessMonitorApp(options = {}) {
       strictExecution: payload.strictExecution ?? payload.strict_execution,
       allowSimulation: payload.allowSimulation ?? payload.allow_simulation,
       executionMode: payload.executionMode ?? payload.execution_mode,
-      demoMode: payload.demoMode ?? payload.demo_mode,
+      demoMode: payload.demoMode ?? payload.demo_mode ?? reqData?.appDemoMode,
       endpoint: payload.endpoint,
       baseUrl: payload.baseUrl || payload.base_url,
     });
@@ -3745,7 +3871,7 @@ export function createHarnessMonitorApp(options = {}) {
       strictExecution: payload.strictExecution ?? payload.strict_execution,
       allowSimulation: payload.allowSimulation ?? payload.allow_simulation,
       executionMode: payload.executionMode ?? payload.execution_mode,
-      demoMode: payload.demoMode ?? payload.demo_mode,
+      demoMode: payload.demoMode ?? payload.demo_mode ?? reqData?.appDemoMode,
     });
     if (res?.ok !== false && toAgent && toAgent !== 'main-orchestrator' && toAgent !== 'all') {
       mutateSubagentLifecycle(wsCtx.workspaceRoot, {
@@ -3768,14 +3894,18 @@ export function createHarnessMonitorApp(options = {}) {
     const wsCtx = await resolveWorkspaceContext(payload, reqData);
     const engine = new HarnessKnowledgeEngine(wsCtx.workspaceRoot);
     const res = await runSelfImprovementCoopCycle(wsCtx.workspaceRoot, engine, {
-      ...payload,
+      taskId: payload.taskId || payload.task_id,
       task: payload.task || payload.problem,
       domain: payload.domain || 'software-engineering',
       reasoningDepth: payload.reasoningDepth || payload.reasoning_depth,
+      proposerModel: payload.proposerModel || payload.proposer_model,
+      proberModels: payload.proberModels || payload.prober_models,
+      composerModel: payload.composerModel || payload.composer_model,
+      recordToLibrary: payload.recordToLibrary ?? payload.record_to_library,
       strictExecution: payload.strictExecution ?? payload.strict_execution,
       allowSimulation: payload.allowSimulation ?? payload.allow_simulation,
       executionMode: payload.executionMode ?? payload.execution_mode,
-      demoMode: payload.demoMode ?? payload.demo_mode,
+      demoMode: payload.demoMode ?? payload.demo_mode ?? reqData?.appDemoMode,
       requiredArtifacts: payload.requiredArtifacts ?? payload.required_artifacts,
     });
     if (res?.ok !== false) {

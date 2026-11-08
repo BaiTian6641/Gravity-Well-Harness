@@ -21,7 +21,8 @@ build/
 # Local RAG & Runtime State (derived views & ephemeral runtime state)
 .harness/index/
 .harness/runtime/
-.harness/snapshots/*.lock.json
+.harness/snapshots/
+.harness/tasks/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal

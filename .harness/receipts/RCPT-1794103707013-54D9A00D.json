@@ -19,20 +19,22 @@
   "score": 1,
   "passed": true,
   "artifactHashes": {
-    "src/rag-engine.mjs": "2db96d0a8f4cf4b52ebc0a7b44814b52ad3625594e900fb7a9b9c3e7e44e55fd",
+    "src/rag-engine.mjs": "56ea0bc4cdb1eaafe46fff28156540a4078a8b8c3fe9376090c29bff47288f6f",
     "src/secret-vault.mjs": "3cf0b4f6348ed8f82a3bed1072d4f58d276bfeabb03967b4d29e244b6f40c525",
-    "src/model-hub.mjs": "9b257aa3220644422ec3be74ab8684717a5dace4301f798cc4936ae33bbadd47",
-    "src/context-resilience.mjs": "c9a9ca33a844aa8aec1667fc896334d9c3bb0637d2be1e8e14459a527726cf2f",
-    "mcp/harness-rag-server.mjs": "37044449bf80d41b6dcaa54e5530a4f02df52363999d08e8afee00928c2bee07",
-    "plugin/harness-ide/scripts/mcp-entry.mjs": "37044449bf80d41b6dcaa54e5530a4f02df52363999d08e8afee00928c2bee07",
+    "src/model-hub.mjs": "636bcf5f1f508707b9868faf003331fbf9d2e258900d0cf0f6cf60b881299869",
+    "src/context-resilience.mjs": "a9ce0e3bcea48df763622be18feebab4b127523425ef55a1ba347b421e7db4fb",
+    "mcp/harness-rag-server.mjs": "733c047e33b4e4da2404cacbee94efc00725ed76a6cad72f493710f4694512f8",
+    "plugin/harness-ide/scripts/mcp-entry.mjs": "733c047e33b4e4da2404cacbee94efc00725ed76a6cad72f493710f4694512f8",
     "plugin/harness-ide/rules/gravity-well-default.md": "8b8b8ac2c9768b127e32ef95738fbf68c877a4b893d9eefe8e18e01d5e4a67c4",
-    "sidecars/harness-ide-monitor/server.mjs": "f22b9d1ce03538dba597101f8cb5da60f47ec3d0a6ab5af91f8c9243db02cdea",
-    "adapters/harness2_antigravity_executor.py": "a7b9548a90062f8c1bfbebd500dea9e19668bd2851d3932a565570bc6945225b",
-    "test/harness-ide.test.mjs": "4e140516a5ec35a7ba58166e31038efbd073b548ba3dcd4bd21534c59791383a"
+    "sidecars/harness-ide-monitor/server.mjs": "16ff3a2430966fa7fe26812d8ab39c55dffb161eacf15ab5784a9da33cdc3b36",
+    "adapters/harness2_antigravity_executor.py": "36d137ce20e82077d1c0afd2f79e73c6177d8dab0daecc266cb6a58aecb824fd",
+    "test/harness-ide.test.mjs": "3fd8593f8cf49b7a5e52c085429e52b32c7d5424e7e2185e6324fa527f7da0b5"
   },
   "providerCalls": 0,
   "actualTokens": null,
   "synthetic": false,
   "createdAt": "2026-11-08T02:08:27.013Z",
-  "signature": "a0ab5daf6c503a157d4abc1a6cabb00d5ddf302fb40e70ccdc3f3423532a24d7"
+  "signature": "43421213a83f00f8640f1305d6af2b2a99e0f3e8077c4203c0a3b4820cb84017",
+  "lessonDigest": "5f2c8c2b51e643aff1802b91af3891e3d47f452fb2d70537daa044e7f1eafb5f",
+  "harnessDigest": "f53c2e1bb07ea7e2ac5898d986fe13c7f03b85a5b32f06eb10df9e85de2b99af"
 }

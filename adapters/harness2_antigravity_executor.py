@@ -300,9 +300,15 @@ class ChannelSpec:
 class BenchPrompts:
     """Upstream Harness² `BenchPrompts` (`harness2/core/spec.py`)."""
 
-    proposer: str = ""
-    composer: str = ""
-    reflector: str = ""
+    proposer: str = "Propose contrastive candidate harness edits across invariant and domain-specific fronts."
+    composer: str = "Compose the winning harness from observed trajectory contrasts and verified deliverables."
+    reflector: str = "Record empirical lessons with 5-part provenance and evaluation receipts."
+    domain_hint: str = "Apply verified cues from .harness/library/<domain>/INDEX.md under frozen snapshot isolation."
+    evaluator_notes: str = "Verify delivered artifacts independently of assistant prose."
+    proposer_Hint: str = "Focus on bounded thinking budgets and deterministic verification checks."
+    proposer_Footer: str = "Emit valid candidate harness trees respecting SurfaceSpec protected_paths."
+    composer_Header: str = "Evaluate behavioral contrasts across K candidate probes."
+    reflector_Header: str = "Distill reusable conditional cues and failure modes."
 
 
 @dataclasses.dataclass(frozen=True)
@@ -315,6 +321,8 @@ class BenchSpec:
     prompts: BenchPrompts = dataclasses.field(default_factory=BenchPrompts)
     max_candidates: int = 2
     default_timeout: int = 300
+    split: str = "all"
+    metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -329,6 +337,29 @@ class RunView:
     deliverable_files: Mapping[str, str] = dataclasses.field(default_factory=dict)
     deliverable_text: str = ""
     score: Optional[Mapping[str, Any]] = None
+    passed: bool = False
+    metrics: Mapping[str, float] = dataclasses.field(default_factory=dict)
+
+
+def resolve_prompts(bench: Any) -> BenchPrompts:
+    """Upstream Harness² `resolve_prompts(bench)` helper (`harness2/core/spec.py`)."""
+    spec = getattr(bench, "spec", bench)
+    prompts = getattr(spec, "prompts", None)
+    if isinstance(prompts, BenchPrompts):
+        return prompts
+    if isinstance(prompts, Mapping):
+        return BenchPrompts(
+            proposer=str(prompts.get("proposer", "")),
+            composer=str(prompts.get("composer", "")),
+            reflector=str(prompts.get("reflector", "")),
+            domain_hint=str(prompts.get("domain_hint", "")),
+            evaluator_notes=str(prompts.get("evaluator_notes", "")),
+            proposer_Hint=str(prompts.get("proposer_Hint", "")),
+            proposer_Footer=str(prompts.get("proposer_Footer", "")),
+            composer_Header=str(prompts.get("composer_Header", "")),
+            reflector_Header=str(prompts.get("reflector_Header", "")),
+        )
+    return BenchPrompts()
 
 
 class TrajectoryReport(str):
@@ -540,7 +571,7 @@ class AntigravitySubstrate:
         Supports both upstream `materialise(tree_dir: Path, spec, ctx) -> Install`
         and `materialise(candidate_tree, target_dir) -> Install`.
         """
-        if isinstance(spec, (str, Path)) and ctx is None:
+        if isinstance(spec, (str, Path)):
             target_path = Path(spec).resolve()
         else:
             staging_root = (self.workspace_root / ".harness" / "runtime" / "staging").resolve()
@@ -552,6 +583,18 @@ class AntigravitySubstrate:
         materialised_files: List[str] = []
         source_hasher = hashlib.sha256()
         protected_set = set(self.surface().protected_paths)
+        ctx_map: Dict[str, str] = {str(k): str(v) for k, v in (ctx or {}).items()} if isinstance(ctx, Mapping) else {}
+
+        def _interpolate_bytes(raw_b: bytes) -> bytes:
+            if not ctx_map:
+                return raw_b
+            try:
+                text = raw_b.decode("utf-8")
+                for ck, cv in ctx_map.items():
+                    text = text.replace(f"{{{{{ck}}}}}", cv).replace(f"${{{ck}}}", cv)
+                return text.encode("utf-8")
+            except UnicodeDecodeError:
+                return raw_b
 
         if isinstance(tree_dir, (str, Path)) and Path(tree_dir).exists():
             src_path = Path(tree_dir).resolve()
@@ -563,7 +606,7 @@ class AntigravitySubstrate:
                     rel_posix = str(rel).replace("\\", "/")
                     if rel_posix.startswith(".git/") or rel_posix in protected_set:
                         continue
-                    raw_bytes = src_file.read_bytes()
+                    raw_bytes = _interpolate_bytes(src_file.read_bytes())
                     source_hasher.update(rel_posix.encode("utf-8"))
                     source_hasher.update(raw_bytes)
                     dest_file = (target_path / rel).resolve()
@@ -573,7 +616,7 @@ class AntigravitySubstrate:
                     dest_file.write_bytes(raw_bytes)
                     materialised_files.append(rel_posix)
             else:
-                raw_bytes = src_path.read_bytes()
+                raw_bytes = _interpolate_bytes(src_path.read_bytes())
                 source_hasher.update(raw_bytes)
                 dest_file = target_path / src_path.name
                 dest_file.write_bytes(raw_bytes)
@@ -587,7 +630,7 @@ class AntigravitySubstrate:
                     raise ValueError(f"Path traversal rejected in materialise: {rel_key}")
                 if rel_posix == ".git" or rel_posix.startswith(".git/") or any(rel_posix == p or rel_posix.startswith(p + "/") for p in protected_set):
                     raise ValueError(f"Protected path rejected in materialise: {rel_posix}")
-                raw_bytes = tree_dir[rel_key].encode("utf-8")
+                raw_bytes = _interpolate_bytes(tree_dir[rel_key].encode("utf-8"))
                 source_hasher.update(rel_posix.encode("utf-8"))
                 source_hasher.update(raw_bytes)
                 dest_file = (target_path / rel_posix).resolve()
@@ -602,13 +645,18 @@ class AntigravitySubstrate:
                 if hasattr(tree_dir, "to_dict")
                 else (dict(tree_dir) if isinstance(tree_dir, Mapping) else {"raw": str(tree_dir)})
             )
-            serialized = json.dumps(spec_dict, sort_keys=True, indent=2).encode("utf-8")
+            serialized = _interpolate_bytes(json.dumps(spec_dict, sort_keys=True, indent=2).encode("utf-8"))
             source_hasher.update(serialized)
             manifest_dir = target_path / "harness"
             manifest_dir.mkdir(parents=True, exist_ok=True)
             manifest_file = manifest_dir / "manifest.json"
             manifest_file.write_bytes(serialized)
             materialised_files.append("harness/manifest.json")
+
+        if ctx_map:
+            ctx_bytes = json.dumps(ctx_map, sort_keys=True, indent=2).encode("utf-8")
+            (target_path / ".harness-stage-context.json").write_bytes(ctx_bytes)
+            materialised_files.append(".harness-stage-context.json")
 
         staged_hasher = hashlib.sha256()
         for f_rel in sorted(materialised_files):
@@ -626,9 +674,33 @@ class AntigravitySubstrate:
                 "source_fingerprint": source_fp,
                 "staged_digest": staged_fp,
                 "materialised_files": materialised_files,
-                "ctx": dict(ctx or {}),
+                "ctx": ctx_map,
             },
         )
+
+    def _resolve_candidate_command(self, candidate_dir: Optional[Path]) -> Optional[Union[str, List[str]]]:
+        if candidate_dir is None or not candidate_dir.exists() or not candidate_dir.is_dir():
+            return None
+        for manifest_rel in ("harness/manifest.json", "manifest.json", "candidate_spec.json"):
+            m_path = candidate_dir / manifest_rel
+            if m_path.exists() and m_path.is_file():
+                try:
+                    m_data = json.loads(m_path.read_text(encoding="utf-8"))
+                    if isinstance(m_data, dict):
+                        cmd_val = m_data.get("command") or m_data.get("entrypoint")
+                        if isinstance(cmd_val, (str, list)) and cmd_val:
+                            return cmd_val
+                except Exception:
+                    pass
+        for script_rel in ("run.py", "scripts/run.py", "harness/run.py"):
+            s_path = candidate_dir / script_rel
+            if s_path.exists() and s_path.is_file():
+                return [sys.executable, str(s_path)]
+        for node_rel in ("run.mjs", "run.js", "scripts/run.mjs", "scripts/run.js"):
+            n_path = candidate_dir / node_rel
+            if n_path.exists() and n_path.is_file():
+                return ["node", str(n_path)]
+        return None
 
     def _execute_single_run(self, spec: Dict[str, Any]) -> Dict[str, Any]:
         run_id = str(
@@ -646,7 +718,9 @@ class AntigravitySubstrate:
         deliverables_dir.mkdir(parents=True, exist_ok=True)
 
         required_files = list(spec.get("required_files") or spec.get("requiredArtifacts") or [])
-        command = spec.get("command")
+        candidate_dir_raw = spec.get("install_dir") or spec.get("harness_dir")
+        candidate_dir_path = Path(candidate_dir_raw).resolve() if candidate_dir_raw else None
+        command = spec.get("command") or self._resolve_candidate_command(candidate_dir_path)
         timeout_s = float(spec.get("timeout_s") or spec.get("timeout") or 30.0)
         events: List[Dict[str, Any]] = []
         errors: List[str] = []
@@ -655,10 +729,17 @@ class AntigravitySubstrate:
 
         if command:
             try:
+                run_env = dict(os.environ)
+                run_env["HARNESS_RUN_DIR"] = str(run_dir_path)
+                run_env["HARNESS_DELIVERABLES_DIR"] = str(deliverables_dir)
+                run_env["HARNESS_TASK_ID"] = str(spec.get("task_id") or spec.get("task_ref") or "")
+                if candidate_dir_path:
+                    run_env["HARNESS_CANDIDATE_DIR"] = str(candidate_dir_path)
                 proc = subprocess.run(
                     command if isinstance(command, list) else str(command),
                     shell=isinstance(command, str),
                     cwd=str(run_dir_path),
+                    env=run_env,
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
@@ -703,7 +784,14 @@ class AntigravitySubstrate:
             )
 
         # Collect agent-produced files strictly inside run_dir_path
-        metadata_names = {"receipt.json", "trajectory.json", "manifest.json", "candidate_spec.json"}
+        metadata_names = {
+            "receipt.json",
+            "trajectory.json",
+            "manifest.json",
+            "candidate_spec.json",
+            "assistant_response.md",
+            ".harness-stage-context.json",
+        }
         produced_files: List[str] = []
         for f_item in sorted(run_dir_path.rglob("*")):
             if not f_item.is_file() or f_item.name in metadata_names:
@@ -913,7 +1001,14 @@ class AntigravityBenchmarkAdapter:
     )
 
     METADATA_FILES: frozenset[str] = frozenset(
-        {"receipt.json", "trajectory.json", "manifest.json", "candidate_spec.json"}
+        {
+            "receipt.json",
+            "trajectory.json",
+            "manifest.json",
+            "candidate_spec.json",
+            "assistant_response.md",
+            ".harness-stage-context.json",
+        }
     )
 
     def __init__(
@@ -968,6 +1063,7 @@ class AntigravityBenchmarkAdapter:
                     "task_id": task_id,
                     "run_id": run_id,
                     "run_dir": str(run_dir),
+                    "harness_dir": str(harness_dir) if harness_dir else None,
                     "required_files": self.required_files,
                     "timeout_s": timeout or self.spec.default_timeout,
                 }
@@ -1404,6 +1500,18 @@ class AntigravityExecutor(AntigravitySubstrate):
         )
         return self._call_rag_node(js)
 
+    def create_evaluation_receipt(self, receipt_payload: Dict[str, Any]) -> Dict[str, Any]:
+        ws_json = json.dumps(str(self.workspace_root))
+        uri_json = json.dumps(self._rag_engine_uri)
+        payload = json.dumps(receipt_payload)
+        js = (
+            f"import({uri_json}).then(({{HarnessKnowledgeEngine}}) => {{"
+            f"const eng = new HarnessKnowledgeEngine({ws_json});"
+            f"console.log(JSON.stringify(eng.createEvaluationReceipt({payload})));"
+            "});"
+        )
+        return self._call_rag_node(js)
+
     async def probe_candidate_async(
         self,
         task_prompt: str,
@@ -1426,17 +1534,35 @@ class AntigravityExecutor(AntigravitySubstrate):
             try:
                 from google.antigravity import Agent, LocalAgentConfig, types  # type: ignore
 
-                config = LocalAgentConfig(
-                    system_instructions=sys_instructions,
-                    capabilities=types.CapabilitiesConfig(enable_subagents=True),
-                )
+                sdk_kwargs: Dict[str, Any] = {
+                    "system_instructions": sys_instructions,
+                    "capabilities": types.CapabilitiesConfig(enable_subagents=True),
+                    "workspace_root": str(self.workspace_root),
+                    "max_steps": int(candidate.max_steps),
+                    "thinking_budget_tokens": int(thinking_cap),
+                }
+                try:
+                    config = LocalAgentConfig(**sdk_kwargs)
+                except TypeError:
+                    config = LocalAgentConfig(
+                        system_instructions=sys_instructions,
+                        capabilities=types.CapabilitiesConfig(enable_subagents=True),
+                    )
+                    try:
+                        setattr(config, "workspace_root", str(self.workspace_root))
+                        setattr(config, "max_steps", int(candidate.max_steps))
+                        setattr(config, "thinking_budget_tokens", int(thinking_cap))
+                    except Exception:
+                        pass
+
                 async with Agent(config) as agent:
                     response = await agent.chat(task_prompt)
                     text_out = await response.text()
                     usage = agent.conversation.total_usage
-                    p_tok = getattr(usage, "prompt_token_count", 0)
-                    c_tok = getattr(usage, "candidates_token_count", 0)
-                    t_tok = min(thinking_cap, getattr(usage, "thoughts_token_count", 0))
+                    p_tok = int(getattr(usage, "prompt_token_count", 0) or 0)
+                    c_tok = int(getattr(usage, "candidates_token_count", 0) or 0)
+                    # Record actual observed thoughts_token_count without clipping to thinking_cap
+                    t_tok = int(getattr(usage, "thoughts_token_count", 0) or 0)
                     tot_tok = p_tok + c_tok + t_tok
 
                     run_dir = (
@@ -1448,13 +1574,42 @@ class AntigravityExecutor(AntigravitySubstrate):
                     ).resolve()
                     deliv_dir = run_dir / "deliverables"
                     deliv_dir.mkdir(parents=True, exist_ok=True)
+                    # Store model prose output as metadata (assistant_response.md), NEVER as a deliverable artifact!
                     if text_out.strip():
-                        (deliv_dir / "response.md").write_text(text_out, encoding="utf-8")
+                        (run_dir / "assistant_response.md").write_text(text_out, encoding="utf-8")
 
                     bench = AntigravityBenchmarkAdapter(
                         self.workspace_root, required_files=required_files
                     )
                     deliv_ok = bench.delivered(run_dir, required_files)
+                    traj_payload = {
+                        "run_id": f"{task_id}-{candidate.candidate_id}",
+                        "run_dir": str(run_dir),
+                        "executed": True,
+                        "events": [
+                            {"type": "action", "step": 1, "action": "agent.chat", "candidate_id": candidate.candidate_id},
+                            {"type": "observation", "step": 1, "summary": text_out[:2000]},
+                        ],
+                        "errors": [] if deliv_ok else ["MISSING_DELIVERABLES"],
+                    }
+                    receipt_payload = {
+                        "run_id": f"{task_id}-{candidate.candidate_id}",
+                        "task_id": task_id,
+                        "run_dir": str(run_dir),
+                        "executed": True,
+                        "synthetic": False,
+                        "status": "succeeded" if deliv_ok else "failed",
+                        "passed_verification": deliv_ok,
+                        "verification_score": 1.0 if deliv_ok else 0.0,
+                        "delivered": deliv_ok,
+                        "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    }
+                    (run_dir / "trajectory.json").write_text(json.dumps(traj_payload, indent=2), encoding="utf-8")
+                    (run_dir / "receipt.json").write_text(json.dumps(receipt_payload, indent=2), encoding="utf-8")
+
+                    scored = bench.score(run_dir, task_id=task_id, required_files=required_files)
+                    passed_ver = bool(scored and scored.get("passed"))
+                    ver_score = float(scored.get("score", 0.0)) if scored else 0.0
                     saved_tok = max(0, unoptimized_baseline_tokens - tot_tok) if tot_tok > 0 else 0
                     saved_pct = (
                         round((saved_tok / unoptimized_baseline_tokens) * 100.0, 1)
@@ -1465,10 +1620,10 @@ class AntigravityExecutor(AntigravitySubstrate):
                         candidate_id=candidate.candidate_id,
                         snapshot_id=snapshot_id,
                         workspace_mode="branch",
-                        passed_verification=deliv_ok,
-                        verification_score=0.95 if deliv_ok else 0.0,
-                        steps_executed=min(4, candidate.max_steps),
-                        tool_errors=0 if deliv_ok else 1,
+                        passed_verification=passed_ver,
+                        verification_score=ver_score,
+                        steps_executed=1,
+                        tool_errors=0 if passed_ver else 1,
                         prompt_tokens=p_tok,
                         candidates_tokens=c_tok,
                         thoughts_tokens=t_tok,
@@ -1829,6 +1984,28 @@ class AntigravityExecutor(AntigravitySubstrate):
             recorded_info = None
             if record_to_library:
                 rec_status = "candidate" if is_simulated_run else "active"
+                eval_receipt_id = None
+                if not is_simulated_run and winner.passed_verification:
+                    rcpt_res = self.create_evaluation_receipt(
+                        {
+                            "taskId": task_id,
+                            "candidateId": winning_spec.candidate_id,
+                            "domain": domain,
+                            "evaluatorId": "python-benchmark-adapter",
+                            "checks": [
+                                {
+                                    "name": "benchmark_adapter_score",
+                                    "passed": True,
+                                    "score": winner.verification_score,
+                                }
+                            ],
+                            "score": winner.verification_score,
+                            "passed": True,
+                            "actualTokens": total_actual_tokens if total_actual_tokens > 0 else None,
+                            "synthetic": False,
+                        }
+                    )
+                    eval_receipt_id = rcpt_res.get("receiptId")
                 recorded_info = self.record_experience(
                     {
                         "task_id": task_id,
@@ -1849,6 +2026,7 @@ class AntigravityExecutor(AntigravitySubstrate):
                         "supporting_evidence": winner.evidence_paths,
                         "status": rec_status,
                         "synthetic": is_simulated_run,
+                        "evaluation_receipt": eval_receipt_id,
                         "adopted_harness": {
                             **winning_spec.to_dict(),
                             "status": rec_status,

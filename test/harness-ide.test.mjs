@@ -173,7 +173,7 @@ test('4. Plugin Lifecycle Hooks adhere to Antigravity stdin/stdout JSON contract
 });
 
 test('5. Auxiliary Pane UI Sidecar Server responds on /, /api/status, /api/dashboard, /api/rag/query', async () => {
-  const app = createHarnessMonitorApp();
+  const app = createHarnessMonitorApp({ demoMode: true, requireAuth: false });
   await app.run(0);
   try {
     const base = `http://127.0.0.1:${app.port}`;
@@ -393,6 +393,7 @@ test('7. Google Harness2 end-to-end Propose-Probe-Compose loop & Adaptive Reason
     reasoningDepth: 'eco',
     earlyStopOnFirstPass: false,
     adoptWinner: false,
+    allowSimulation: true,
   });
 
   const balancedRun = engine.runHarness2Loop({
@@ -404,6 +405,7 @@ test('7. Google Harness2 end-to-end Propose-Probe-Compose loop & Adaptive Reason
     reasoningDepth: 'balanced',
     earlyStopOnFirstPass: false,
     adoptWinner: false,
+    allowSimulation: true,
   });
 
   const deepRun = engine.runHarness2Loop({
@@ -415,6 +417,7 @@ test('7. Google Harness2 end-to-end Propose-Probe-Compose loop & Adaptive Reason
     reasoningDepth: 'deep',
     earlyStopOnFirstPass: false,
     adoptWinner: false,
+    allowSimulation: true,
   });
 
   assert.equal(ecoRun.ok, true);
@@ -448,6 +451,7 @@ test('7. Google Harness2 end-to-end Propose-Probe-Compose loop & Adaptive Reason
     reasoningDepth: 'balanced',
     earlyStopOnFirstPass: true,
     adoptWinner: false,
+    allowSimulation: true,
   });
   assert.equal(seqEarlyRun.tokenEfficiency.earlyStopped, true);
   assert.ok(seqEarlyRun.trajectories.some((t) => t.earlyStopped === true));
@@ -466,6 +470,7 @@ test('7. Google Harness2 end-to-end Propose-Probe-Compose loop & Adaptive Reason
     reasoning_depth: 'balanced',
     early_stop: true,
     record_to_library: false,
+    allow_simulation: true,
   });
   assert.equal(mcpLoop.ok, true);
   assert.equal(mcpLoop.reasoningProfile.reasoningDepth, 'balanced');
@@ -473,7 +478,7 @@ test('7. Google Harness2 end-to-end Propose-Probe-Compose loop & Adaptive Reason
 });
 
 test('8. Multi-Model Hub (DeepSeek Official + OpenCode Go), Bidirectional Subagent Calling, Multi-Engine Search, Message Injection & Self-Improvement', async () => {
-  const app = createHarnessMonitorApp();
+  const app = createHarnessMonitorApp({ demoMode: true, requireAuth: false });
   await app.run(0);
   try {
     const base = `http://127.0.0.1:${app.port}`;
@@ -571,6 +576,7 @@ test('8. Multi-Model Hub (DeepSeek Official + OpenCode Go), Bidirectional Subage
       composer_model: 'opencode-go/gpt-6-luna',
       reasoning_depth: 'balanced',
       record_to_library: false,
+      allow_simulation: true,
     });
     assert.equal(rsiData.ok, true);
     assert.equal(rsiData.cooperationRoster.proposerModel, 'deepseek-v4-pro');
@@ -785,6 +791,7 @@ test('9. F01, F03, F06 & F12: Immutable Snapshot Blobs, CAS Locks, Missing/Trave
     problem: 'Produce verified artifact',
     requiredArtifacts: ['.harness/non-existent-required-output-12345.json'],
     adoptWinner: true,
+    allowSimulation: true,
   });
   assert.equal(missingArtRun.ok, false);
   assert.equal(missingArtRun.status, 'failed');
@@ -1116,26 +1123,39 @@ test('13. CTX-01..CTX-12: Gemini 4 Argon Context Resilience (Requirement Ledger,
       /CTX-07 violation/
     );
 
-    // Valid Requirement Ledger upsert
-    const ledger = ctxMgr.upsertRequirementLedger(tempTaskId, {
-      objective: 'Verify Argon Context Resilience end-to-end',
-      userCorrection: 'Never expose plaintext API keys or use private host RPCs',
-      requirements: [
-        {
-          id: 'REQ-01',
-          behavior: 'Validate cross-file units and schemas',
-          state: 'verified',
-          acceptanceChecks: ['validateContracts returns ok: true'],
-          evidenceRefs: ['test/harness-ide.test.mjs'],
-          consumerRefs: [{ file: 'src/context-resilience.mjs', symbol: 'validateContracts' }],
-        },
-        {
-          id: 'REQ-02',
-          behavior: 'Complete remaining integration',
-          state: 'implemented',
-        },
-      ],
-    });
+    // Valid Requirement Ledger upsert (using a passing non-synthetic verification verdict JSON)
+    const tempVerdictRel = `.harness/runtime/verdict-ctx13-${Date.now()}.json`;
+    const tempVerdictAbs = path.join(REPO_ROOT, tempVerdictRel);
+    fs.mkdirSync(path.dirname(tempVerdictAbs), { recursive: true });
+    fs.writeFileSync(
+      tempVerdictAbs,
+      JSON.stringify({ passed: true, score: 0.99, synthetic: false }, null, 2),
+      'utf8'
+    );
+    let ledger;
+    try {
+      ledger = ctxMgr.upsertRequirementLedger(tempTaskId, {
+        objective: 'Verify Argon Context Resilience end-to-end',
+        userCorrection: 'Never expose plaintext API keys or use private host RPCs',
+        requirements: [
+          {
+            id: 'REQ-01',
+            behavior: 'Validate cross-file units and schemas',
+            state: 'verified',
+            acceptanceChecks: ['validateContracts returns ok: true'],
+            evidenceRefs: [tempVerdictRel],
+            consumerRefs: [{ file: 'src/context-resilience.mjs', symbol: 'validateContracts' }],
+          },
+          {
+            id: 'REQ-02',
+            behavior: 'Complete remaining integration',
+            state: 'implemented',
+          },
+        ],
+      });
+    } finally {
+      if (fs.existsSync(tempVerdictAbs)) fs.unlinkSync(tempVerdictAbs);
+    }
     assert.equal(ledger.requirements.length, 2);
     assert.equal(ledger.userCorrections.length, 1);
 
@@ -1590,6 +1610,8 @@ test('16. WP4 & WP5: Public Antigravity Interfaces, Default Rule Deployment, Com
   const taskDir = ctxMgr._resolveSafeTaskDir(tempTaskId);
   const tempSourceRel = `.harness/runtime/wp5-consumer-${Date.now()}.mjs`;
   const tempSourceAbs = path.join(REPO_ROOT, tempSourceRel);
+  const tempVerdictRel = `.harness/runtime/wp5-verdict-${Date.now()}.json`;
+  const tempVerdictAbs = path.join(REPO_ROOT, tempVerdictRel);
 
   try {
     fs.mkdirSync(path.dirname(tempSourceAbs), { recursive: true });
@@ -1597,6 +1619,11 @@ test('16. WP4 & WP5: Public Antigravity Interfaces, Default Rule Deployment, Com
     fs.writeFileSync(
       tempSourceAbs,
       '// commentedOutHandler is not implemented yet\nexport function activeHandler() { return "ACT_KEY_1"; }\n',
+      'utf8'
+    );
+    fs.writeFileSync(
+      tempVerdictAbs,
+      JSON.stringify({ passed: true, score: 0.98, synthetic: false }, null, 2),
       'utf8'
     );
 
@@ -1611,12 +1638,12 @@ test('16. WP4 & WP5: Public Antigravity Interfaces, Default Rule Deployment, Com
               behavior: 'Must fail if symbol is only in comments',
               state: 'verified',
               acceptanceChecks: ['symbol check'],
-              evidenceRefs: [tempSourceRel],
+              evidenceRefs: [tempVerdictRel],
               consumerRefs: [{ file: tempSourceRel, symbol: 'commentedOutHandler' }],
             },
           ],
         }),
-      /in executable code \(comments excluded\)/
+      /in executable code \(comments and string literals excluded\)/
     );
 
     // Rejects nonexistent evidenceRef
@@ -1638,7 +1665,7 @@ test('16. WP4 & WP5: Public Antigravity Interfaces, Default Rule Deployment, Com
       /does not exist on disk/
     );
 
-    // Valid verified requirement referencing real activeHandler + real evidence file
+    // Valid verified requirement referencing real activeHandler + real passing verification verdict JSON
     ctxMgr.upsertRequirementLedger(tempTaskId, {
       objective: 'Live recovery & contract drift invalidation',
       userCorrection: 'Always verify live files before claiming verified',
@@ -1648,7 +1675,7 @@ test('16. WP4 & WP5: Public Antigravity Interfaces, Default Rule Deployment, Com
           behavior: 'Maintain ACT_KEY_1 contract between producer and consumer',
           state: 'verified',
           acceptanceChecks: ['ACT_KEY_1 present'],
-          evidenceRefs: [tempSourceRel],
+          evidenceRefs: [tempVerdictRel],
           consumerRefs: [{ file: tempSourceRel, symbol: 'activeHandler' }],
         },
       ],
@@ -1724,10 +1751,12 @@ test('16. WP4 & WP5: Public Antigravity Interfaces, Default Rule Deployment, Com
     const ack = ctxMgr.acknowledgeRecoveryPacket(tempTaskId, 'worker-live-1', {
       executorSessionId: 'SESSION-RESUMED-42',
       checkpointRevision: recovery.checkpointRevision,
+      recoveryToken: recovery.recoveryToken,
     });
     assert.equal(ack.ok, true);
   } finally {
     if (fs.existsSync(tempSourceAbs)) fs.unlinkSync(tempSourceAbs);
+    if (fs.existsSync(tempVerdictAbs)) fs.unlinkSync(tempVerdictAbs);
     if (fs.existsSync(taskDir)) fs.rmSync(taskDir, { recursive: true, force: true });
   }
 });
@@ -1959,13 +1988,18 @@ test('17. WP6, WP7 & WP8: Multi-Process Concurrency, Symlink Containment, Authen
   const e2eWs = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-wp7-e2e-'));
   const pluginMcpEntry = path.join(REPO_ROOT, 'plugin', 'harness-ide', 'scripts', 'mcp-entry.mjs');
   try {
-    // Initialize .harness directories and a real source consumer file in e2eWs
+    // Initialize .harness directories and a real source consumer file + verdict file in e2eWs
     const e2eEngine = new HarnessKnowledgeEngine(e2eWs);
     e2eEngine.ensureDirectories();
     fs.mkdirSync(path.join(e2eWs, 'src'), { recursive: true });
     fs.writeFileSync(
       path.join(e2eWs, 'src', 'feature.mjs'),
       'export function runVerifiedFeature() { return "WP7_CONTRACT_KEY"; }\n',
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(e2eWs, '.harness', 'runtime', 'wp7-verdict.json'),
+      JSON.stringify({ passed: true, score: 0.99, synthetic: false }, null, 2),
       'utf8'
     );
 
@@ -1982,7 +2016,7 @@ test('17. WP6, WP7 & WP8: Multi-Process Concurrency, Symlink Containment, Authen
           behavior: 'Create src/feature.mjs with runVerifiedFeature and WP7_CONTRACT_KEY',
           state: 'verified',
           acceptanceChecks: ['runVerifiedFeature returns WP7_CONTRACT_KEY'],
-          evidenceRefs: ['src/feature.mjs'],
+          evidenceRefs: ['.harness/runtime/wp7-verdict.json'],
           consumerRefs: [{ file: 'src/feature.mjs', symbol: 'runVerifiedFeature' }],
         },
       ],
@@ -2037,6 +2071,7 @@ test('17. WP6, WP7 & WP8: Multi-Process Concurrency, Symlink Containment, Authen
       worker_id: 'wp7-worker-1',
       executor_session_id: 'WP7-SESSION-1',
       checkpoint_revision: workerRestore.checkpointRevision,
+      recovery_token: workerRestore.recoveryToken,
     });
     assert.equal(workerAck.ok, true);
 
@@ -2106,3 +2141,493 @@ test('17. WP6, WP7 & WP8: Multi-Process Concurrency, Symlink Containment, Authen
     fs.rmSync(e2eWs, { recursive: true, force: true });
   }
 });
+
+test('18. PR A–G: Verification Authority, Frozen Snapshot Query Blobs, Dangling Symlinks, In-Flight Message Reservation, Context Recovery Tokens & Honest Monitor Telemetry', async () => {
+  const isoWs = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-pr-ag-'));
+  try {
+    const engine = new HarnessKnowledgeEngine(isoWs);
+    engine.ensureDirectories();
+
+    // --- PR A: Verification Authority & Promotion Gate ---
+    // 1. Caller-injected allowUnverifiedActive via MCP harness_record_experience must be ignored
+    const bypassRec = await handleToolCall('harness_record_experience', {
+      workspace_root: isoWs,
+      task_id: 'pr-a-bypass-attempt',
+      domain: 'software-engineering',
+      title: 'Bypass attempt',
+      problem: 'Attempt to record active without receipt via allowUnverifiedActive',
+      observed_behavior: 'Unverified claim',
+      status: 'active',
+      allowUnverifiedActive: true,
+    });
+    assert.equal(bypassRec.status, 'candidate', 'allowUnverifiedActive must be ignored without a valid receipt');
+    assert.equal(bypassRec.downgradedFromActive, true);
+
+    // 2. Executor that modifies a file WITHOUT an independent evaluator must return status: 'delivered_unverified' and passedVerification: false
+    const unverifiedDelivery = await engine.runHarness2Loop({
+      taskId: 'pr-a-delivered-unverified',
+      problem: 'Modify file without evaluator',
+      domain: 'software-engineering',
+      allowSimulation: false,
+      k: 1,
+      requiredArtifacts: ['src/unverified.txt'],
+      executor: async () => {
+        fs.mkdirSync(path.join(isoWs, 'src'), { recursive: true });
+        fs.writeFileSync(path.join(isoWs, 'src', 'unverified.txt'), 'changed without evaluator\n', 'utf8');
+        return {};
+      },
+    });
+    assert.equal(unverifiedDelivery.ok, false);
+    assert.equal(unverifiedDelivery.status, 'delivered_unverified');
+    assert.equal(unverifiedDelivery.passedVerification, false);
+    assert.equal(unverifiedDelivery.winner.totalTokens, null, 'Unobserved tokens must be null');
+    assert.equal(unverifiedDelivery.tokenEfficiency.totalActualTokens, null);
+
+    // 3. Multi-candidate workspace isolation: Candidate 1 and Candidate 2 write different values to the same path;
+    //    evaluator scores each candidate against its own isolated workspace state, and winning candidate state is restored
+    const multiCandRes = await engine.runHarness2Loop({
+      taskId: 'pr-a-multi-cand-isolation',
+      problem: 'Isolate candidate workspaces during K-candidate evaluation',
+      domain: 'software-engineering',
+      allowSimulation: false,
+      k: 2,
+      mode: 'sequential',
+      earlyStopOnFirstPass: false,
+      adoptWinner: true,
+      requiredArtifacts: ['src/isolated-out.txt'],
+      executor: async ({ candidateIndex }) => {
+        fs.mkdirSync(path.join(isoWs, 'src'), { recursive: true });
+        const content = candidateIndex === 0 ? 'CANDIDATE_1_WINNER\n' : 'CANDIDATE_2_LOSER\n';
+        fs.writeFileSync(path.join(isoWs, 'src', 'isolated-out.txt'), content, 'utf8');
+        return { observedTokens: 500 + candidateIndex * 100 };
+      },
+      evaluator: async ({ workspaceRoot }) => {
+        const txt = fs.readFileSync(path.join(workspaceRoot, 'src', 'isolated-out.txt'), 'utf8').trim();
+        const isCand1 = txt === 'CANDIDATE_1_WINNER';
+        return {
+          passed: isCand1,
+          score: isCand1 ? 0.97 : 0.25,
+          observedTokens: 500,
+        };
+      },
+    });
+    assert.equal(multiCandRes.ok, true);
+    assert.equal(multiCandRes.passedVerification, true);
+    assert.equal(
+      fs.readFileSync(path.join(isoWs, 'src', 'isolated-out.txt'), 'utf8').trim(),
+      'CANDIDATE_1_WINNER',
+      'Winning Candidate 1 artifact must be restored to workspaceRoot after Candidate 2 ran'
+    );
+    assert.ok(multiCandRes.receiptId);
+
+    // 4. Receipt lessonDigest binding: tampering with EXPERIENCE.md after receipt creation must fail promotion with RECEIPT_LESSON_DIGEST_MISMATCH
+    const expPath = path.join(
+      isoWs,
+      '.harness',
+      'library',
+      'software-engineering',
+      'harnesses',
+      'pr-a-multi-cand-isolation',
+      'EXPERIENCE.md'
+    );
+    const origExp = fs.readFileSync(expPath, 'utf8');
+    fs.writeFileSync(expPath, origExp + '\n<!-- tampered lesson text -->\n', 'utf8');
+    const tamperedLessonPromo = engine.promoteExperienceToProjectKnowledge({
+      task_id_or_docid: 'pr-a-multi-cand-isolation',
+      receiptId: multiCandRes.receiptId,
+    });
+    assert.equal(tamperedLessonPromo.ok, false);
+    assert.equal(tamperedLessonPromo.detail, 'RECEIPT_LESSON_DIGEST_MISMATCH');
+    fs.writeFileSync(expPath, origExp, 'utf8');
+    const validLessonPromo = engine.promoteExperienceToProjectKnowledge({
+      task_id_or_docid: 'pr-a-multi-cand-isolation',
+      adr_id: 'ADR-PR-A-ISOLATED',
+      receiptId: multiCandRes.receiptId,
+    });
+    assert.equal(validLessonPromo.ok, true);
+
+    // --- PR B: Snapshot Query from Frozen Blobs, Stale Index Detection & Dangling Symlinks ---
+    const snapDocPath = path.join(isoWs, '.harness', 'knowledge', 'project', 'ADR-SNAP-BLOB.md');
+    fs.mkdirSync(path.dirname(snapDocPath), { recursive: true });
+    fs.writeFileSync(
+      snapDocPath,
+      [
+        '---',
+        'docid: ADR-SNAP-BLOB',
+        'title: Frozen Snapshot Blob Test',
+        'collection: project-knowledge',
+        'domain: software-engineering',
+        'status: active',
+        'created_at: 2026-01-01T00:00:00.000Z',
+        '---',
+        '',
+        '# Frozen Snapshot Blob Test',
+        '',
+        'Original frozen keyword FROZEN_ALPHA_TOKEN_777.',
+      ].join('\n'),
+      'utf8'
+    );
+    // Automatic stale index detection in loadOrBuildIndex() when file is added
+    const autoDetected = engine.query({ query: 'FROZEN_ALPHA_TOKEN_777' });
+    assert.equal(autoDetected.results[0]?.docid, 'ADR-SNAP-BLOB');
+
+    const snap = engine.createSnapshotLock({
+      domain: 'software-engineering',
+      k: 2,
+      mode: 'parallel',
+    });
+    assert.equal(snap.ok, true);
+
+    // Mutate live ADR-SNAP-BLOB.md on disk and rebuild live index
+    fs.writeFileSync(
+      snapDocPath,
+      [
+        '---',
+        'docid: ADR-SNAP-BLOB',
+        'title: Mutated Live Document',
+        'collection: project-knowledge',
+        'domain: software-engineering',
+        'status: active',
+        'created_at: 2026-01-01T00:00:00.000Z',
+        '---',
+        '',
+        '# Mutated Live Document',
+        '',
+        'Mutated live keyword MUTATED_OMEGA_TOKEN_888.',
+      ].join('\n'),
+      'utf8'
+    );
+    engine.buildIndex();
+
+    // Query under snapshotId must score and snippet strictly from the frozen blob (finding FROZEN_ALPHA_TOKEN_777 and NOT MUTATED_OMEGA_TOKEN_888)
+    const frozenQueryHit = engine.query({
+      query: 'FROZEN_ALPHA_TOKEN_777',
+      snapshotId: snap.snapshotId,
+    });
+    assert.equal(frozenQueryHit.results[0]?.docid, 'ADR-SNAP-BLOB');
+    assert.ok(frozenQueryHit.results[0]?.snippet.includes('FROZEN_ALPHA_TOKEN_777'));
+
+    const mutatedQueryMiss = engine.query({
+      query: 'MUTATED_OMEGA_TOKEN_888',
+      snapshotId: snap.snapshotId,
+    });
+    assert.ok(!mutatedQueryMiss.results.some((r) => r.docid === 'ADR-SNAP-BLOB'));
+    engine.releaseSnapshotLock();
+
+    // Dangling symlink pointing outside workspaceRoot must be rejected by _isPathInsideWorkspace
+    const outsideTarget = path.join(os.tmpdir(), `outside-nonexistent-target-${Date.now()}.txt`);
+    const danglingLink = path.join(isoWs, 'src', 'dangling-outside-link.txt');
+    let symlinkCreated = false;
+    try {
+      fs.symlinkSync(outsideTarget, danglingLink);
+      symlinkCreated = true;
+    } catch {
+      // Windows without developer mode may disallow file symlinks; test directory junction if needed
+      try {
+        fs.symlinkSync(path.dirname(outsideTarget), danglingLink, 'junction');
+        symlinkCreated = true;
+      } catch {}
+    }
+    if (symlinkCreated) {
+      assert.equal(
+        engine._isPathInsideWorkspace(danglingLink),
+        false,
+        'Symlink/junction pointing outside workspaceRoot must be rejected'
+      );
+      fs.unlinkSync(danglingLink);
+    }
+
+    // --- PR C & PR G: Python Stage Interpolation, Execute, Assistant Prose Exclusion & Benchmark Prompts ---
+    const pyCheck = spawnSync(
+      'python',
+      [
+        '-c',
+        [
+          'import json, pathlib, tempfile',
+          'from adapters.harness2_antigravity_executor import AntigravityExecutor, AntigravityBenchmarkAdapter, resolve_prompts',
+          'ws = pathlib.Path(r"' + isoWs.replace(/\\/g, '\\\\') + '")',
+          'ex = AntigravityExecutor(workspace_root=str(ws))',
+          'stage_dir = pathlib.Path(tempfile.mkdtemp())',
+          'ex.materialise({"AGENTS.md": "Task={{task_ref}}Out={{out_dir}}"}, stage_dir, {"task_ref": "T-99", "out_dir": "deliverables"})',
+          'rendered = (stage_dir / "AGENTS.md").read_text(encoding="utf-8")',
+          'bench = AntigravityBenchmarkAdapter(required_files=["result.txt"])',
+          'prompts = resolve_prompts(bench)',
+          'run_dir = pathlib.Path(tempfile.mkdtemp())',
+          '(run_dir / "assistant_response.md").write_text("Model prose only", encoding="utf-8")',
+          '(run_dir / "receipt.json").write_text(json.dumps({"executed": True, "delivered": True, "synthetic": False}), encoding="utf-8")',
+          '(run_dir / "trajectory.json").write_text(json.dumps({"events": [{"step": 1}]}), encoding="utf-8")',
+          'prose_only_delivered = bench.delivered(run_dir)',
+          'print(json.dumps({"rendered": rendered, "has_prompts": bool(prompts.proposer and prompts.composer), "prose_only_delivered": prose_only_delivered}))',
+        ].join('; '),
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf8', timeout: 10000 }
+    );
+    assert.equal(pyCheck.status, 0, pyCheck.stderr);
+    const pyOut = JSON.parse(pyCheck.stdout.trim());
+    assert.equal(pyOut.rendered, 'Task=T-99Out=deliverables');
+    assert.equal(pyOut.has_prompts, true);
+    assert.equal(pyOut.prose_only_delivered, false, 'assistant_response.md prose must not satisfy delivered()');
+
+    // --- PR D: Default Strict Model Hub, In-Flight Message Reservation & Verified-Only Self-Improve Cue ---
+    const defaultStrictInvoke = await invokeUnifiedModel(isoWs, {
+      modelId: 'deepseek-v4-pro',
+      prompt: 'Default strict invocation without allowSimulation',
+    });
+    // Ensure when no credentials exist (or if vault has none in isolated env), it does not silently simulate
+    if (!resolveSecretCredential('DEEPSEEK_API_KEY').hasKey) {
+      assert.equal(defaultStrictInvoke.ok, false);
+      assert.equal(defaultStrictInvoke.status, 'unauthorized');
+    }
+
+    // Concurrent injectOrConveySwarmMessage with same ID must reserve IN_FLIGHT and call provider only once
+    let providerCallCount = 0;
+    const prevKey = resolveSecretCredential('DEEPSEEK_API_KEY');
+    setSecretInVault('DEEPSEEK_API_KEY', 'sk-temp-concurrent-bus-test');
+    try {
+      const mockFetch = async () => {
+        providerCallCount += 1;
+        await new Promise((r) => setTimeout(r, 40));
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            choices: [{ message: { content: 'Verified single provider call' } }],
+            usage: { prompt_tokens: 20, completion_tokens: 10, total_tokens: 30 },
+          }),
+        };
+      };
+      const sharedMsgId = `MSG-CONC-ONCE-${Date.now()}`;
+      const [c1, c2] = await Promise.all([
+        injectOrConveySwarmMessage(isoWs, {
+          id: sharedMsgId,
+          fromAgent: 'main-orchestrator',
+          toAgent: 'deepseek-peer-reasoner',
+          targetModelId: 'deepseek-v4-pro',
+          content: 'Execute exactly once',
+          executeModelCall: true,
+          fetchImpl: mockFetch,
+        }),
+        injectOrConveySwarmMessage(isoWs, {
+          id: sharedMsgId,
+          fromAgent: 'main-orchestrator',
+          toAgent: 'deepseek-peer-reasoner',
+          targetModelId: 'deepseek-v4-pro',
+          content: 'Execute exactly once',
+          executeModelCall: true,
+          fetchImpl: mockFetch,
+        }),
+      ]);
+      assert.equal(providerCallCount, 1, 'Concurrent duplicate message IDs must invoke provider at most once');
+      assert.ok(c1.idempotentDuplicate || c2.idempotentDuplicate);
+    } finally {
+      if (prevKey.hasKey && prevKey.source.includes('aes-256-gcm-vault')) {
+        setSecretInVault('DEEPSEEK_API_KEY', prevKey.value);
+      } else {
+        setSecretInVault('DEEPSEEK_API_KEY', '');
+      }
+    }
+
+    // --- PR E: String-Literal Symbol Rejection, Recovery Token Gate, Hook Priority & Supervisor Stop ---
+    const ctxMgr = new ContextResilienceManager(isoWs);
+    fs.mkdirSync(path.join(isoWs, 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(isoWs, 'src', 'string-only.mjs'),
+      'export const label = "stringLiteralOnlySymbol";\nexport function realSymbol() { return 1; }\n',
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(isoWs, '.harness', 'runtime', 'verdict-pass.json'),
+      JSON.stringify({ passed: true, score: 1.0, synthetic: false }),
+      'utf8'
+    );
+
+    // Rejects source code file as evidenceRefs
+    assert.throws(
+      () =>
+        ctxMgr.upsertRequirementLedger('task-pr-e', {
+          objective: 'Reject source file evidence',
+          requirements: [
+            {
+              id: 'REQ-SRC-EVID',
+              behavior: 'Source file is not verification evidence',
+              state: 'verified',
+              acceptanceChecks: ['check'],
+              evidenceRefs: ['src/string-only.mjs'],
+              consumerRefs: [{ file: 'src/string-only.mjs', symbol: 'realSymbol' }],
+            },
+          ],
+        }),
+      /must be a passing evaluation receipt/
+    );
+
+    // Rejects symbol that appears only inside a string literal
+    assert.throws(
+      () =>
+        ctxMgr.upsertRequirementLedger('task-pr-e', {
+          objective: 'Reject string-literal-only symbol',
+          requirements: [
+            {
+              id: 'REQ-STR-SYM',
+              behavior: 'Symbol in string literal is not executable implementation',
+              state: 'verified',
+              acceptanceChecks: ['check'],
+              evidenceRefs: ['.harness/runtime/verdict-pass.json'],
+              consumerRefs: [{ file: 'src/string-only.mjs', symbol: 'stringLiteralOnlySymbol' }],
+            },
+          ],
+        }),
+      /in executable code \(comments and string literals excluded\)/
+    );
+
+    // Valid upsert + recovery token & stale packet rejection
+    ctxMgr.upsertRequirementLedger('task-pr-e', {
+      objective: 'A'.repeat(2000),
+      userCorrection: 'CRITICAL_USER_CORRECTION_NEVER_DROP',
+      requirements: [
+        {
+          id: 'REQ-OPEN-99',
+          behavior: 'Open requirement must stay visible in hook packet',
+          state: 'implemented',
+        },
+      ],
+    });
+    ctxMgr.writeCheckpoint('task-pr-e', {
+      activeWorkers: [{ workerId: 'worker-e1', ownership: ['src/string-only.mjs'], openChecks: ['REQ-OPEN-99'] }],
+      nextAction: 'Verify token',
+    });
+    const restoreE1 = ctxMgr.restoreSubagentFromCheckpoint('task-pr-e', 'worker-e1', {
+      executorSessionId: 'SES-E1',
+    });
+    assert.ok(restoreE1.recoveryToken);
+
+    // Missing recoveryToken must fail
+    const missingTokenAck = ctxMgr.acknowledgeRecoveryPacket('task-pr-e', 'worker-e1', {
+      executorSessionId: 'SES-E1',
+      checkpointRevision: restoreE1.checkpointRevision,
+    });
+    assert.equal(missingTokenAck.ok, false);
+    assert.equal(missingTokenAck.error, 'RECOVERY_TOKEN_REQUIRED');
+
+    // Advance ledger after restore -> acknowledging old recovery packet must fail with STALE_RECOVERY_PACKET
+    ctxMgr.upsertRequirementLedger('task-pr-e', {
+      userCorrection: 'Second correction after restore',
+    });
+    const staleAck = ctxMgr.acknowledgeRecoveryPacket('task-pr-e', 'worker-e1', {
+      executorSessionId: 'SES-E1',
+      checkpointRevision: restoreE1.checkpointRevision,
+      recoveryToken: restoreE1.recoveryToken,
+    });
+    assert.equal(staleAck.ok, false);
+    assert.equal(staleAck.error, 'STALE_RECOVERY_PACKET');
+
+    // Hook packet prioritization: even with 2,000-char Objective, Latest Correction and Open Reqs are preserved under 700 chars
+    const hookPkt = ctxMgr.buildActiveTasksHookPacket(700);
+    assert.ok(hookPkt.length <= 700);
+    assert.ok(hookPkt.includes('CRITICAL_USER_CORRECTION_NEVER_DROP') || hookPkt.includes('Second correction after restore'));
+    assert.ok(hookPkt.includes('REQ-OPEN-99'));
+
+    // Supervisor stop after 3 stagnant attempts blocks runHarness2Loop and invokeUnifiedModel
+    ctxMgr.recordAttemptProgress('task-pr-e', { madeProgress: false, maxStagnantAttempts: 3 });
+    ctxMgr.recordAttemptProgress('task-pr-e', { madeProgress: false, maxStagnantAttempts: 3 });
+    ctxMgr.recordAttemptProgress('task-pr-e', { madeProgress: false, maxStagnantAttempts: 3 });
+
+    const stoppedLoop = await engine.runHarness2Loop({
+      taskId: 'task-pr-e',
+      problem: 'Should be halted by supervisor stop',
+      allowSimulation: true,
+    });
+    assert.equal(stoppedLoop.ok, false);
+    assert.equal(stoppedLoop.error, 'ESCALATED_NO_PROGRESS_STOP');
+
+    const stoppedModel = await invokeUnifiedModel(isoWs, {
+      taskId: 'task-pr-e',
+      modelId: 'deepseek-v4-pro',
+      prompt: 'Should be halted by supervisor stop',
+      allowSimulation: true,
+    });
+    assert.equal(stoppedModel.ok, false);
+    assert.equal(stoppedModel.error, 'ESCALATED_NO_PROGRESS_STOP');
+
+    // --- PR F: Default Monitor Auth, Honest Partial Telemetry & Template Worker Recall Guard ---
+    // Write a single tool-call event without token counts into telemetry.json
+    fs.writeFileSync(
+      path.join(isoWs, '.harness', 'runtime', 'telemetry.json'),
+      JSON.stringify(
+        {
+          updatedAt: new Date().toISOString(),
+          events: [{ timestamp: new Date().toISOString(), hook: 'postToolUse', toolName: 'read_file', stepIdx: 1 }],
+          sessions: {},
+        },
+        null,
+        2
+      ),
+      'utf8'
+    );
+
+    const strictApp = createHarnessMonitorApp({
+      registeredWorkspaces: [isoWs],
+    });
+    await strictApp.run(0);
+    try {
+      const base = `http://127.0.0.1:${strictApp.port}`;
+      // Default app requires authentication (401 without X-Sidecar-Token)
+      const unauthRes = await fetch(`${base}/api/status`);
+      assert.equal(unauthRes.status, 401);
+
+      const headers = {
+        'Content-Type': 'application/json',
+        'X-Sidecar-Token': strictApp.sessionToken,
+      };
+
+      // Request body cannot override allowUnregisteredWorkspaces
+      const unregisteredWs = fs.mkdtempSync(path.join(os.tmpdir(), 'unregistered-ws-'));
+      try {
+        const unregRes = await fetch(`${base}/api/dashboard`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            workspaceRoot: unregisteredWs,
+            allowUnregisteredWorkspaces: true,
+          }),
+        });
+        assert.equal(unregRes.status, 403);
+      } finally {
+        fs.rmSync(unregisteredWs, { recursive: true, force: true });
+      }
+
+      // Partial telemetry (1 tool event, 0 token counts, 0 spawned subagents) must NOT fabricate 29,700 tokens or 7 template subagents
+      const dashRes = await fetch(`${base}/api/dashboard`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ workspaceRoot: isoWs }),
+      });
+      assert.equal(dashRes.status, 200);
+      const dash = await dashRes.json();
+      assert.equal(dash.contextAnalytics.observedSteps, 1);
+      assert.equal(dash.contextAnalytics.observedTokens, null);
+      assert.equal(dash.contextAnalytics.currentWindow.totalTokens, null);
+      assert.equal(dash.contextAnalytics.currentWindow.cacheHitPct, null);
+      assert.equal(dash.swarm.formations['live-harness2'].nodes.length, 1);
+      assert.equal(dash.swarm.formations['live-harness2'].nodes[0].id, 'main-orchestrator');
+
+      // Recalling a template worker when no real subagent was spawned must return 409 NO_REGISTERED_EXECUTOR_FOR_WORKER
+      const templateRecallRes = await fetch(`${base}/api/swarm/recall`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          workspaceRoot: isoWs,
+          nodeId: 'harness-proposer',
+          action: 'recall',
+        }),
+      });
+      assert.equal(templateRecallRes.status, 409);
+      const templateRecallJson = await templateRecallRes.json();
+      assert.equal(templateRecallJson.error, 'NO_REGISTERED_EXECUTOR_FOR_WORKER');
+    } finally {
+      await strictApp.close();
+    }
+  } finally {
+    fs.rmSync(isoWs, { recursive: true, force: true });
+  }
+});
+

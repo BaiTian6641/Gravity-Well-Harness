@@ -52,3 +52,7 @@ Tasks within `software-engineering` execute in order and may read only earlier `
 - **[task-stage15-wp1-wp7-verified](./harnesses/task-stage15-wp1-wp7-verified/EXPERIENCE.md)** (`2026-11-08T02:08:27.111Z`, `status: active`)
   - **Cue**: *When hardening agent harnesses for self-improvement, separate execution, verification, and promotion via HMAC-SHA256 stored evaluation receipts bound to on-disk artifact hashes, unify packaged plugin MCP entrypoints with development servers, and reconcile worker recovery packets against live Requirement Ledgers and contract validations.*
   - **Adopted Harness**: [`./harnesses/task-stage15-wp1-wp7-verified/harness/manifest.json`](./harnesses/task-stage15-wp1-wp7-verified/harness/manifest.json)
+
+- **[task-stage16-pr-a-g-verified](./harnesses/task-stage16-pr-a-g-verified/EXPERIENCE.md)** (`2026-11-08T04:19:57.083Z`, `status: active`)
+  - **Cue**: *When verifying candidate harnesses or promoting lessons, bind 15-field HMAC receipts to lessonDigest and harnessDigest, isolate candidate workspaces, score snapshot queries from frozen blobs, and require recoveryToken on subagent recovery.*
+  - **Adopted Harness**: [`./harnesses/task-stage16-pr-a-g-verified/harness/manifest.json`](./harnesses/task-stage16-pr-a-g-verified/harness/manifest.json)

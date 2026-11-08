@@ -800,25 +800,36 @@ export async function handleToolCall(name, args = {}) {
       requireNonEmptyString(args.problem, 'problem', name);
       requireNonEmptyString(args.observed_behavior ?? args.observedBehavior, 'observed_behavior', name);
       return engine.recordExperience({
-        ...args,
         task_id: taskId,
+        domain: args.domain,
+        title: args.title,
+        cue: args.cue,
+        problem: args.problem,
         observed_behavior: args.observed_behavior ?? args.observedBehavior,
-        receiptId: args.receipt_id ?? args.receiptId,
+        supporting_evidence: args.supporting_evidence ?? args.supportingEvidence,
+        receiptId:
+          args.receipt_id ??
+          args.receiptId ??
+          args.evaluation_receipt_id ??
+          args.evaluationReceiptId,
         evaluationReceipt: args.evaluation_receipt ?? args.evaluationReceipt,
         status: args.status,
         synthetic: args.synthetic,
+        tags: args.tags,
+        adopted_harness: args.adopted_harness ?? args.adoptedHarness,
       });
     }
     case 'harness_promote_lesson': {
       const targetDocId = args.task_id_or_docid ?? args.experienceDocId ?? args.docid;
       requireNonEmptyString(targetDocId, 'task_id_or_docid', name);
       return engine.promoteExperienceToProjectKnowledge({
-        ...args,
         task_id_or_docid: targetDocId,
+        adr_id: args.adr_id ?? args.adrId,
+        title: args.title,
+        summary: args.summary,
         receiptId: args.receipt_id ?? args.receiptId,
         evaluationReceipt: args.evaluation_receipt ?? args.evaluationReceipt,
-        status: args.status,
-        synthetic: args.synthetic,
+        verified: args.verified,
       });
     }
     case 'harness_index_refresh': {
@@ -844,9 +855,18 @@ export async function handleToolCall(name, args = {}) {
             ? false
             : true;
       return await engine.runHarness2Loop({
-        ...args,
         task_id: taskId,
         taskId,
+        domain: args.domain,
+        problem: args.problem,
+        k: args.k,
+        mode: args.mode,
+        reasoning_depth: args.reasoning_depth ?? args.reasoningDepth,
+        thinking_budget_tokens: args.thinking_budget_tokens ?? args.thinkingBudgetTokens,
+        max_probe_steps: args.max_probe_steps ?? args.maxProbeSteps,
+        prober_model_tier: args.prober_model_tier ?? args.proberModelTier,
+        early_stop: args.early_stop ?? args.earlyStopOnFirstPass,
+        record_to_library: args.record_to_library ?? args.recordToLibrary,
         requiredArtifacts: args.required_artifacts ?? args.requiredArtifacts,
         allowSimulation,
         strictExecution: strictExec,
@@ -865,6 +885,7 @@ export async function handleToolCall(name, args = {}) {
         strictExecution: args.strict_execution ?? args.strictExecution,
         allowSimulation: args.allow_simulation ?? args.allowSimulation,
         executionMode: args.execution_mode ?? args.executionMode,
+        demoMode: args.demo_mode ?? args.demoMode,
         timeoutMs: args.timeout_ms ?? args.timeoutMs,
         endpoint: args.endpoint,
         baseUrl: args.base_url ?? args.baseUrl,
@@ -879,6 +900,7 @@ export async function handleToolCall(name, args = {}) {
         strictExecution: args.strict_execution ?? args.strictExecution,
         allowSimulation: args.allow_simulation ?? args.allowSimulation,
         executionMode: args.execution_mode ?? args.executionMode,
+        demoMode: args.demo_mode ?? args.demoMode,
         endpoint: args.endpoint,
         deepseekSearchUrl: args.deepseek_search_url ?? args.deepseekSearchUrl,
         parallelSearchUrl: args.parallel_search_url ?? args.parallelSearchUrl,
@@ -901,6 +923,7 @@ export async function handleToolCall(name, args = {}) {
         strictExecution: args.strict_execution ?? args.strictExecution,
         allowSimulation: args.allow_simulation ?? args.allowSimulation,
         executionMode: args.execution_mode ?? args.executionMode,
+        demoMode: args.demo_mode ?? args.demoMode,
         executeTargetModel: args.execute_target_model ?? args.executeTargetModel,
         runId: args.run_id ?? args.runId,
         candidateId: args.candidate_id ?? args.candidateId,
@@ -908,12 +931,21 @@ export async function handleToolCall(name, args = {}) {
     }
     case 'harness_self_improve':
       return runSelfImprovementCoopCycle(root, engine, {
-        ...args,
+        taskId: args.task_id ?? args.taskId,
+        task_id: args.task_id ?? args.taskId,
         task: args.task || args.problem,
+        problem: args.problem || args.task,
+        domain: args.domain,
+        proposer_model: args.proposer_model ?? args.proposerModel,
+        prober_models: args.prober_models ?? args.proberModels,
+        composer_model: args.composer_model ?? args.composerModel,
         reasoningDepth: args.reasoning_depth || args.reasoningDepth,
+        record_to_library: args.record_to_library ?? args.recordToLibrary,
+        requiredArtifacts: args.required_artifacts ?? args.requiredArtifacts,
         strictExecution: args.strict_execution ?? args.strictExecution,
         allowSimulation: args.allow_simulation ?? args.allowSimulation,
         executionMode: args.execution_mode ?? args.executionMode,
+        demoMode: args.demo_mode ?? args.demoMode,
       });
     case 'harness_task_ledger': {
       const action = args.action;
