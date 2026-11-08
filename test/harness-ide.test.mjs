@@ -1542,19 +1542,31 @@ test('15. WP2 & WP3: Packaged 16-Tool MCP Parity Outside Source Tree, Strict Pol
     assert.equal(consumedList[0].id, fixedId);
     assert.equal(consumedList[0].consumed, true);
 
-    // Retry injecting the SAME message ID -> must return idempotentDuplicate: true and preserve consumed: true
+    // Retry injecting the SAME message ID with identical payload -> must return idempotentDuplicate: true and preserve consumed: true
     const duplicateSend = await injectOrConveySwarmMessage(REPO_ROOT, {
       id: fixedId,
       fromAgent: 'main-orchestrator',
       toAgent: 'worker-idempotent',
       type: 'CONVEY_CONTEXT',
-      content: 'Duplicate retry',
+      content: 'Deliver once only',
       executeModelCall: false,
     });
     assert.equal(duplicateSend.ok, true);
     assert.equal(duplicateSend.idempotentDuplicate, true);
     assert.equal(duplicateSend.message.consumed, true);
     assert.equal(consumePendingSwarmMessages(REPO_ROOT, 'worker-idempotent').length, 0);
+
+    // Reusing the SAME message ID with conflicting content must fail with MESSAGE_ID_PAYLOAD_CONFLICT
+    const conflictSend = await injectOrConveySwarmMessage(REPO_ROOT, {
+      id: fixedId,
+      fromAgent: 'main-orchestrator',
+      toAgent: 'worker-idempotent',
+      type: 'CONVEY_CONTEXT',
+      content: 'Conflicting retry content',
+      executeModelCall: false,
+    });
+    assert.equal(conflictSend.ok, false);
+    assert.equal(conflictSend.error, 'MESSAGE_ID_PAYLOAD_CONFLICT');
 
     // Disabled provider with executeModelCall: true must report status: 'DELIVERY_FAILED' and ok: false
     saveHubConfig(REPO_ROOT, {
@@ -1740,6 +1752,10 @@ test('16. WP4 & WP5: Public Antigravity Interfaces, Default Rule Deployment, Com
     });
 
     // Live worker recovery must reflect the post-checkpoint userCorrection AND demote REQ-LIVE-01 to implemented_unverified!
+    ctxMgr.registerExecutorSession(tempTaskId, 'worker-live-1', {
+      executorSessionId: 'SESSION-RESUMED-42',
+      transport: 'in_process',
+    });
     const recovery = ctxMgr.restoreSubagentFromCheckpoint(tempTaskId, 'worker-live-1', {
       executorSessionId: 'SESSION-RESUMED-42',
     });
@@ -1748,6 +1764,11 @@ test('16. WP4 & WP5: Public Antigravity Interfaces, Default Rule Deployment, Com
     assert.equal(recovery.contractValidation.ok, false);
     assert.ok(recovery.invalidatedRequirements.includes('REQ-LIVE-01'));
     assert.equal(recovery.materialUserCorrections.length, 2);
+
+    const deliveredLive = ctxMgr.deliverRecoveryPacket(tempTaskId, 'worker-live-1', {
+      executorSessionId: 'SESSION-RESUMED-42',
+    });
+    assert.equal(deliveredLive.ok, true);
 
     const ack = ctxMgr.acknowledgeRecoveryPacket(tempTaskId, 'worker-live-1', {
       executorSessionId: 'SESSION-RESUMED-42',
@@ -2059,6 +2080,14 @@ test('17. WP6, WP7 & WP8: Multi-Process Concurrency, Symlink Containment, Authen
     });
     assert.equal(cpWrite.checkpointRevision, 1);
 
+    await handleToolCall('harness_checkpoint', {
+      workspace_root: e2eWs,
+      action: 'register_session',
+      task_id: 'task-wp7-e2e',
+      worker_id: 'wp7-worker-1',
+      executor_session_id: 'WP7-SESSION-1',
+      transport: 'in_process',
+    });
     const workerRestore = await handleToolCall('harness_checkpoint', {
       workspace_root: e2eWs,
       action: 'restore_subagent',
@@ -2068,6 +2097,15 @@ test('17. WP6, WP7 & WP8: Multi-Process Concurrency, Symlink Containment, Authen
     });
     assert.equal(workerRestore.ok, true);
     assert.equal(workerRestore.contractValidation.ok, true);
+
+    const workerDeliver = await handleToolCall('harness_checkpoint', {
+      workspace_root: e2eWs,
+      action: 'deliver_recovery',
+      task_id: 'task-wp7-e2e',
+      worker_id: 'wp7-worker-1',
+      executor_session_id: 'WP7-SESSION-1',
+    });
+    assert.equal(workerDeliver.ok, true);
 
     const workerAck = await handleToolCall('harness_checkpoint', {
       workspace_root: e2eWs,
@@ -2087,17 +2125,18 @@ test('17. WP6, WP7 & WP8: Multi-Process Concurrency, Symlink Containment, Authen
       domain: 'software-engineering',
       allowSimulation: false,
       requiredArtifacts: ['src/wp7-delivered.json'],
-      executor: async ({ candidate }) => {
+      executor: async ({ candidate, workspaceRoot }) => {
+        fs.mkdirSync(path.join(workspaceRoot, 'src'), { recursive: true });
         fs.writeFileSync(
-          path.join(e2eWs, 'src', 'wp7-delivered.json'),
+          path.join(workspaceRoot, 'src', 'wp7-delivered.json'),
           JSON.stringify({ deliveredBy: candidate.id, contract: 'WP7_CONTRACT_KEY' }, null, 2),
           'utf8'
         );
         return { observedTokens: 1820 };
       },
-      evaluator: async () => {
+      evaluator: async ({ workspaceRoot }) => {
         const raw = JSON.parse(
-          fs.readFileSync(path.join(e2eWs, 'src', 'wp7-delivered.json'), 'utf8')
+          fs.readFileSync(path.join(workspaceRoot, 'src', 'wp7-delivered.json'), 'utf8')
         );
         return {
           passed: raw.contract === 'WP7_CONTRACT_KEY',
@@ -2176,9 +2215,13 @@ test('18. PR A–G: Verification Authority, Frozen Snapshot Query Blobs, Danglin
       allowSimulation: false,
       k: 1,
       requiredArtifacts: ['src/unverified.txt'],
-      executor: async () => {
-        fs.mkdirSync(path.join(isoWs, 'src'), { recursive: true });
-        fs.writeFileSync(path.join(isoWs, 'src', 'unverified.txt'), 'changed without evaluator\n', 'utf8');
+      executor: async ({ workspaceRoot }) => {
+        fs.mkdirSync(path.join(workspaceRoot, 'src'), { recursive: true });
+        fs.writeFileSync(
+          path.join(workspaceRoot, 'src', 'unverified.txt'),
+          'changed without evaluator\n',
+          'utf8'
+        );
         return {};
       },
     });
@@ -2200,10 +2243,10 @@ test('18. PR A–G: Verification Authority, Frozen Snapshot Query Blobs, Danglin
       earlyStopOnFirstPass: false,
       adoptWinner: true,
       requiredArtifacts: ['src/isolated-out.txt'],
-      executor: async ({ candidateIndex }) => {
-        fs.mkdirSync(path.join(isoWs, 'src'), { recursive: true });
+      executor: async ({ candidateIndex, workspaceRoot }) => {
+        fs.mkdirSync(path.join(workspaceRoot, 'src'), { recursive: true });
         const content = candidateIndex === 0 ? 'CANDIDATE_1_WINNER\n' : 'CANDIDATE_2_LOSER\n';
-        fs.writeFileSync(path.join(isoWs, 'src', 'isolated-out.txt'), content, 'utf8');
+        fs.writeFileSync(path.join(workspaceRoot, 'src', 'isolated-out.txt'), content, 'utf8');
         return { observedTokens: 500 + candidateIndex * 100 };
       },
       evaluator: async ({ workspaceRoot }) => {
@@ -2501,10 +2544,17 @@ test('18. PR A–G: Verification Authority, Frozen Snapshot Query Blobs, Danglin
       activeWorkers: [{ workerId: 'worker-e1', ownership: ['src/string-only.mjs'], openChecks: ['REQ-OPEN-99'] }],
       nextAction: 'Verify token',
     });
+    ctxMgr.registerExecutorSession('task-pr-e', 'worker-e1', {
+      executorSessionId: 'SES-E1',
+      transport: 'in_process',
+    });
     const restoreE1 = ctxMgr.restoreSubagentFromCheckpoint('task-pr-e', 'worker-e1', {
       executorSessionId: 'SES-E1',
     });
     assert.ok(restoreE1.recoveryToken);
+    ctxMgr.deliverRecoveryPacket('task-pr-e', 'worker-e1', {
+      executorSessionId: 'SES-E1',
+    });
 
     // Missing recoveryToken must fail
     const missingTokenAck = ctxMgr.acknowledgeRecoveryPacket('task-pr-e', 'worker-e1', {
@@ -2973,10 +3023,18 @@ print("PYTHON_WP1_WP2_OK")
       activeWorkers: [{ workerId: 'worker-wp5', ownership: ['src/svc.mjs'], openChecks: ['REQ-WP5-1'] }],
       nextAction: 'Resume worker-wp5',
     });
+    ctxMgr.registerExecutorSession('task-wp5-ctx', 'worker-wp5', {
+      executorSessionId: 'SES-WP5-REAL',
+      transport: 'in_process',
+    });
     const restoredWp5 = ctxMgr.restoreSubagentFromCheckpoint('task-wp5-ctx', 'worker-wp5', {
       executor_session_id: 'SES-WP5-REAL',
     });
     assert.equal(restoredWp5.executorSessionId, 'SES-WP5-REAL');
+    const deliveredWp5 = ctxMgr.deliverRecoveryPacket('task-wp5-ctx', 'worker-wp5', {
+      executorSessionId: 'SES-WP5-REAL',
+    });
+    assert.equal(deliveredWp5.ok, true);
 
     // Wrong executor_session_id must be rejected
     const wrongSesAck = ctxMgr.acknowledgeRecoveryPacket('task-wp5-ctx', 'worker-wp5', {
@@ -3231,5 +3289,541 @@ print("PYTHON_WP1_WP2_OK")
     fs.rmSync(wpWs, { recursive: true, force: true });
   }
 });
+
+test('20. Review fbd2a9c (F01–F15 & WP1–WP10): Clean-Package Preflight, Argv Verifier, Tree-Diff Isolation & Deletions, Task/Check-Bound Receipts, Historical Lesson Revisions, Transport-Backed Recovery, Connected Self-Improve & Held-Out Gate', async () => {
+  const ws20 = fs.mkdtempSync(path.join(os.tmpdir(), 'gravity-well-f01-f15-'));
+  try {
+    // --- F01 / WP1: setup.mjs has zero antigravity-sidecar-kit imports and verifyCleanPackagePreflight passes ---
+    const setupRaw = fs.readFileSync(path.join(REPO_ROOT, 'setup.mjs'), 'utf8');
+    assert.ok(
+      !setupRaw.includes('antigravity-sidecar-kit'),
+      'setup.mjs must not import antigravity-sidecar-kit'
+    );
+    const { verifyCleanPackagePreflight } = await import('../setup.mjs');
+    const preflight = verifyCleanPackagePreflight(REPO_ROOT);
+    assert.equal(preflight.ok, true);
+
+    const engine = new HarnessKnowledgeEngine(ws20);
+    engine.ensureDirectories();
+    const ctxMgr = new ContextResilienceManager(ws20);
+    const { handleToolCall: pluginMcpCall } = await import(
+      '../plugin/harness-ide/scripts/mcp-entry.mjs'
+    );
+
+    // --- F02 / WP2: Quoted & multi-token verifier_command / verifier_args ---
+    const quotedFailLoop = await pluginMcpCall('harness_run_loop', {
+      workspace_root: ws20,
+      task_id: 'f02-quoted-verifier-fail',
+      domain: 'software-engineering',
+      problem: 'Quoted verifier command must not split inside quotes and must fail when assertion fails',
+      k: 1,
+      mode: 'sequential',
+      command: 'node',
+      args: ['-e', 'import("node:fs").then(fs => fs.writeFileSync("out.txt", "wrong value", "utf8"))'],
+      verifier_command:
+        'node -e "import fs from \'node:fs\'; const v = fs.readFileSync(\'out.txt\', \'utf8\'); if (!v.includes(\'hello world\')) process.exit(1)"',
+      required_artifacts: ['out.txt'],
+    });
+    assert.equal(quotedFailLoop.ok, false);
+    assert.equal(quotedFailLoop.passedVerification, false);
+    assert.equal(quotedFailLoop.receiptId, null);
+
+    const quotedPassLoop = await pluginMcpCall('harness_run_loop', {
+      workspace_root: ws20,
+      task_id: 'f02-quoted-verifier-pass',
+      domain: 'software-engineering',
+      problem: 'Quoted verifier command passes when out.txt contains hello world',
+      k: 1,
+      mode: 'sequential',
+      command: 'node',
+      args: ['-e', 'import("node:fs").then(fs => fs.writeFileSync("out.txt", "hello world\\n", "utf8"))'],
+      verifier_command:
+        'node -e "import fs from \'node:fs\'; const v = fs.readFileSync(\'out.txt\', \'utf8\'); if (!v.includes(\'hello world\')) process.exit(1)"',
+      required_artifacts: ['out.txt'],
+    });
+    assert.equal(quotedPassLoop.ok, true);
+    assert.equal(quotedPassLoop.passedVerification, true);
+    assert.ok(quotedPassLoop.receiptId);
+
+    // --- F03 / WP3: Candidate isolation without requiredArtifacts, tree-diff materialization, file deletion & postIntegrationVerified ---
+    fs.mkdirSync(path.join(ws20, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(ws20, 'src', 'obsolete.mjs'), 'export const old = true;\n', 'utf8');
+    fs.writeFileSync(path.join(ws20, 'src', 'live-mod.mjs'), 'export const val = "INITIAL";\n', 'utf8');
+
+    const treeDiffLoop = await engine.runHarness2Loop({
+      taskId: 'f03-tree-diff-and-delete',
+      domain: 'software-engineering',
+      problem: 'Isolate candidates even when requiredArtifacts is empty, apply deletions, and re-verify integrated tree',
+      allowSimulation: false,
+      k: 2,
+      mode: 'sequential',
+      earlyStopOnFirstPass: false,
+      // Intentionally omit requiredArtifacts to verify F03 unconditional staging isolation!
+      executor: async ({ candidateIndex, workspaceRoot }) => {
+        assert.notEqual(
+          path.resolve(workspaceRoot),
+          path.resolve(ws20),
+          'Candidate must execute in an isolated staging workspace even when requiredArtifacts is omitted'
+        );
+        if (candidateIndex === 0) {
+          // Candidate 1 (winner): updates live-mod.mjs and deletes obsolete.mjs
+          fs.writeFileSync(
+            path.join(workspaceRoot, 'src', 'live-mod.mjs'),
+            'export const val = "WINNER_CAND_1";\n',
+            'utf8'
+          );
+          if (fs.existsSync(path.join(workspaceRoot, 'src', 'obsolete.mjs'))) {
+            fs.unlinkSync(path.join(workspaceRoot, 'src', 'obsolete.mjs'));
+          }
+        } else {
+          // Candidate 2 (loser): writes broken value
+          fs.writeFileSync(
+            path.join(workspaceRoot, 'src', 'live-mod.mjs'),
+            'export const val = "LOSER_CAND_2";\n',
+            'utf8'
+          );
+        }
+        return { observedTokens: 400 + candidateIndex * 50 };
+      },
+      evaluator: async ({ workspaceRoot }) => {
+        const modTxt = fs.readFileSync(path.join(workspaceRoot, 'src', 'live-mod.mjs'), 'utf8');
+        const obsoleteExists = fs.existsSync(path.join(workspaceRoot, 'src', 'obsolete.mjs'));
+        const passed = modTxt.includes('WINNER_CAND_1') && !obsoleteExists;
+        return {
+          passed,
+          score: passed ? 0.98 : 0.1,
+          observedTokens: 100,
+        };
+      },
+    });
+    assert.equal(treeDiffLoop.ok, true);
+    assert.equal(treeDiffLoop.passedVerification, true);
+    assert.equal(treeDiffLoop.postIntegrationVerified, true);
+    assert.equal(
+      fs.readFileSync(path.join(ws20, 'src', 'live-mod.mjs'), 'utf8').trim(),
+      'export const val = "WINNER_CAND_1";'
+    );
+    assert.equal(
+      fs.existsSync(path.join(ws20, 'src', 'obsolete.mjs')),
+      false,
+      'Deleted file in winning candidate must be deleted in live workspace upon integration'
+    );
+
+    // --- F05 / WP4: Task-bound & check-bound receipts, requirement revision invalidation & allowVerifiedNoChange ---
+    const receiptForTaskA = ctxMgr.createAuthenticatedVerdict({
+      taskId: 'task-bound-A',
+      passed: true,
+      score: 1.0,
+      acceptanceCheckIds: ['check-alpha'],
+    });
+    const verdictPathA = '.harness/runtime/verdict-task-a.json';
+    fs.writeFileSync(path.join(ws20, verdictPathA), JSON.stringify(receiptForTaskA, null, 2), 'utf8');
+
+    // Cross-task receipt reuse must fail with TASK_ID_MISMATCH
+    assert.throws(
+      () =>
+        ctxMgr.upsertRequirementLedger('task-bound-B', {
+          objective: 'Attempt to reuse task-bound-A verdict on task-bound-B',
+          requirements: [
+            {
+              id: 'REQ-CROSS-TASK',
+              behavior: 'Must reject cross-task evidence',
+              state: 'verified',
+              acceptanceChecks: ['check-alpha'],
+              evidenceRefs: [verdictPathA],
+              consumerRefs: [{ file: 'src/live-mod.mjs', symbol: 'val' }],
+            },
+          ],
+        }),
+      /TASK_ID_MISMATCH/
+    );
+
+    // Missing acceptance check coverage must fail with MISSING_ACCEPTANCE_CHECK_COVERAGE
+    assert.throws(
+      () =>
+        ctxMgr.upsertRequirementLedger('task-bound-A', {
+          objective: 'Require both check-alpha and check-beta',
+          requirements: [
+            {
+              id: 'REQ-CHECK-COV',
+              behavior: 'Must reject partial acceptance check coverage',
+              state: 'verified',
+              acceptanceChecks: ['check-alpha', 'check-beta'],
+              evidenceRefs: [verdictPathA],
+              consumerRefs: [{ file: 'src/live-mod.mjs', symbol: 'val' }],
+            },
+          ],
+        }),
+      /MISSING_ACCEPTANCE_CHECK_COVERAGE/
+    );
+
+    // Verified no-change mode when workspace already satisfies independent verifier
+    const noChangeLoop = await engine.runHarness2Loop({
+      taskId: 'f05-verified-no-change',
+      domain: 'software-engineering',
+      problem: 'Verify already-compliant workspace with allowVerifiedNoChange',
+      allowSimulation: false,
+      allowVerifiedNoChange: true,
+      k: 1,
+      executor: async () => ({ observedTokens: 120 }),
+      evaluator: async ({ workspaceRoot }) => ({
+        passed: fs
+          .readFileSync(path.join(workspaceRoot, 'src', 'live-mod.mjs'), 'utf8')
+          .includes('WINNER_CAND_1'),
+        score: 0.95,
+        observedTokens: 80,
+      }),
+    });
+    assert.equal(noChangeLoop.ok, true);
+    assert.equal(noChangeLoop.passedVerification, true);
+    assert.ok(noChangeLoop.receiptId);
+
+    // --- F06 / WP5: Historical lesson revision promotion & transactional INDEX.md cue rollback ---
+    const liveModSha = crypto
+      .createHash('sha256')
+      .update(fs.readFileSync(path.join(ws20, 'src/live-mod.mjs')))
+      .digest('hex');
+    const rev1Receipt = engine.createEvaluationReceipt({
+      taskId: 'f06-history-task',
+      candidateId: 'cand-rev1',
+      domain: 'software-engineering',
+      passed: true,
+      score: 0.91,
+      evaluatorId: 'verifier-v1',
+      artifactHashes: { 'src/live-mod.mjs': liveModSha },
+    });
+    const rev1 = engine.recordExperience({
+      taskId: 'f06-history-task',
+      domain: 'software-engineering',
+      title: 'Revision 1 Lesson',
+      cue: 'cue-v1-alpha',
+      problem: 'Initial verified problem',
+      observedBehavior: 'Observed v1 behavior',
+      supportingEvidence: [rev1Receipt.receiptId],
+      status: 'active',
+      evaluationReceipt: rev1Receipt,
+    });
+    assert.equal(rev1.ok, true);
+    assert.equal(rev1.status, 'active');
+
+    const rev2Receipt = engine.createEvaluationReceipt({
+      taskId: 'f06-history-task',
+      candidateId: 'cand-rev2',
+      domain: 'software-engineering',
+      passed: true,
+      score: 0.97,
+      evaluatorId: 'verifier-v2',
+      artifactHashes: { 'src/live-mod.mjs': liveModSha },
+    });
+    const rev2 = engine.recordExperience({
+      taskId: 'f06-history-task',
+      domain: 'software-engineering',
+      title: 'Revision 2 Lesson',
+      cue: 'cue-v2-beta',
+      problem: 'Updated verified problem',
+      observedBehavior: 'Observed v2 behavior',
+      supportingEvidence: [rev2Receipt.receiptId],
+      status: 'active',
+      evaluationReceipt: rev2Receipt,
+    });
+    assert.equal(rev2.ok, true);
+    assert.notEqual(rev1.lessonRevisionId, rev2.lessonRevisionId);
+
+    // Promoting historical rev1 by its lessonRevisionId + rev1Receipt.receiptId must succeed!
+    const promoteHistorical = engine.promoteExperienceToProjectKnowledge({
+      task_id_or_docid: 'f06-history-task',
+      lessonRevisionId: rev1.lessonRevisionId,
+      receiptId: rev1Receipt.receiptId,
+      adr_id: 'ADR-F06-HIST-REV1',
+    });
+    assert.equal(promoteHistorical.ok, true);
+    assert.equal(promoteHistorical.promoted, true);
+    assert.equal(promoteHistorical.lessonRevisionId, rev1.lessonRevisionId);
+
+    // INDEX.md must have only the latest active cue ('cue-v2-beta') and not duplicate rows
+    const indexMdPath = path.join(ws20, '.harness', 'library', 'software-engineering', 'INDEX.md');
+    const indexMdBeforeRollback = fs.readFileSync(indexMdPath, 'utf8');
+    assert.ok(indexMdBeforeRollback.includes('cue-v2-beta'));
+    assert.ok(!indexMdBeforeRollback.includes('cue-v1-alpha'));
+
+    // Rolling back active lesson to rev1 must restore cue-v1-alpha in INDEX.md
+    const rb = engine.rollbackActiveLesson(
+      'software-engineering',
+      'f06-history-task',
+      rev1.lessonRevisionId
+    );
+    assert.equal(rb.ok, true);
+    const indexMdAfterRollback = fs.readFileSync(indexMdPath, 'utf8');
+    assert.ok(indexMdAfterRollback.includes('cue-v1-alpha'));
+    assert.ok(!indexMdAfterRollback.includes('cue-v2-beta'));
+
+    // --- F07 / WP7: Transport-backed recovery acknowledgment & view-only /api/swarm/reset ---
+    ctxMgr.upsertRequirementLedger('f07-recovery-task', {
+      objective: 'Require registered session and delivered packet before recovery ack',
+      requirements: [{ id: 'REQ-F07-1', behavior: 'Check transport', state: 'implemented' }],
+    });
+    ctxMgr.writeCheckpoint('f07-recovery-task', {
+      activeWorkers: [{ workerId: 'worker-f07', ownership: ['src/live-mod.mjs'], openChecks: ['REQ-F07-1'] }],
+      nextAction: 'Test recovery gate',
+    });
+    const prepRestore = ctxMgr.restoreSubagentFromCheckpoint('f07-recovery-task', 'worker-f07', {
+      executorSessionId: 'SES-UNREGISTERED',
+    });
+    // Without registerExecutorSession, acknowledgeRecoveryPacket must fail with NO_REGISTERED_EXECUTOR_SESSION
+    const unregAck = ctxMgr.acknowledgeRecoveryPacket('f07-recovery-task', 'worker-f07', {
+      executorSessionId: 'SES-UNREGISTERED',
+      checkpointRevision: prepRestore.checkpointRevision,
+      recoveryToken: prepRestore.recoveryToken,
+    });
+    assert.equal(unregAck.ok, false);
+    assert.equal(unregAck.error, 'NO_REGISTERED_EXECUTOR_SESSION');
+
+    // Register session, but do NOT deliver packet yet -> must fail with RECOVERY_PACKET_DELIVERY_UNCONFIRMED
+    ctxMgr.registerExecutorSession('f07-recovery-task', 'worker-f07', {
+      executorSessionId: 'SES-UNREGISTERED',
+      transport: 'in_process',
+    });
+    const undeliveredAck = ctxMgr.acknowledgeRecoveryPacket('f07-recovery-task', 'worker-f07', {
+      executorSessionId: 'SES-UNREGISTERED',
+      checkpointRevision: prepRestore.checkpointRevision,
+      recoveryToken: prepRestore.recoveryToken,
+    });
+    assert.equal(undeliveredAck.ok, false);
+    assert.equal(undeliveredAck.error, 'RECOVERY_PACKET_DELIVERY_UNCONFIRMED');
+
+    // Deliver packet -> acknowledge succeeds
+    const deliv = ctxMgr.deliverRecoveryPacket('f07-recovery-task', 'worker-f07', {
+      executorSessionId: 'SES-UNREGISTERED',
+    });
+    assert.equal(deliv.ok, true);
+    const fullAck = ctxMgr.acknowledgeRecoveryPacket('f07-recovery-task', 'worker-f07', {
+      executorSessionId: 'SES-UNREGISTERED',
+      checkpointRevision: prepRestore.checkpointRevision,
+      recoveryToken: prepRestore.recoveryToken,
+    });
+    assert.equal(fullAck.ok, true);
+
+    // --- F08 / WP8 & WP10: Connected harness_self_improve with real command + held-out verifier gate ---
+    const selfImprovePass = await pluginMcpCall('harness_self_improve', {
+      workspace_root: ws20,
+      task_id: 'f08-self-improve-real',
+      domain: 'software-engineering',
+      problem: 'Connected self-improve cycle with real executor, task verifier, and held-out verifier',
+      allow_simulation: false,
+      record_to_library: true,
+      command: 'node',
+      args: [
+        '-e',
+        'import("node:fs").then(fs => fs.writeFileSync("src/self-improved.txt", "HELD_OUT_PASS_OK\\n", "utf8"))',
+      ],
+      verifier_command: 'node',
+      verifier_args: [
+        '-e',
+        'import("node:fs").then(fs => { if (!fs.readFileSync("src/self-improved.txt", "utf8").includes("HELD_OUT_PASS_OK")) process.exit(1); })',
+      ],
+      held_out_verifier_command: 'node',
+      held_out_verifier_args: [
+        '-e',
+        'import("node:fs").then(fs => { if (fs.readFileSync("src/self-improved.txt", "utf8").trim() !== "HELD_OUT_PASS_OK") process.exit(1); })',
+      ],
+      required_artifacts: ['src/self-improved.txt'],
+    });
+    assert.equal(selfImprovePass.ok, true);
+    assert.equal(selfImprovePass.passedVerification, true);
+    assert.equal(selfImprovePass.heldOutPassed, true);
+    assert.equal(selfImprovePass.synthetic, false);
+    assert.ok(selfImprovePass.receiptId);
+    assert.equal(selfImprovePass.adoptedExperience?.status, 'active');
+
+    // Held-out failure must prevent active promotion
+    const selfImproveHeldOutFail = await pluginMcpCall('harness_self_improve', {
+      workspace_root: ws20,
+      task_id: 'f08-self-improve-heldout-fail',
+      domain: 'software-engineering',
+      problem: 'Task verifier passes but held-out verifier fails -> must not promote to active',
+      allow_simulation: false,
+      record_to_library: true,
+      command: 'node',
+      args: [
+        '-e',
+        'import("node:fs").then(fs => fs.writeFileSync("src/self-improved-2.txt", "TASK_ONLY\\n", "utf8"))',
+      ],
+      verifier_command: 'node',
+      verifier_args: [
+        '-e',
+        'import("node:fs").then(fs => { if (!fs.readFileSync("src/self-improved-2.txt", "utf8").includes("TASK_ONLY")) process.exit(1); })',
+      ],
+      held_out_verifier_command: 'node',
+      held_out_verifier_args: ['-e', 'process.exit(1)'],
+      required_artifacts: ['src/self-improved-2.txt'],
+    });
+    assert.equal(selfImproveHeldOutFail.ok, false);
+    assert.equal(selfImproveHeldOutFail.heldOutPassed, false);
+    assert.notEqual(selfImproveHeldOutFail.adoptedExperience?.status, 'active');
+
+    // --- F04 & F15 / WP6: Python Upstream Harness2 Dataclasses, Single-Pass Validator & Nested SDK Config Validation ---
+    const pyCheck = spawnSync(
+      'python',
+      [
+        '-c',
+        `
+import json, sys, tempfile
+from pathlib import Path
+sys.path.insert(0, ${JSON.stringify(REPO_ROOT)})
+from adapters.harness2_antigravity_executor import (
+    Channel,
+    ChannelSpec,
+    HarnessSpec,
+    BenchPrompts,
+    AntigravityBenchmarkAdapter,
+    build_sdk_agent_config,
+    validate_sdk_agent_config,
+    parse_agy_stream_json_events,
+    resolve_prompts,
+)
+
+ws = Path(${JSON.stringify(ws20)})
+# 1. Exact 6 BenchPrompts fields + upstream HarnessSpec/Channel
+bp = BenchPrompts(
+    domain_hint="dh",
+    proposer_hint="ph",
+    proposer_footer="pf",
+    composer_header="ch",
+    reflector_header="rh",
+    evaluator_notes="en",
+)
+assert bp.domain_hint == "dh" and bp.proposer == "ph" and bp.composer == "ch"
+hs = HarnessSpec(files={"AGENTS.md": "hello {{task_ref}}"}, summary="s1")
+ch = Channel(name="stdout", description="out")
+assert ch.name == "stdout"
+
+adapter = AntigravityBenchmarkAdapter(workspace_root=str(ws))
+stage = Path(tempfile.mkdtemp())
+inst = adapter.substrate.materialise(stage, hs, {"task_ref": "T-UPSTREAM"})
+assert (stage / "AGENTS.md").read_text(encoding="utf-8") == "hello T-UPSTREAM"
+
+# 2. Single-pass validator_cmd: counter file must increment only ONCE across execute() + score()
+counter_file = ws / "py-validator-count.txt"
+(stage / "run.py").write_text(
+    "from pathlib import Path\\nPath('deliverables').mkdir(exist_ok=True)\\nPath('deliverables/a.txt').write_text('ok', encoding='utf-8')\\n",
+    encoding="utf-8",
+)
+validator_cmd = [
+    sys.executable,
+    "-c",
+    f"from pathlib import Path; p = Path({str(counter_file)!r}); c = int(p.read_text()) if p.exists() else 0; p.write_text(str(c + 1))",
+]
+runs = adapter.substrate.execute("t-single-pass", install=inst, run_ids=["r1"], validator_cmd=validator_cmd)
+scored = adapter.score(runs[0], task_id="t-single-pass", validator_cmd=validator_cmd)
+assert scored["passed_verification"] is True
+assert int(counter_file.read_text()) == 1, f"Expected validator_cmd to run once, ran {counter_file.read_text()} times"
+
+# 3. Nested SDK config validation rejects legacy/invented keys
+cfg = build_sdk_agent_config(workspace_root=str(ws), model="gemini-2.5-pro")
+assert validate_sdk_agent_config(cfg)["ok"] is True
+for bad in [
+    {**cfg, "budget_config": {}},
+    {**cfg, "compaction_config": {}},
+    {**cfg, "model": "inherit"},
+    {**cfg, "budget": {**cfg["budget"], "max_iterations": 10}},
+    {**cfg, "compaction": {**cfg["compaction"], "enabled": True}},
+]:
+    assert validate_sdk_agent_config(bad)["ok"] is False
+
+# 4. parse_agy_stream_json_events
+ev = parse_agy_stream_json_events(['{"type":"turn_end","usage":{"total_tokens":321}}'])
+assert ev["observed_tokens"] == 321
+print("PY_F04_F15_OK")
+`,
+      ],
+      { encoding: 'utf8', timeout: 30000 }
+    );
+    assert.equal(pyCheck.status, 0, pyCheck.stderr || pyCheck.stdout);
+    assert.ok(pyCheck.stdout.includes('PY_F04_F15_OK'));
+
+    // --- F09, F10, F11, F12: Run requestId idempotency, hook replay/resurrection guard & monitor formation summary ---
+    const idemLoop1 = await engine.runHarness2Loop({
+      taskId: 'f10-idem-loop',
+      requestId: 'req-loop-idem-99',
+      problem: 'Idempotent loop test',
+      allowSimulation: true,
+      k: 1,
+    });
+    const idemLoop2 = await engine.runHarness2Loop({
+      taskId: 'f10-idem-loop',
+      requestId: 'req-loop-idem-99',
+      problem: 'Idempotent loop test',
+      allowSimulation: true,
+      k: 1,
+    });
+    assert.equal(idemLoop1.ok, true);
+    assert.equal(idemLoop2.idempotentReplay, true);
+
+    const idemLoopConflict = await engine.runHarness2Loop({
+      taskId: 'f10-idem-loop',
+      requestId: 'req-loop-idem-99',
+      problem: 'CONFLICTING PROBLEM PAYLOAD',
+      allowSimulation: true,
+      k: 1,
+    });
+    assert.equal(idemLoopConflict.ok, false);
+    assert.equal(idemLoopConflict.error, 'REQUEST_ID_PAYLOAD_CONFLICT');
+
+    // View-only /api/swarm/reset must NOT mark RUNNING subagents in telemetry.json as COMPLETED
+    const telPath = path.join(ws20, '.harness', 'runtime', 'telemetry.json');
+    fs.writeFileSync(
+      telPath,
+      JSON.stringify(
+        {
+          updatedAt: new Date().toISOString(),
+          events: [{ timestamp: new Date().toISOString(), hook: 'postToolUse', toolName: 'read_file', stepIdx: 1 }],
+          subagents: [{ id: 'sub-keep-running', role: 'Worker', status: 'RUNNING' }],
+          sessions: {},
+        },
+        null,
+        2
+      ),
+      'utf8'
+    );
+    const app = createHarnessMonitorApp({ registeredWorkspaces: [ws20] });
+    await app.run(0);
+    try {
+      const base = `http://127.0.0.1:${app.port}`;
+      const headers = {
+        'Content-Type': 'application/json',
+        'X-Sidecar-Token': app.sessionToken,
+      };
+      const resetRes = await fetch(`${base}/api/swarm/reset`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ workspaceRoot: ws20 }),
+      });
+      assert.equal(resetRes.status, 200);
+      const telAfterReset = JSON.parse(fs.readFileSync(telPath, 'utf8'));
+      assert.equal(
+        telAfterReset.subagents[0].status,
+        'RUNNING',
+        '/api/swarm/reset must not overwrite live RUNNING worker status to COMPLETED in telemetry.json'
+      );
+
+      // Formation summary must preserve null / 'unavailable' when worker token/cost telemetry is null
+      const dashRes = await fetch(`${base}/api/dashboard`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ workspaceRoot: ws20 }),
+      });
+      const dash = await dashRes.json();
+      const summary = dash.swarm.formations['live-harness2'].summary;
+      assert.equal(summary.totalTokens, null);
+      assert.equal(summary.totalTokensFormatted, 'unavailable');
+      assert.equal(summary.estimatedCostFormatted, 'unavailable');
+    } finally {
+      await app.close();
+    }
+  } finally {
+    fs.rmSync(ws20, { recursive: true, force: true });
+  }
+});
+
 
 

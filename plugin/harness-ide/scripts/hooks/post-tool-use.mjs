@@ -227,17 +227,31 @@ export function processPostToolUse(input = {}) {
         : Array.isArray(telemetry.events)
           ? telemetry.events
           : [];
+      const rawEventId = input.eventId || input.event_id || input.toolCall?.id || null;
+      const eventDedupId = rawEventId
+        ? `${convId}:ev-${rawEventId}`
+        : explicitStep !== null
+          ? `${convId}:step-${explicitStep}:${toolName}:${JSON.stringify(toolArgs).slice(0, 160)}`
+          : null;
+      telemetry.seenEventIds = Array.isArray(telemetry.seenEventIds) ? telemetry.seenEventIds : [];
       const isReplayedEvent =
-        explicitStep !== null &&
-        existingEventsList.some(
-          (ev) =>
-            ev &&
-            ev.conversationId === convId &&
-            Number(ev.stepIdx) === explicitStep &&
-            ev.toolName === toolName
-        );
+        (eventDedupId !== null && telemetry.seenEventIds.includes(eventDedupId)) ||
+        (explicitStep !== null &&
+          existingEventsList.some(
+            (ev) =>
+              ev &&
+              ev.conversationId === convId &&
+              Number(ev.stepIdx) === explicitStep &&
+              ev.toolName === toolName
+          ));
       if (!isReplayedEvent) {
         sess.toolCallCount = (sess.toolCallCount || 0) + 1;
+        if (eventDedupId !== null) {
+          telemetry.seenEventIds.push(eventDedupId);
+          if (telemetry.seenEventIds.length > 200) {
+            telemetry.seenEventIds = telemetry.seenEventIds.slice(-200);
+          }
+        }
       }
       if (input.transcriptPath) {
         sess.transcriptPath = input.transcriptPath;
@@ -251,10 +265,11 @@ export function processPostToolUse(input = {}) {
       // NOTE (F11 / F08 / WP6):
       // - Never auto-complete RUNNING subagents based on step count or elapsed time
       // - Never merge/deduplicate subagents that share the same Role across different batch indices or steps
-      // - Deduplicate replayed hook events with the same deterministic eventKey
+      // - Deduplicate replayed hook events before any counter or state mutation
+      // - Never transition CANCELLED/STOPPED workers back to RUNNING on replayed or late send_message
       // - Never transition or add RUNNING subagents when hasToolError is true
       // - Mark killed subagents as CANCELLED (not COMPLETED)
-      if (toolName === 'invoke_subagent') {
+      if (!isReplayedEvent && toolName === 'invoke_subagent') {
         if (!hasToolError) {
           const batch = decodeSubagentBatch(toolArgs);
           for (let idx = 0; idx < batch.length; idx++) {
@@ -308,7 +323,7 @@ export function processPostToolUse(input = {}) {
             });
           }
         }
-      } else if (toolName === 'send_message') {
+      } else if (!isReplayedEvent && toolName === 'send_message') {
         if (!hasToolError) {
           const recipient = String(toolArgs.Recipient || toolArgs.recipient || '').trim();
           const target = sess.subagents.find(
@@ -318,18 +333,28 @@ export function processPostToolUse(input = {}) {
               s.role.toLowerCase() === recipient.toLowerCase()
           );
           if (target) {
-            target.status = 'RUNNING';
-            target.recalled = true;
-            target.recallCount = (target.recallCount || 0) + 1;
-            target.recalledAt = nowIso;
-            target.lastActiveAt = nowIso;
-            target.lastActiveStepIdx = currentStepIdx;
-            if (toolArgs.Message || toolArgs.message) {
-              target.promptPreview = String(toolArgs.Message || toolArgs.message).slice(0, 220);
+            const isTerminalCancelled =
+              target.status === 'CANCELLED' ||
+              target.status === 'STOPPED' ||
+              target.status === 'CANCEL_REQUESTED';
+            const isStaleStep =
+              explicitStep !== null &&
+              typeof target.lastTerminalStepIdx === 'number' &&
+              explicitStep <= target.lastTerminalStepIdx;
+            if (!isTerminalCancelled && !isStaleStep) {
+              target.status = 'RUNNING';
+              target.recalled = true;
+              target.recallCount = (target.recallCount || 0) + 1;
+              target.recalledAt = nowIso;
+              target.lastActiveAt = nowIso;
+              target.lastActiveStepIdx = currentStepIdx;
+              if (toolArgs.Message || toolArgs.message) {
+                target.promptPreview = String(toolArgs.Message || toolArgs.message).slice(0, 220);
+              }
             }
           }
         }
-      } else if (toolName === 'manage_subagents') {
+      } else if (!isReplayedEvent && toolName === 'manage_subagents') {
         if (!hasToolError) {
           const action = String(toolArgs.Action || toolArgs.action || '').toLowerCase();
           const ids = Array.isArray(toolArgs.ConversationIds)
@@ -342,6 +367,7 @@ export function processPostToolUse(input = {}) {
               s.status = 'CANCELLED';
               s.cancelledAt = nowIso;
               s.terminationReason = 'kill_all';
+              s.lastTerminalStepIdx = currentStepIdx;
             }
           } else if (action === 'kill') {
             for (const s of sess.subagents) {
@@ -349,12 +375,14 @@ export function processPostToolUse(input = {}) {
                 s.status = 'CANCELLED';
                 s.cancelledAt = nowIso;
                 s.terminationReason = 'kill';
+                s.lastTerminalStepIdx = currentStepIdx;
               }
             }
           } else if (action === 'complete_all') {
             for (const s of sess.subagents) {
               s.status = 'COMPLETED';
               s.completedAt = nowIso;
+              s.lastTerminalStepIdx = currentStepIdx;
             }
           } else if (action === 'complete') {
             for (const s of sess.subagents) {
@@ -366,6 +394,7 @@ export function processPostToolUse(input = {}) {
               ) {
                 s.status = 'COMPLETED';
                 s.completedAt = nowIso;
+                s.lastTerminalStepIdx = currentStepIdx;
               }
             }
           }

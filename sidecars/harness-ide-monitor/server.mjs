@@ -134,24 +134,39 @@ function resolveActiveWorkspace({ clientWorkspaceUris = [] } = {}) {
   return { workspacePath: '', source: 'none' };
 }
 
-function persistSidecarRuntime(sidecarId = SIDECAR_ID, port = 0) {
+function persistSidecarRuntime(sidecarId = SIDECAR_ID, port = 0, options = {}) {
+  const numericPort = Number(port || 0);
+  const payload = {
+    sidecarId,
+    pid: process.pid,
+    port: numericPort,
+    url: numericPort > 0 ? `http://127.0.0.1:${numericPort}` : null,
+    updatedAt: new Date().toISOString(),
+  };
   try {
     fs.mkdirSync(GLOBAL_SIDECAR_DATA_DIR, { recursive: true });
     fs.writeFileSync(
       path.join(GLOBAL_SIDECAR_DATA_DIR, 'runtime.json'),
-      JSON.stringify(
-        {
-          sidecarId,
-          pid: process.pid,
-          port: Number(port || 0),
-          updatedAt: new Date().toISOString(),
-        },
-        null,
-        2
-      ),
+      JSON.stringify(payload, null, 2) + '\n',
       'utf8'
     );
   } catch {}
+  const wsCandidates = new Set(
+    [options?.workspaceRoot, REPO_ROOT].filter((p) => typeof p === 'string' && p.trim().length > 0)
+  );
+  for (const wsRoot of wsCandidates) {
+    try {
+      const harnessDir = path.join(wsRoot, '.harness');
+      if (fs.existsSync(harnessDir)) {
+        fs.writeFileSync(
+          path.join(harnessDir, 'monitor-runtime.json'),
+          JSON.stringify(payload, null, 2) + '\n',
+          'utf8'
+        );
+      }
+    } catch {}
+  }
+  return payload;
 }
 
 function exitWithLanguageServer({ app } = {}) {
@@ -241,13 +256,19 @@ export function registerWorkspace(wsPath, targetSet = DEFAULT_REGISTERED_WORKSPA
   return real;
 }
 
-function getLifecycleFilePath(workspaceRoot) {
-  return path.join(workspaceRoot || REPO_ROOT, '.harness', 'runtime', 'subagent-lifecycle.json');
+function getLifecycleFilePath(workspaceRoot, { demoMode = false } = {}) {
+  return path.join(
+    workspaceRoot || REPO_ROOT,
+    '.harness',
+    'runtime',
+    demoMode ? 'subagent-swarm-demo.json' : 'subagent-lifecycle.json'
+  );
 }
 
-function loadSubagentLifecycle(workspaceRoot) {
-  const key = path.resolve(workspaceRoot || REPO_ROOT).toLowerCase();
-  const filePath = getLifecycleFilePath(workspaceRoot);
+function loadSubagentLifecycle(workspaceRoot, options = {}) {
+  const demoMode = Boolean(options?.demoMode);
+  const key = `${path.resolve(workspaceRoot || REPO_ROOT).toLowerCase()}:${demoMode ? 'demo' : 'live'}`;
+  const filePath = getLifecycleFilePath(workspaceRoot, { demoMode });
   let state = SUBAGENT_LIFECYCLE_MEM.get(key) || { revision: 1, nodes: {} };
 
   if (fs.existsSync(filePath)) {
@@ -257,6 +278,7 @@ function loadSubagentLifecycle(workspaceRoot) {
         state = {
           revision: Math.max(state.revision || 1, Number(disk.revision || 1)),
           nodes: { ...disk.nodes, ...(state.nodes || {}) },
+          annotations: { ...(disk.annotations || {}), ...(state.annotations || {}) },
         };
       }
     } catch {}
@@ -266,10 +288,11 @@ function loadSubagentLifecycle(workspaceRoot) {
   return state;
 }
 
-function saveSubagentLifecycle(workspaceRoot, state) {
-  const key = path.resolve(workspaceRoot || REPO_ROOT).toLowerCase();
+function saveSubagentLifecycle(workspaceRoot, state, options = {}) {
+  const demoMode = Boolean(options?.demoMode);
+  const key = `${path.resolve(workspaceRoot || REPO_ROOT).toLowerCase()}:${demoMode ? 'demo' : 'live'}`;
   SUBAGENT_LIFECYCLE_MEM.set(key, state);
-  const filePath = getLifecycleFilePath(workspaceRoot);
+  const filePath = getLifecycleFilePath(workspaceRoot, { demoMode });
   try {
     if (fs.existsSync(path.join(workspaceRoot || REPO_ROOT, '.harness'))) {
       fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -280,7 +303,8 @@ function saveSubagentLifecycle(workspaceRoot, state) {
 }
 
 function mutateSubagentLifecycle(workspaceRoot, payload = {}) {
-  const state = loadSubagentLifecycle(workspaceRoot);
+  const demoMode = Boolean(payload.demoMode === true);
+  const state = loadSubagentLifecycle(workspaceRoot, { demoMode });
   state.annotations = state.annotations && typeof state.annotations === 'object' ? state.annotations : {};
   const formationId = payload.formationId || 'live-harness2';
   const nodeId = payload.nodeId || '';
@@ -308,10 +332,16 @@ function mutateSubagentLifecycle(workspaceRoot, payload = {}) {
       };
     }
     state.revision = (state.revision || 1) + 1;
-    return saveSubagentLifecycle(workspaceRoot, state);
+    return saveSubagentLifecycle(workspaceRoot, state, { demoMode });
   }
 
-  const executorAck = Boolean(payload.executorAck === true || payload.demoMode === true);
+  const executorAck = Boolean(payload.executorAck === true || demoMode);
+  const stoppedConfirmed = Boolean(
+    payload.stoppedConfirmed === true ||
+      payload.confirmStopped === true ||
+      payload.executorStopped === true ||
+      demoMode
+  );
   const setNodeEntry = (fId, nId, status, isRecall = false, controlStatus = 'acknowledged') => {
     const k = `${fId}:${nId}`;
     const prev = state.nodes[k] || {};
@@ -323,6 +353,7 @@ function mutateSubagentLifecycle(workspaceRoot, payload = {}) {
       recalledAt: isRecall ? nowIso : prev.recalledAt || null,
       completedAt: status === 'COMPLETED' ? nowIso : null,
       cancelledAt: status === 'CANCELLED' ? nowIso : null,
+      cancelRequestedAt: status === 'CANCEL_REQUESTED' ? nowIso : prev.cancelRequestedAt || null,
       receiptId: payload.receiptId || prev.receiptId || null,
     };
   };
@@ -341,9 +372,9 @@ function mutateSubagentLifecycle(workspaceRoot, payload = {}) {
     setNodeEntry(
       formationId,
       nodeId,
-      executorAck ? 'CANCELLED' : 'PENDING_CANCEL',
+      stoppedConfirmed ? 'CANCELLED' : 'CANCEL_REQUESTED',
       false,
-      executorAck ? 'acknowledged' : 'pending_acknowledgment'
+      stoppedConfirmed ? 'stopped' : 'cancel_requested'
     );
   } else if (action === 'recall_all') {
     const nodeIds = Array.isArray(payload.nodeIds) ? payload.nodeIds : [];
@@ -367,11 +398,19 @@ function mutateSubagentLifecycle(workspaceRoot, payload = {}) {
         delete state.nodes[k];
       }
     }
+    state.revision = (state.revision || 1) + 1;
+    return saveSubagentLifecycle(workspaceRoot, state, { demoMode });
   }
 
-  // Synchronize telemetry.json ONLY when executorAck is true (or reset/complete with verified receipt)
+  // Synchronize telemetry.json ONLY when !demoMode and executorAck is true (or complete with verified receipt / cancel request)
   const shouldSyncExecutionState =
-    executorAck || action === 'reset' || action === 'complete' || action === 'complete_all';
+    !demoMode &&
+    action !== 'reset' &&
+    (executorAck ||
+      action === 'complete' ||
+      action === 'complete_all' ||
+      action === 'cancel' ||
+      action === 'kill');
   const telFile = path.join(workspaceRoot, '.harness', 'runtime', 'telemetry.json');
   if (shouldSyncExecutionState && fs.existsSync(telFile)) {
     try {
@@ -391,20 +430,23 @@ function mutateSubagentLifecycle(workspaceRoot, payload = {}) {
         for (const s of list) {
           if (!s || typeof s !== 'object') continue;
           const matches =
-            action === 'reset' ||
-            (action === 'complete_all' && targetIds.size === 0) ||
-            targetIds.has(s.id);
+            (action === 'complete_all' && targetIds.size === 0) || targetIds.has(s.id);
           if (!matches) continue;
-          if (action === 'reset' || action === 'complete' || action === 'complete_all') {
+          if (action === 'complete' || action === 'complete_all') {
             if (s.status !== 'COMPLETED') {
               s.status = 'COMPLETED';
               s.completedAt = nowIso;
               changed = true;
             }
           } else if (action === 'cancel' || action === 'kill') {
-            if (s.status !== 'CANCELLED') {
-              s.status = 'CANCELLED';
-              s.cancelledAt = nowIso;
+            const nextCancelStatus = stoppedConfirmed ? 'CANCELLED' : 'CANCEL_REQUESTED';
+            if (s.status !== nextCancelStatus) {
+              s.status = nextCancelStatus;
+              if (stoppedConfirmed) {
+                s.cancelledAt = nowIso;
+              } else {
+                s.cancelRequestedAt = nowIso;
+              }
               changed = true;
             }
           } else if (action === 'recall' || action === 'recall_all') {
@@ -429,7 +471,7 @@ function mutateSubagentLifecycle(workspaceRoot, payload = {}) {
   }
 
   state.revision = (state.revision || 1) + 1;
-  return saveSubagentLifecycle(workspaceRoot, state);
+  return saveSubagentLifecycle(workspaceRoot, state, { demoMode });
 }
 
 export function isStrictLoopbackOrigin(originHeader, activePort = 0) {
@@ -2467,7 +2509,7 @@ export function buildSwarmFormations(
     return Math.round(num);
   };
 
-  const lifecycleState = loadSubagentLifecycle(workspaceContext.workspaceRoot);
+  const lifecycleState = loadSubagentLifecycle(workspaceContext.workspaceRoot, { demoMode });
 
   const packFormation = (id, name, description, rawNodes) => {
     const currencySymbol = id === 'live-harness2' ? '$' : '¥';
@@ -2551,9 +2593,21 @@ export function buildSwarmFormations(
     const completedCount = nodes.filter((n) => n.status === 'COMPLETED').length;
     const cancelledCount = nodes.filter((n) => n.status === 'CANCELLED').length;
     const standbyCount = nodes.filter((n) => n.status === 'STANDBY').length;
-    const totalTokens = nodes.reduce((acc, n) => acc + (n.totalTokens || 0), 0);
-    const totalContextTokens = nodes.reduce((acc, n) => acc + (n.contextTokens || 0), 0);
-    const totalCostVal = nodes.reduce((acc, n) => acc + (n.costUsd || 0), 0);
+    const hasObservedNodeTokens = nodes.some((n) => typeof n.totalTokens === 'number');
+    const hasObservedNodeContext = nodes.some((n) => typeof n.contextTokens === 'number');
+    const hasObservedNodeCost = nodes.some((n) => typeof n.costUsd === 'number');
+    const totalTokens = hasObservedNodeTokens
+      ? nodes.reduce((acc, n) => acc + (typeof n.totalTokens === 'number' ? n.totalTokens : 0), 0)
+      : null;
+    const totalContextTokens = hasObservedNodeContext
+      ? nodes.reduce(
+          (acc, n) => acc + (typeof n.contextTokens === 'number' ? n.contextTokens : 0),
+          0
+        )
+      : null;
+    const totalCostVal = hasObservedNodeCost
+      ? nodes.reduce((acc, n) => acc + (typeof n.costUsd === 'number' ? n.costUsd : 0), 0)
+      : null;
     const subNodes = nodes.filter((n) => n.tier > 0);
     const subCompleted = subNodes.filter((n) => n.status === 'COMPLETED').length;
     const activeSubagentCount = subNodes.filter((n) => n.status === 'RUNNING').length;
@@ -2648,10 +2702,15 @@ export function buildSwarmFormations(
         activeSubagentCount,
         inactiveSubagentCount,
         recalledCount,
-        totalTokens: hasObservedActivity ? totalTokens : null,
-        totalTokensFormatted: hasObservedActivity ? formatCompactNumber(totalTokens) : '0',
-        totalContextFormatted: hasObservedActivity ? formatCompactNumber(totalContextTokens) : '0',
-        estimatedCostFormatted: `${currencySymbol}${totalCostVal.toFixed(2)}`,
+        totalTokens,
+        totalTokensFormatted:
+          totalTokens !== null ? formatCompactNumber(totalTokens) : 'unavailable',
+        totalContextTokens,
+        totalContextFormatted:
+          totalContextTokens !== null ? formatCompactNumber(totalContextTokens) : 'unavailable',
+        estimatedCostUsd: totalCostVal,
+        estimatedCostFormatted:
+          totalCostVal !== null ? `${currencySymbol}${totalCostVal.toFixed(2)}` : 'unavailable',
         progressCompleted: subCompleted,
         progressTotal: subNodes.length,
       },
@@ -3506,7 +3565,10 @@ export function createHarnessMonitorApp(options = {}) {
     const wsCtx = await resolveWorkspaceContext(reqData, reqData);
     const engine = new HarnessKnowledgeEngine(wsCtx.workspaceRoot);
     const status = engine.getStatus();
-    const lifecycleState = loadSubagentLifecycle(wsCtx.workspaceRoot);
+    const isDemo = Boolean(
+      reqData?.demoMode ?? reqData?.body?.demoMode ?? reqData?.appDemoMode
+    );
+    const lifecycleState = loadSubagentLifecycle(wsCtx.workspaceRoot, { demoMode: isDemo });
     const hubCfg = loadHubConfig(wsCtx.workspaceRoot);
     const messageBus = loadMessageBus(wsCtx.workspaceRoot);
     const activeBrain = resolveWorkspaceBrainTranscript(wsCtx);
@@ -3556,12 +3618,12 @@ export function createHarnessMonitorApp(options = {}) {
     const status = engine.getStatus();
     const settings = engine.loadConfig();
     const snapshots = wsCtx.hasHarness ? engine.listSnapshots() : [];
-    const lifecycleState = loadSubagentLifecycle(workspaceRoot);
     const activeBrain = resolveWorkspaceBrainTranscript(wsCtx);
     const hookTelemetry = loadWorkspaceTelemetry(workspaceRoot);
     const isDemo = Boolean(
       reqData?.demoMode ?? reqData?.body?.demoMode ?? reqData?.appDemoMode
     );
+    const lifecycleState = loadSubagentLifecycle(workspaceRoot, { demoMode: isDemo });
     const contextAnalytics = buildContextAndTokenAnalytics(wsCtx, activeBrain, index.documents, {
       telemetry: hookTelemetry,
       demoMode: isDemo,
@@ -4075,6 +4137,13 @@ export function createHarnessMonitorApp(options = {}) {
       action,
       durationSec: Number(payload.durationSec || 180),
       demoMode: isDemo,
+      stoppedConfirmed: Boolean(
+        payload.stoppedConfirmed === true ||
+          payload.stopped_confirmed === true ||
+          payload.confirmStopped === true ||
+          payload.confirm_stopped === true ||
+          payload.executorStopped === true
+      ),
       executorAck: Boolean(
         payload.executorAck === true ||
           payload.executor_ack === true ||
@@ -4102,6 +4171,15 @@ export function createHarnessMonitorApp(options = {}) {
     };
   };
   app.api('/api/swarm/recall', handleSwarmRecall, 'POST');
+  app.api(
+    '/api/swarm/reset',
+    async (reqData = {}) =>
+      handleSwarmRecall({
+        ...reqData,
+        body: { ...(reqData?.body || {}), action: 'reset' },
+      }),
+    'POST'
+  );
 
   const handleHarness2Run = async (reqData = {}) => {
     const payload = reqData?.body || reqData || {};
@@ -4138,8 +4216,19 @@ export function createHarnessMonitorApp(options = {}) {
       executorId: payload.executorId ?? payload.executor_id,
       verifierId: payload.verifierId ?? payload.verifier_id,
       command: payload.command,
+      args: payload.args,
       verifierCommand: payload.verifierCommand ?? payload.verifier_command,
+      verifierArgs: payload.verifierArgs ?? payload.verifier_args,
+      heldOutVerifier: payload.heldOutVerifier ?? payload.held_out_verifier,
+      heldOutVerifierId: payload.heldOutVerifierId ?? payload.held_out_verifier_id,
+      heldOutVerifierCommand:
+        payload.heldOutVerifierCommand ?? payload.held_out_verifier_command,
+      heldOutVerifierArgs: payload.heldOutVerifierArgs ?? payload.held_out_verifier_args,
       baselineTokens: payload.baselineTokens ?? payload.baseline_tokens,
+      requireEfficiencyGain:
+        payload.requireEfficiencyGain ?? payload.require_efficiency_gain,
+      allowVerifiedNoChange:
+        payload.allowVerifiedNoChange ?? payload.allow_verified_no_change,
       requestId: payload.requestId ?? payload.request_id,
     });
     return { ok: report?.ok !== false, ...report };
@@ -4212,6 +4301,9 @@ export function createHarnessMonitorApp(options = {}) {
     const payload = reqData?.body || reqData || {};
     const wsCtx = await resolveWorkspaceContext(payload, reqData);
     const toAgent = payload.toAgent || payload.to_agent || 'harness-proposer';
+    const isDemo = Boolean(
+      payload.demoMode ?? payload.demo_mode ?? reqData?.appDemoMode
+    );
     const res = await injectOrConveySwarmMessage(wsCtx.workspaceRoot, {
       id: payload.id ?? payload.messageId ?? payload.message_id,
       fromAgent: payload.fromAgent || payload.from_agent || 'main-orchestrator',
@@ -4227,14 +4319,15 @@ export function createHarnessMonitorApp(options = {}) {
       strictExecution: payload.strictExecution ?? payload.strict_execution,
       allowSimulation: payload.allowSimulation ?? payload.allow_simulation,
       executionMode: payload.executionMode ?? payload.execution_mode,
-      demoMode: payload.demoMode ?? payload.demo_mode ?? reqData?.appDemoMode,
+      demoMode: isDemo,
     });
-    if (res?.ok !== false && toAgent && toAgent !== 'main-orchestrator' && toAgent !== 'all') {
+    if (res?.ok !== false && isDemo && toAgent && toAgent !== 'main-orchestrator' && toAgent !== 'all') {
       mutateSubagentLifecycle(wsCtx.workspaceRoot, {
         formationId: 'live-harness2',
         nodeId: toAgent,
         action: 'recall',
         durationSec: 180,
+        demoMode: true,
       });
     }
     return {
@@ -4249,6 +4342,9 @@ export function createHarnessMonitorApp(options = {}) {
     const payload = reqData?.body || reqData || {};
     const wsCtx = await resolveWorkspaceContext(payload, reqData);
     const engine = new HarnessKnowledgeEngine(wsCtx.workspaceRoot);
+    const isDemo = Boolean(
+      payload.demoMode ?? payload.demo_mode ?? reqData?.appDemoMode
+    );
     const res = await runSelfImprovementCoopCycle(wsCtx.workspaceRoot, engine, {
       taskId: payload.taskId || payload.task_id,
       task: payload.task || payload.problem,
@@ -4261,15 +4357,33 @@ export function createHarnessMonitorApp(options = {}) {
       strictExecution: payload.strictExecution ?? payload.strict_execution,
       allowSimulation: payload.allowSimulation ?? payload.allow_simulation,
       executionMode: payload.executionMode ?? payload.execution_mode,
-      demoMode: payload.demoMode ?? payload.demo_mode ?? reqData?.appDemoMode,
+      demoMode: isDemo,
       requiredArtifacts: payload.requiredArtifacts ?? payload.required_artifacts,
+      executorId: payload.executorId ?? payload.executor_id,
+      verifierId: payload.verifierId ?? payload.verifier_id,
+      command: payload.command,
+      args: payload.args,
+      verifierCommand: payload.verifierCommand ?? payload.verifier_command,
+      verifierArgs: payload.verifierArgs ?? payload.verifier_args,
+      heldOutVerifier: payload.heldOutVerifier ?? payload.held_out_verifier,
+      heldOutVerifierId: payload.heldOutVerifierId ?? payload.held_out_verifier_id,
+      heldOutVerifierCommand:
+        payload.heldOutVerifierCommand ?? payload.held_out_verifier_command,
+      heldOutVerifierArgs: payload.heldOutVerifierArgs ?? payload.held_out_verifier_args,
+      baselineTokens: payload.baselineTokens ?? payload.baseline_tokens,
+      requireEfficiencyGain:
+        payload.requireEfficiencyGain ?? payload.require_efficiency_gain,
+      allowVerifiedNoChange:
+        payload.allowVerifiedNoChange ?? payload.allow_verified_no_change,
+      requestId: payload.requestId ?? payload.request_id,
     });
-    if (res?.ok !== false) {
+    if (res?.ok !== false && isDemo) {
       mutateSubagentLifecycle(wsCtx.workspaceRoot, {
         formationId: 'live-harness2',
         nodeIds: ['harness-proposer', 'harness-prober-1', 'harness-prober-2', 'harness-composer'],
         action: 'recall_all',
         durationSec: 180,
+        demoMode: true,
       });
     }
     return {
@@ -4331,13 +4445,11 @@ export function createHarnessMonitorApp(options = {}) {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try {
-    persistSidecarRuntime(SIDECAR_ID);
-  } catch {}
   const app = createHarnessMonitorApp();
   exitWithLanguageServer({ app });
   await app.run();
-  try {
-    persistSidecarRuntime(SIDECAR_ID);
-  } catch {}
+  const runtimeInfo = persistSidecarRuntime(SIDECAR_ID, app.port, {
+    workspaceRoot: app.defaultWorkspaceRoot || REPO_ROOT,
+  });
+  console.log(JSON.stringify({ ok: true, ...runtimeInfo }));
 }

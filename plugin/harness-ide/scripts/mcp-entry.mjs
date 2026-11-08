@@ -325,6 +325,18 @@ const TOOL_DEFINITIONS = [
           type: 'string',
           description: 'Description of the Propose-Probe-Compose experiment.'
         },
+        snapshot_id: {
+          type: 'string',
+          description: 'Optional snapshot lock ID (for release).'
+        },
+        owner_run_id: {
+          type: 'string',
+          description: 'Optional owner run ID for lock ownership validation (for create or release).'
+        },
+        force: {
+          type: 'boolean',
+          description: 'Force release an active snapshot lock (default: false).'
+        },
         workspace_root: {
           type: 'string',
           description: 'Optional workspace root override.'
@@ -343,6 +355,14 @@ const TOOL_DEFINITIONS = [
         task_id: {
           type: 'string',
           description: 'Unique identifier for the task/experiment (e.g., task-002-retry-backoff).'
+        },
+        attempt_id: {
+          type: 'string',
+          description: 'Optional unique attempt identifier for revision history.'
+        },
+        request_id: {
+          type: 'string',
+          description: 'Optional idempotency request identifier.'
         },
         domain: {
           type: 'string',
@@ -369,10 +389,22 @@ const TOOL_DEFINITIONS = [
           items: { type: 'string' },
           description: 'Paths, commits, test logs, or trajectory references supporting the conclusion.'
         },
+        receipt_id: {
+          type: 'string',
+          description: 'Signed evaluation receipt ID (required when status="active").'
+        },
+        evaluation_receipt: {
+          type: 'string',
+          description: 'Signed evaluation receipt ID or path (alias for receipt_id).'
+        },
         status: {
           type: 'string',
           enum: ['active', 'candidate', 'superseded'],
           description: 'Provenance status: use "candidate" during unverified probing, "active" after Compose adoption.'
+        },
+        synthetic: {
+          type: 'boolean',
+          description: 'Whether this record was produced by simulation (synthetic records cannot become active).'
         },
         tags: {
           type: 'array',
@@ -413,6 +445,18 @@ const TOOL_DEFINITIONS = [
         summary: {
           type: 'string',
           description: 'Curated architectural guidance text.'
+        },
+        receipt_id: {
+          type: 'string',
+          description: 'Optional explicit signed evaluation receipt ID.'
+        },
+        evaluation_receipt: {
+          type: 'string',
+          description: 'Optional explicit signed evaluation receipt ID or path.'
+        },
+        verified: {
+          type: 'boolean',
+          description: 'Optional explicit verification flag (requires valid receipt).'
         },
         workspace_root: {
           type: 'string',
@@ -504,24 +548,54 @@ const TOOL_DEFINITIONS = [
         },
         command: {
           type: 'string',
-          description: 'Optional rollout shell/CLI command for command-executor.'
+          description: 'Optional rollout executable/command for command-executor.'
+        },
+        args: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional explicit argv array for command-executor.'
         },
         verifier_command: {
           type: 'string',
-          description: 'Optional independent verification shell/CLI command for command-verifier.'
+          description: 'Optional independent verification executable/command for command-verifier.'
+        },
+        verifier_args: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional explicit argv array for command-verifier.'
         },
         required_artifacts: {
           type: 'array',
           items: { type: 'string' },
           description: 'Relative paths of required deliverable artifacts.'
         },
+        request_id: {
+          type: 'string',
+          description: 'Optional idempotency key for deduplicating identical loop executions.'
+        },
+        strict_execution: {
+          type: 'boolean',
+          description: 'Enforce strict verified execution (default: true).'
+        },
         allow_simulation: {
           type: 'boolean',
           description: 'Explicitly opt into simulation mode (default: false).'
         },
+        pass_threshold: {
+          type: 'number',
+          description: 'Minimum verification score threshold to pass (default: 0.75).'
+        },
         baseline_tokens: {
           type: 'number',
           description: 'Optional measured baseline token count for computing token savings.'
+        },
+        held_out_verifier: {
+          type: 'string',
+          description: 'Optional held-out verifier ID or command for gating active lesson promotion.'
+        },
+        require_efficiency_gain: {
+          type: 'boolean',
+          description: 'Require candidate token usage to beat measured baseline_tokens when scores tie.'
         },
         workspace_root: {
           type: 'string',
@@ -602,6 +676,9 @@ const TOOL_DEFINITIONS = [
     inputSchema: {
       type: 'object',
       properties: {
+        id: { type: 'string', description: 'Optional deterministic message ID for idempotent deduplication.' },
+        message_id: { type: 'string', description: 'Optional alias for id.' },
+        task_id: { type: 'string', description: 'Optional task ID for stop-state enforcement.' },
         from_agent: { type: 'string', description: 'Sender agent ID (default: main-orchestrator).' },
         to_agent: { type: 'string', description: 'Recipient agent ID or "all" (default: harness-proposer).' },
         from_model: { type: 'string', description: 'Sender model ID.' },
@@ -611,12 +688,18 @@ const TOOL_DEFINITIONS = [
           enum: ['INJECT_DIRECTIVE', 'CONVEY_CONTEXT', 'PEER_CRITIQUE', 'SELF_IMPROVE_CUE'],
           description: 'Message injection / convey type.'
         },
+        priority: { type: 'string', description: 'Optional message priority (normal, high, urgent).' },
         content: { type: 'string', description: 'Message content to inject and convey.' },
         reasoning_depth: {
           type: 'string',
           enum: ['eco', 'balanced', 'deep'],
           description: 'Reasoning depth for recipient execution.'
         },
+        execute_target_model: { type: 'boolean', description: 'Whether to immediately invoke the recipient model (default: true).' },
+        run_id: { type: 'string', description: 'Optional run ID correlation.' },
+        candidate_id: { type: 'string', description: 'Optional candidate ID correlation.' },
+        strict_execution: { type: 'boolean', description: 'Enforce strict execution without simulation fallback.' },
+        allow_simulation: { type: 'boolean', description: 'Explicitly opt into simulation mode (default: false).' },
         workspace_root: { type: 'string', description: 'Optional workspace root override.' }
       },
       required: ['content']
@@ -629,13 +712,31 @@ const TOOL_DEFINITIONS = [
     inputSchema: {
       type: 'object',
       properties: {
+        task_id: { type: 'string', description: 'Optional explicit task identifier.' },
         task: { type: 'string', description: 'Task or capability to self-improve.' },
+        problem: { type: 'string', description: 'Problem statement (alias for task).' },
         domain: { type: 'string', description: 'Target domain library (default: software-engineering).' },
+        k: { type: 'number', description: 'Number of candidate harnesses to probe (2 to 6, default: 2).' },
+        mode: { type: 'string', enum: ['parallel', 'sequential'], description: 'Probe execution mode.' },
         reasoning_depth: {
           type: 'string',
           enum: ['eco', 'balanced', 'deep'],
           description: 'Reasoning depth preset (default: balanced).'
         },
+        executor_id: { type: 'string', description: 'Registered executor ID.' },
+        verifier_id: { type: 'string', description: 'Registered independent verifier ID.' },
+        command: { type: 'string', description: 'Optional rollout executable/command.' },
+        args: { type: 'array', items: { type: 'string' }, description: 'Optional explicit argv array for command.' },
+        verifier_command: { type: 'string', description: 'Optional independent verification executable/command.' },
+        verifier_args: { type: 'array', items: { type: 'string' }, description: 'Optional explicit argv array for verifier_command.' },
+        required_artifacts: { type: 'array', items: { type: 'string' }, description: 'Relative paths of required deliverable artifacts.' },
+        record_to_library: { type: 'boolean', description: 'Record the composed winner into .harness/library/<domain>/.' },
+        request_id: { type: 'string', description: 'Optional idempotency key.' },
+        baseline_tokens: { type: 'number', description: 'Optional measured baseline token count.' },
+        held_out_verifier: { type: 'string', description: 'Optional held-out verifier ID or command.' },
+        require_efficiency_gain: { type: 'boolean', description: 'Require token efficiency gain over baseline_tokens.' },
+        strict_execution: { type: 'boolean', description: 'Enforce strict verified execution (default: true).' },
+        allow_simulation: { type: 'boolean', description: 'Explicitly opt into simulation mode (default: false).' },
         workspace_root: { type: 'string', description: 'Optional workspace root override.' }
       }
     }
@@ -691,14 +792,24 @@ const TOOL_DEFINITIONS = [
   {
     name: 'harness_checkpoint',
     description:
-      'Write or load atomic resumable task checkpoints, restore subagent state after compaction, acknowledge recovery packets, or externalize large tool outputs (write, load, restore_subagent, acknowledge_recovery, store_bounded_log).',
+      'Write or load atomic resumable task checkpoints, register controller-owned worker sessions, deliver and acknowledge recovery packets, manage cancellation states, or externalize large tool outputs.',
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['write', 'load', 'restore_subagent', 'acknowledge_recovery', 'store_bounded_log'],
-          description: 'Checkpoint operation.'
+          enum: [
+            'write',
+            'load',
+            'register_session',
+            'deliver_recovery',
+            'restore_subagent',
+            'acknowledge_recovery',
+            'request_cancel',
+            'observe_stopped',
+            'store_bounded_log'
+          ],
+          description: 'Checkpoint or worker session operation.'
         },
         task_id: {
           type: 'string',
@@ -706,15 +817,58 @@ const TOOL_DEFINITIONS = [
         },
         worker_id: {
           type: 'string',
-          description: 'Subagent worker ID (for restore_subagent or acknowledge_recovery).'
+          description: 'Subagent worker ID.'
+        },
+        executor_session_id: {
+          type: 'string',
+          description: 'Controller-owned executor session ID (for register_session, deliver_recovery, or acknowledge_recovery).'
+        },
+        transport: {
+          type: 'string',
+          description: 'Transport channel for worker session (e.g. subagent, sdk, cli, process).'
         },
         recovery_token: {
           type: 'string',
-          description: 'Recovery token or checkpoint revision (for acknowledge_recovery).'
+          description: 'Recovery token (for deliver_recovery or acknowledge_recovery).'
         },
         checkpoint_revision: {
           type: 'number',
-          description: 'Checkpoint revision number (for acknowledge_recovery).'
+          description: 'Checkpoint revision number.'
+        },
+        ledger_revision: {
+          type: 'number',
+          description: 'Requirement ledger revision number.'
+        },
+        contract_revision: {
+          type: 'number',
+          description: 'Contract registry revision number.'
+        },
+        packet_digest: {
+          type: 'string',
+          description: 'SHA-256 digest of the recovery packet.'
+        },
+        active_workers: {
+          type: 'array',
+          items: { type: 'object' },
+          description: 'Active workers snapshot (for write).'
+        },
+        pending_messages: {
+          type: 'array',
+          items: { type: 'object' },
+          description: 'Pending messages snapshot (for write).'
+        },
+        known_failures: {
+          type: 'array',
+          items: { type: 'object' },
+          description: 'Known failures snapshot (for write).'
+        },
+        next_action: {
+          type: 'string',
+          description: 'Next concrete action (for write).'
+        },
+        context_metrics: {
+          type: 'object',
+          description: 'Context window usage metrics (for write).'
         },
         tool_name: {
           type: 'string',
@@ -903,8 +1057,13 @@ export async function handleToolCall(name, args = {}) {
         executor_id: args.executor_id ?? args.executorId,
         verifier_id: args.verifier_id ?? args.verifierId,
         command: args.command,
+        args: args.args ?? args.executor_args ?? args.executorArgs,
         verifier_command: args.verifier_command ?? args.verifierCommand,
+        verifier_args: args.verifier_args ?? args.verifierArgs,
+        verifierArgs: args.verifier_args ?? args.verifierArgs,
         baseline_tokens: args.baseline_tokens ?? args.baselineTokens,
+        heldOutVerifier: args.held_out_verifier ?? args.heldOutVerifier,
+        requireEfficiencyGain: args.require_efficiency_gain ?? args.requireEfficiencyGain,
         request_id: args.request_id ?? args.requestId,
         allowSimulation,
         strictExecution: strictExec,
@@ -978,6 +1137,28 @@ export async function handleToolCall(name, args = {}) {
         task: args.task || args.problem,
         problem: args.problem || args.task,
         domain: args.domain,
+        k: args.k,
+        mode: args.mode,
+        executor_id: args.executor_id ?? args.executorId,
+        verifier_id: args.verifier_id ?? args.verifierId,
+        command: args.command,
+        args: args.args ?? args.executor_args ?? args.executorArgs,
+        verifier_command: args.verifier_command ?? args.verifierCommand,
+        verifier_args: args.verifier_args ?? args.verifierArgs,
+        request_id: args.request_id ?? args.requestId,
+        baseline_tokens: args.baseline_tokens ?? args.baselineTokens,
+        held_out_verifier: args.held_out_verifier ?? args.heldOutVerifier,
+        held_out_verifier_command:
+          args.held_out_verifier_command ??
+          args.heldOutVerifierCommand ??
+          args.held_out_command ??
+          args.heldOutCommand,
+        held_out_verifier_args:
+          args.held_out_verifier_args ??
+          args.heldOutVerifierArgs ??
+          args.held_out_args ??
+          args.heldOutArgs,
+        require_efficiency_gain: args.require_efficiency_gain ?? args.requireEfficiencyGain,
         proposer_model: args.proposer_model ?? args.proposerModel,
         prober_models: args.prober_models ?? args.proberModels,
         composer_model: args.composer_model ?? args.composerModel,
@@ -1064,8 +1245,12 @@ export async function handleToolCall(name, args = {}) {
       const validActions = [
         'write',
         'load',
+        'register_session',
+        'deliver_recovery',
         'restore_subagent',
         'acknowledge_recovery',
+        'request_cancel',
+        'observe_stopped',
         'store_bounded_log'
       ];
       if (typeof action !== 'string' || !validActions.includes(action)) {
@@ -1092,6 +1277,16 @@ export async function handleToolCall(name, args = {}) {
       if (action === 'load') {
         return mgr.loadLatestCheckpoint(taskId);
       }
+      if (action === 'register_session') {
+        const workerId = args.worker_id || args.workerId;
+        requireNonEmptyString(workerId, 'worker_id', name);
+        return mgr.registerExecutorSession(taskId, workerId, args);
+      }
+      if (action === 'deliver_recovery') {
+        const workerId = args.worker_id || args.workerId;
+        requireNonEmptyString(workerId, 'worker_id', name);
+        return mgr.deliverRecoveryPacket(taskId, workerId, args);
+      }
       if (action === 'restore_subagent') {
         const workerId = args.worker_id || args.workerId;
         requireNonEmptyString(workerId, 'worker_id', name);
@@ -1100,16 +1295,17 @@ export async function handleToolCall(name, args = {}) {
       if (action === 'acknowledge_recovery') {
         const workerId = args.worker_id || args.workerId;
         requireNonEmptyString(workerId, 'worker_id', name);
-        if (typeof mgr.acknowledgeRecoveryPacket === 'function') {
-          return mgr.acknowledgeRecoveryPacket(taskId, workerId, args);
-        }
-        return {
-          ok: true,
-          acknowledged: true,
-          taskId,
-          workerId,
-          recoveryToken: args.recovery_token ?? args.recoveryToken ?? null,
-        };
+        return mgr.acknowledgeRecoveryPacket(taskId, workerId, args);
+      }
+      if (action === 'request_cancel') {
+        const workerId = args.worker_id || args.workerId;
+        requireNonEmptyString(workerId, 'worker_id', name);
+        return mgr.requestSessionCancel(taskId, workerId, args);
+      }
+      if (action === 'observe_stopped') {
+        const workerId = args.worker_id || args.workerId;
+        requireNonEmptyString(workerId, 'worker_id', name);
+        return mgr.observeSessionStopped(taskId, workerId, args);
       }
       if (action === 'store_bounded_log') {
         const toolName = args.tool_name || args.toolName || 'tool';

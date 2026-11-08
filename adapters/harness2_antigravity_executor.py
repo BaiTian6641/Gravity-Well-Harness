@@ -47,7 +47,7 @@ REASONING_DEPTH_PROFILES: Dict[str, Dict[str, Any]] = {
         "rag_top_k": 6,
         "rag_snippet_max_chars": 500,
         "prober_model_tier": "flash",
-        "composer_model_tier": "inherit",
+        "composer_model_tier": "pro",
         "early_stop_on_first_pass": True,
     },
     "deep": {
@@ -58,7 +58,7 @@ REASONING_DEPTH_PROFILES: Dict[str, Dict[str, Any]] = {
         "max_probe_steps": 12,
         "rag_top_k": 10,
         "rag_snippet_max_chars": 1200,
-        "prober_model_tier": "inherit",
+        "prober_model_tier": "pro",
         "composer_model_tier": "pro",
         "early_stop_on_first_pass": False,
     },
@@ -295,34 +295,123 @@ class RunRequest:
 
 
 @dataclasses.dataclass(frozen=True)
-class ChannelSpec:
-    """Upstream Harness² `ChannelSpec` (`harness2/core/spec.py`)."""
+class Channel:
+    """Upstream Harness² `Channel` / `ChannelSpec` (`harness2/core/spec.py`)."""
 
     name: str = ""
+    description: str = ""
+    max_bytes: int = 24000
     provider: str = "opencode"
     model: str = "gemini-3-flash"
-    description: str = ""
     weight: float = 1.0
-    max_bytes: int = 24000
+
+
+ChannelSpec = Channel
+
+
+@dataclasses.dataclass(frozen=True)
+class HarnessSpec:
+    """Upstream Harness² `HarnessSpec` (`harness2/core/spec.py`)."""
+
+    files: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    summary: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "files": dict(self.files),
+            "summary": self.summary,
+        }
 
 
 @dataclasses.dataclass(frozen=True)
 class BenchPrompts:
-    """Upstream Harness² `BenchPrompts` (`harness2/core/spec.py`)."""
+    """
+    Upstream Harness² `BenchPrompts` (`harness2/core/spec.py`).
+    Maintains the exact 6 upstream dataclass fields (`domain_hint`, `proposer_hint`,
+    `proposer_footer`, `composer_header`, `reflector_header`, `evaluator_notes`) so
+    `harness2.core.spec.resolve_prompts(adapter)` succeeds without unexpected keyword errors,
+    while exposing `.proposer`, `.composer`, and `.reflector` properties for backward compatibility.
+    """
 
-    proposer: str = "Propose contrastive candidate harness edits across invariant and domain-specific fronts."
-    composer: str = "Compose the winning harness from observed trajectory contrasts and verified deliverables."
-    reflector: str = "Record empirical lessons with 5-part provenance and evaluation receipts."
     domain_hint: str = "Apply verified cues from .harness/library/<domain>/INDEX.md under frozen snapshot isolation."
-    evaluator_notes: str = "Verify delivered artifacts independently of assistant prose."
-    proposer_hint: str = "Focus on bounded thinking budgets and deterministic verification checks."
+    proposer_hint: str = "Propose contrastive candidate harness edits across invariant and domain-specific fronts."
     proposer_footer: str = "Emit valid candidate harness trees respecting SurfaceSpec protected_paths."
-    composer_header: str = "Evaluate behavioral contrasts across K candidate probes."
-    reflector_header: str = "Distill reusable conditional cues and failure modes."
-    proposer_Hint: str = "Focus on bounded thinking budgets and deterministic verification checks."
-    proposer_Footer: str = "Emit valid candidate harness trees respecting SurfaceSpec protected_paths."
-    composer_Header: str = "Evaluate behavioral contrasts across K candidate probes."
-    reflector_Header: str = "Distill reusable conditional cues and failure modes."
+    composer_header: str = "Compose the winning harness from observed trajectory contrasts and verified deliverables."
+    reflector_header: str = "Record empirical lessons with 5-part provenance and evaluation receipts."
+    evaluator_notes: str = "Verify delivered artifacts independently of assistant prose."
+
+    def __init__(
+        self,
+        domain_hint: str = "Apply verified cues from .harness/library/<domain>/INDEX.md under frozen snapshot isolation.",
+        proposer_hint: str = "Propose contrastive candidate harness edits across invariant and domain-specific fronts.",
+        proposer_footer: str = "Emit valid candidate harness trees respecting SurfaceSpec protected_paths.",
+        composer_header: str = "Compose the winning harness from observed trajectory contrasts and verified deliverables.",
+        reflector_header: str = "Record empirical lessons with 5-part provenance and evaluation receipts.",
+        evaluator_notes: str = "Verify delivered artifacts independently of assistant prose.",
+        **legacy_kwargs: Any,
+    ) -> None:
+        if legacy_kwargs.get("proposer") and proposer_hint == "Propose contrastive candidate harness edits across invariant and domain-specific fronts.":
+            proposer_hint = str(legacy_kwargs["proposer"])
+        if legacy_kwargs.get("composer") and composer_header == "Compose the winning harness from observed trajectory contrasts and verified deliverables.":
+            composer_header = str(legacy_kwargs["composer"])
+        if legacy_kwargs.get("reflector") and reflector_header == "Record empirical lessons with 5-part provenance and evaluation receipts.":
+            reflector_header = str(legacy_kwargs["reflector"])
+        if legacy_kwargs.get("proposer_Hint"):
+            proposer_hint = str(legacy_kwargs["proposer_Hint"])
+        if legacy_kwargs.get("proposer_Footer"):
+            proposer_footer = str(legacy_kwargs["proposer_Footer"])
+        if legacy_kwargs.get("composer_Header"):
+            composer_header = str(legacy_kwargs["composer_Header"])
+        if legacy_kwargs.get("reflector_Header"):
+            reflector_header = str(legacy_kwargs["reflector_Header"])
+        object.__setattr__(self, "domain_hint", str(domain_hint))
+        object.__setattr__(self, "proposer_hint", str(proposer_hint))
+        object.__setattr__(self, "proposer_footer", str(proposer_footer))
+        object.__setattr__(self, "composer_header", str(composer_header))
+        object.__setattr__(self, "reflector_header", str(reflector_header))
+        object.__setattr__(self, "evaluator_notes", str(evaluator_notes))
+
+    @property
+    def proposer(self) -> str:
+        return self.proposer_hint
+
+    @property
+    def composer(self) -> str:
+        return self.composer_header
+
+    @property
+    def reflector(self) -> str:
+        return self.reflector_header
+
+    @property
+    def proposer_Hint(self) -> str:
+        return self.proposer_hint
+
+    @property
+    def proposer_Footer(self) -> str:
+        return self.proposer_footer
+
+    @property
+    def composer_Header(self) -> str:
+        return self.composer_header
+
+    @property
+    def reflector_Header(self) -> str:
+        return self.reflector_header
+
+
+try:
+    from harness2.core.spec import BenchPrompts as _UpstreamBenchPrompts  # type: ignore
+
+    if not hasattr(_UpstreamBenchPrompts, "proposer"):
+        _UpstreamBenchPrompts.proposer = property(lambda self: getattr(self, "proposer_hint", ""))  # type: ignore
+    if not hasattr(_UpstreamBenchPrompts, "composer"):
+        _UpstreamBenchPrompts.composer = property(lambda self: getattr(self, "composer_header", ""))  # type: ignore
+    if not hasattr(_UpstreamBenchPrompts, "reflector"):
+        _UpstreamBenchPrompts.reflector = property(lambda self: getattr(self, "reflector_header", ""))  # type: ignore
+    BenchPrompts = _UpstreamBenchPrompts  # type: ignore
+except Exception:
+    pass
 
 
 @dataclasses.dataclass(frozen=True)
@@ -332,7 +421,7 @@ class BenchSpec:
     name: str
     install_mode: str = "full_tree"
     domains: Tuple[str, ...] = ("software-engineering",)
-    channels: Tuple[ChannelSpec, ...] = ()
+    channels: Tuple[Channel, ...] = ()
     prompts: BenchPrompts = dataclasses.field(default_factory=BenchPrompts)
     max_candidates: int = 2
     default_timeout: int = 300
@@ -362,25 +451,28 @@ def resolve_prompts(bench: Any) -> BenchPrompts:
     prompts = getattr(spec, "prompts", None)
     if isinstance(prompts, BenchPrompts):
         return prompts
-    if isinstance(prompts, Mapping):
-        p_hint = str(prompts.get("proposer_hint") or prompts.get("proposer_Hint") or "")
-        p_foot = str(prompts.get("proposer_footer") or prompts.get("proposer_Footer") or "")
-        c_head = str(prompts.get("composer_header") or prompts.get("composer_Header") or "")
-        r_head = str(prompts.get("reflector_header") or prompts.get("reflector_Header") or "")
+    if dataclasses.is_dataclass(prompts):
+        raw_map = dataclasses.asdict(prompts)
         return BenchPrompts(
-            proposer=str(prompts.get("proposer", "")),
-            composer=str(prompts.get("composer", "")),
-            reflector=str(prompts.get("reflector", "")),
+            domain_hint=str(raw_map.get("domain_hint", "")),
+            proposer_hint=str(raw_map.get("proposer_hint") or raw_map.get("proposer") or ""),
+            proposer_footer=str(raw_map.get("proposer_footer", "")),
+            composer_header=str(raw_map.get("composer_header") or raw_map.get("composer") or ""),
+            reflector_header=str(raw_map.get("reflector_header") or raw_map.get("reflector") or ""),
+            evaluator_notes=str(raw_map.get("evaluator_notes", "")),
+        )
+    if isinstance(prompts, Mapping):
+        p_hint = str(prompts.get("proposer_hint") or prompts.get("proposer_Hint") or prompts.get("proposer") or "")
+        p_foot = str(prompts.get("proposer_footer") or prompts.get("proposer_Footer") or "")
+        c_head = str(prompts.get("composer_header") or prompts.get("composer_Header") or prompts.get("composer") or "")
+        r_head = str(prompts.get("reflector_header") or prompts.get("reflector_Header") or prompts.get("reflector") or "")
+        return BenchPrompts(
             domain_hint=str(prompts.get("domain_hint", "")),
-            evaluator_notes=str(prompts.get("evaluator_notes", "")),
             proposer_hint=p_hint,
             proposer_footer=p_foot,
             composer_header=c_head,
             reflector_header=r_head,
-            proposer_Hint=p_hint,
-            proposer_Footer=p_foot,
-            composer_Header=c_head,
-            reflector_Header=r_head,
+            evaluator_notes=str(prompts.get("evaluator_notes", "")),
         )
     return BenchPrompts()
 
@@ -591,11 +683,34 @@ class AntigravitySubstrate:
     ) -> Install:
         """
         Stages a candidate harness tree or spec into an isolated runtime directory with digests.
-        Supports both upstream `materialise(tree_dir: Path, spec, ctx) -> Install`
-        and `materialise(candidate_tree, target_dir) -> Install`.
+        Supports:
+        1. Upstream `materialise(tree_dir: Path, spec: HarnessSpec | Mapping, ctx) -> Install`
+        2. `materialise(candidate_tree: Mapping[str, str], target_dir: Path, ctx) -> Install`
+        3. `materialise(src_dir: Path, target_dir: Path | None = None, ctx) -> Install`
         """
+        spec_files_overlay: Optional[Mapping[str, str]] = None
         if isinstance(spec, (str, Path)):
             target_path = Path(spec).resolve()
+        elif isinstance(tree_dir, (str, Path)) and (
+            hasattr(spec, "files") or (isinstance(spec, Mapping) and "files" in spec) or isinstance(spec, Mapping)
+        ):
+            # Upstream convention: materialise(tree_dir: Path, spec: HarnessSpec, ctx)
+            staging_root = (self.workspace_root / ".harness" / "runtime" / "staging").resolve()
+            staging_root.mkdir(parents=True, exist_ok=True)
+            seed = hashlib.sha256(
+                f"{tree_dir}:{spec}:{datetime.datetime.now(datetime.timezone.utc).isoformat()}".encode("utf-8")
+            ).hexdigest()[:12]
+            src_candidate = Path(tree_dir).resolve()
+            if src_candidate.exists() and src_candidate.is_dir() and src_candidate != self.workspace_root:
+                target_path = src_candidate
+            else:
+                target_path = (staging_root / f"stage-{seed}").resolve()
+            if hasattr(spec, "files") and isinstance(getattr(spec, "files"), Mapping):
+                spec_files_overlay = getattr(spec, "files")
+            elif isinstance(spec, Mapping) and isinstance(spec.get("files"), Mapping):
+                spec_files_overlay = spec.get("files")
+            elif isinstance(spec, Mapping) and all(isinstance(k, str) and isinstance(v, str) for k, v in spec.items()):
+                spec_files_overlay = spec
         else:
             staging_root = (self.workspace_root / ".harness" / "runtime" / "staging").resolve()
             staging_root.mkdir(parents=True, exist_ok=True)
@@ -619,6 +734,26 @@ class AntigravitySubstrate:
             except UnicodeDecodeError:
                 return raw_b
 
+        def _write_overlay_map(file_map: Mapping[str, str]) -> None:
+            for rel_key in sorted(file_map.keys()):
+                rel_posix = rel_key.replace("\\", "/").strip()
+                while rel_posix.startswith("./"):
+                    rel_posix = rel_posix[2:]
+                if ".." in Path(rel_posix).parts or rel_posix.startswith("/") or ":" in rel_posix:
+                    raise ValueError(f"Path traversal rejected in materialise: {rel_key}")
+                if rel_posix == ".git" or rel_posix.startswith(".git/") or any(rel_posix == p or rel_posix.startswith(p + "/") for p in protected_set):
+                    raise ValueError(f"Protected path rejected in materialise: {rel_posix}")
+                raw_bytes = _interpolate_bytes(str(file_map[rel_key]).encode("utf-8"))
+                source_hasher.update(rel_posix.encode("utf-8"))
+                source_hasher.update(raw_bytes)
+                dest_file = (target_path / rel_posix).resolve()
+                if not str(dest_file).startswith(str(target_path)):
+                    raise ValueError(f"Path traversal rejected in materialise: {rel_posix}")
+                dest_file.parent.mkdir(parents=True, exist_ok=True)
+                dest_file.write_bytes(raw_bytes)
+                if rel_posix not in materialised_files:
+                    materialised_files.append(rel_posix)
+
         if isinstance(tree_dir, (str, Path)) and Path(tree_dir).exists():
             src_path = Path(tree_dir).resolve()
             if src_path.is_dir():
@@ -627,7 +762,7 @@ class AntigravitySubstrate:
                         continue
                     rel = src_file.relative_to(src_path)
                     rel_posix = str(rel).replace("\\", "/")
-                    if rel_posix.startswith(".git/") or rel_posix in protected_set:
+                    if rel_posix.startswith(".git/") or any(rel_posix == p or rel_posix.startswith(p + "/") for p in protected_set):
                         continue
                     raw_bytes = _interpolate_bytes(src_file.read_bytes())
                     source_hasher.update(rel_posix.encode("utf-8"))
@@ -644,24 +779,14 @@ class AntigravitySubstrate:
                 dest_file = target_path / src_path.name
                 dest_file.write_bytes(raw_bytes)
                 materialised_files.append(src_path.name)
+            if spec_files_overlay:
+                _write_overlay_map(spec_files_overlay)
+        elif spec_files_overlay is not None:
+            _write_overlay_map(spec_files_overlay)
+        elif hasattr(tree_dir, "files") and isinstance(getattr(tree_dir, "files"), Mapping):
+            _write_overlay_map(getattr(tree_dir, "files"))
         elif isinstance(tree_dir, Mapping) and all(isinstance(k, str) and isinstance(v, str) for k, v in tree_dir.items()):
-            for rel_key in sorted(tree_dir.keys()):
-                rel_posix = rel_key.replace("\\", "/").strip()
-                while rel_posix.startswith("./"):
-                    rel_posix = rel_posix[2:]
-                if ".." in Path(rel_posix).parts or rel_posix.startswith("/"):
-                    raise ValueError(f"Path traversal rejected in materialise: {rel_key}")
-                if rel_posix == ".git" or rel_posix.startswith(".git/") or any(rel_posix == p or rel_posix.startswith(p + "/") for p in protected_set):
-                    raise ValueError(f"Protected path rejected in materialise: {rel_posix}")
-                raw_bytes = _interpolate_bytes(tree_dir[rel_key].encode("utf-8"))
-                source_hasher.update(rel_posix.encode("utf-8"))
-                source_hasher.update(raw_bytes)
-                dest_file = (target_path / rel_posix).resolve()
-                if not str(dest_file).startswith(str(target_path)):
-                    raise ValueError(f"Path traversal rejected in materialise: {rel_posix}")
-                dest_file.parent.mkdir(parents=True, exist_ok=True)
-                dest_file.write_bytes(raw_bytes)
-                materialised_files.append(rel_posix)
+            _write_overlay_map(tree_dir)
         else:
             spec_dict = (
                 tree_dir.to_dict()
@@ -987,6 +1112,8 @@ class AntigravitySubstrate:
         install: Optional[Install] = None,
         run_ids: Optional[List[str]] = None,
         timeout: int = 300,
+        validator_cmd: Optional[Union[str, List[str]]] = None,
+        **kwargs: Any,
     ) -> Any:
         """
         Executes candidate rollout(s).
@@ -994,10 +1121,13 @@ class AntigravitySubstrate:
           returns a list of `Path` run directories.
         - Direct dict/spec call `execute(run_spec: dict) -> dict` returns the structured execution summary dict.
         """
+        resolved_validator = validator_cmd or kwargs.get("validator_cmd")
         if isinstance(task_ref, dict):
             spec = dict(task_ref)
             if install is not None and getattr(install, "staging_dir", None) is not None:
                 spec.setdefault("install_dir", str(getattr(install, "staging_dir")))
+            if resolved_validator is not None:
+                spec.setdefault("validator_cmd", resolved_validator)
             return self._execute_single_run(spec)
 
         if install is not None or run_ids is not None or isinstance(task_ref, RunRequest):
@@ -1020,12 +1150,15 @@ class AntigravitySubstrate:
                         "run_id": rid,
                         "timeout_s": req_timeout,
                         "install_dir": str(staging_dir_val) if staging_dir_val is not None else None,
+                        "validator_cmd": resolved_validator,
                     }
                 )
                 out_paths.append(Path(res["run_dir"]))
             return out_paths
 
         spec = getattr(task_ref, "__dict__", {"task_ref": str(task_ref)})
+        if resolved_validator is not None and isinstance(spec, dict):
+            spec.setdefault("validator_cmd", resolved_validator)
         return self._execute_single_run(spec)
 
     def read_trajectory(
@@ -1419,7 +1552,7 @@ class AntigravityBenchmarkAdapter:
         if not isinstance(events, list) or len(events) == 0:
             return None
 
-        if validator_cmd:
+        if validator_cmd and receipt_data.get("verifier_executed") is not True:
             proc = subprocess.run(
                 validator_cmd if isinstance(validator_cmd, list) else str(validator_cmd),
                 shell=isinstance(validator_cmd, str),
@@ -1431,9 +1564,18 @@ class AntigravityBenchmarkAdapter:
                 check=False,
             )
             passed = proc.returncode == 0
+            receipt_data["verifier_executed"] = True
+            receipt_data["passed_verification"] = passed
+            receipt_data["verification_score"] = 1.0 if passed else 0.0
+            receipt_data["status"] = "succeeded" if passed else "failed"
+            try:
+                receipt_file.write_text(json.dumps(receipt_data, indent=2), encoding="utf-8")
+            except Exception:
+                pass
             return {
                 "ok": passed,
                 "passed": passed,
+                "passed_verification": passed,
                 "score": 1.0 if passed else 0.0,
                 "status": "passed" if passed else "failed",
                 "task_id": task_id or str(receipt_data.get("task_id", "")),
@@ -1465,6 +1607,7 @@ class AntigravityBenchmarkAdapter:
         return {
             "ok": passed,
             "passed": passed,
+            "passed_verification": passed,
             "score": raw_score,
             "status": "passed" if passed else "failed",
             "task_id": task_id or str(receipt_data.get("task_id", "")),
@@ -1671,12 +1814,30 @@ class AntigravityExecutor(AntigravitySubstrate):
         "policies",
         "hooks",
         "mcp_servers",
-        "budget_config",
-        "compaction_config",
+        "budget",
+        "compaction",
         "conversation_id",
         "session_continuation_mode",
         "save_dir",
     )
+
+    PUBLIC_SDK_BUDGET_CONFIG_FIELDS: Tuple[str, ...] = (
+        "max_model_calls",
+        "max_tool_calls",
+        "max_total_tokens",
+        "scope",
+    )
+
+    PUBLIC_SDK_COMPACTION_CONFIG_FIELDS: Tuple[str, ...] = (
+        "token_threshold",
+    )
+
+    SDK_MODEL_TIER_MAP: Dict[str, str] = {
+        "flash_lite": "gemini-3.1-flash-lite-preview",
+        "flash": "gemini-3-flash-preview",
+        "pro": "gemini-3.1-pro-preview",
+        "auto": "gemini-3-flash-preview",
+    }
 
     def build_sdk_agent_config(
         self,
@@ -1684,38 +1845,61 @@ class AntigravityExecutor(AntigravitySubstrate):
         snapshot_id: str,
         *,
         task_id: str = "task-probe",
+        candidate_workspace: Optional[Union[str, Path]] = None,
+        conversation_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Builds a documented public `google.antigravity` `LocalAgentConfig` dictionary
-        without undocumented kwargs (`workspace_root`, `max_steps`, `thinking_budget_tokens`).
+        using only public documented fields (`workspaces`, `model`, `api_key`, `system_instructions`,
+        `policies`, `budget`, `compaction`, `session_continuation_mode`, `save_dir`).
         """
-        thinking_cap = candidate.thinking_budget_tokens or self.reasoning_profile["thinking_budget_tokens"]
+        raw_model = str(candidate.model_tier or self.reasoning_profile["prober_model_tier"] or "gemini-3-flash-preview").strip()
+        if raw_model == "inherit" or not raw_model:
+            raise ValueError("SDK LocalAgentConfig.model must be a concrete model identifier, not 'inherit' or empty.")
+        resolved_model = self.SDK_MODEL_TIER_MAP.get(raw_model, raw_model)
+
+        if candidate_workspace is not None:
+            cand_ws = Path(candidate_workspace).resolve(strict=True)
+        else:
+            cand_ws = (
+                self.workspace_root / ".harness" / "runtime" / "sdk-workspaces" / f"{task_id}-{candidate.candidate_id}"
+            ).resolve()
+            cand_ws.mkdir(parents=True, exist_ok=True)
+            cand_ws = cand_ws.resolve(strict=True)
+
+        max_steps = int(candidate.max_steps or self.reasoning_profile["max_probe_steps"] or 6)
+        thinking_cap = int(candidate.thinking_budget_tokens or self.reasoning_profile["thinking_budget_tokens"] or 2048)
+        max_total_tokens = int(max(4096, thinking_cap * 8))
+        token_threshold = int(max(1000, min(max_total_tokens - 512, max(4000, int(max_total_tokens * 0.75)))))
         sys_instructions = self.build_system_instructions(candidate, snapshot_id)
         save_dir_path = (
             self.workspace_root / ".harness" / "runtime" / "sdk-sessions" / f"{task_id}-{candidate.candidate_id}"
         ).resolve()
-        return {
-            "workspaces": [str(self.workspace_root)],
-            "model": str(candidate.model_tier or self.reasoning_profile["prober_model_tier"] or "auto"),
+
+        cfg: Dict[str, Any] = {
+            "workspaces": [str(cand_ws)],
+            "model": resolved_model,
             "api_key": os.environ.get("GEMINI_API_KEY", ""),
             "system_instructions": sys_instructions,
             "policies": {"terminal_execution": "auto"},
-            "budget_config": {
-                "max_iterations": int(candidate.max_steps),
-                "max_tokens": int(max(4096, thinking_cap * 4)),
+            "budget": {
+                "max_model_calls": max_steps,
+                "max_tool_calls": max_steps * 4,
+                "max_total_tokens": max_total_tokens,
+                "scope": "lifetime",
             },
-            "compaction_config": {"enabled": True},
+            "compaction": {
+                "token_threshold": token_threshold,
+            },
+            "session_continuation_mode": "resume" if conversation_id else "create_only",
             "save_dir": str(save_dir_path),
         }
+        if conversation_id:
+            cfg["conversation_id"] = str(conversation_id)
+        return cfg
 
     def validate_sdk_agent_config(self, config_dict: Mapping[str, Any]) -> Dict[str, Any]:
-        unknown = [k for k in config_dict.keys() if k not in self.PUBLIC_SDK_LOCAL_AGENT_CONFIG_FIELDS]
-        return {
-            "ok": len(unknown) == 0,
-            "unknown_fields": unknown,
-            "unsupported_keys": unknown,
-            "allowed_fields": list(self.PUBLIC_SDK_LOCAL_AGENT_CONFIG_FIELDS),
-        }
+        return validate_sdk_agent_config(config_dict)
 
     async def probe_candidate_async(
         self,
@@ -1769,33 +1953,58 @@ class AntigravityExecutor(AntigravitySubstrate):
             try:
                 from google.antigravity import Agent, LocalAgentConfig, types  # type: ignore
 
+                run_dir = (
+                    self.workspace_root
+                    / ".harness"
+                    / "runtime"
+                    / "runs"
+                    / f"{task_id}-{candidate.candidate_id}"
+                ).resolve()
+                deliv_dir = run_dir / "deliverables"
+                deliv_dir.mkdir(parents=True, exist_ok=True)
+
                 public_cfg_dict = self.build_sdk_agent_config(
-                    candidate, snapshot_id, task_id=task_id
+                    candidate,
+                    snapshot_id,
+                    task_id=task_id,
+                    candidate_workspace=run_dir,
                 )
-                try:
-                    budget_obj = (
-                        types.BudgetConfig(**public_cfg_dict["budget_config"])
-                        if hasattr(types, "BudgetConfig")
-                        else public_cfg_dict["budget_config"]
-                    )
-                    compaction_obj = (
-                        types.CompactionConfig(**public_cfg_dict["compaction_config"])
-                        if hasattr(types, "CompactionConfig")
-                        else public_cfg_dict["compaction_config"]
-                    )
-                    config = LocalAgentConfig(
-                        workspaces=public_cfg_dict["workspaces"],
-                        model=public_cfg_dict["model"],
-                        api_key=public_cfg_dict["api_key"],
-                        system_instructions=sys_instructions,
-                        budget_config=budget_obj,
-                        compaction_config=compaction_obj,
-                        save_dir=public_cfg_dict["save_dir"],
-                    )
-                except TypeError:
-                    config = LocalAgentConfig(
-                        system_instructions=sys_instructions,
-                    )
+                validation = self.validate_sdk_agent_config(public_cfg_dict)
+                if not validation.get("ok"):
+                    raise ValueError(f"Invalid SDK LocalAgentConfig: {validation}")
+
+                budget_dict = dict(public_cfg_dict["budget"])
+                if hasattr(types, "BudgetScope") and isinstance(budget_dict.get("scope"), str):
+                    scope_str = budget_dict["scope"].upper()
+                    if hasattr(types.BudgetScope, scope_str):
+                        budget_dict["scope"] = getattr(types.BudgetScope, scope_str)
+                budget_obj = (
+                    types.BudgetConfig(**budget_dict)
+                    if hasattr(types, "BudgetConfig")
+                    else budget_dict
+                )
+                compaction_obj = (
+                    types.CompactionConfig(**public_cfg_dict["compaction"])
+                    if hasattr(types, "CompactionConfig")
+                    else public_cfg_dict["compaction"]
+                )
+                cont_mode = public_cfg_dict.get("session_continuation_mode", "create_only")
+                if hasattr(types, "SessionContinuationMode") and isinstance(cont_mode, str):
+                    mode_attr = cont_mode.upper()
+                    if hasattr(types.SessionContinuationMode, mode_attr):
+                        cont_mode = getattr(types.SessionContinuationMode, mode_attr)
+
+                config = LocalAgentConfig(
+                    workspaces=public_cfg_dict["workspaces"],
+                    model=public_cfg_dict["model"],
+                    api_key=public_cfg_dict["api_key"],
+                    system_instructions=sys_instructions,
+                    policies=public_cfg_dict["policies"],
+                    budget=budget_obj,
+                    compaction=compaction_obj,
+                    session_continuation_mode=cont_mode,
+                    save_dir=public_cfg_dict["save_dir"],
+                )
 
                 async with Agent(config) as agent:
                     response = await agent.chat(task_prompt)
@@ -1810,15 +2019,6 @@ class AntigravityExecutor(AntigravitySubstrate):
                     t_tok = int(raw_t or 0)
                     tot_tok = p_tok + c_tok + t_tok
 
-                    run_dir = (
-                        self.workspace_root
-                        / ".harness"
-                        / "runtime"
-                        / "runs"
-                        / f"{task_id}-{candidate.candidate_id}"
-                    ).resolve()
-                    deliv_dir = run_dir / "deliverables"
-                    deliv_dir.mkdir(parents=True, exist_ok=True)
                     # Store model prose output as metadata (assistant_response.md), NEVER as a deliverable artifact!
                     if text_out.strip():
                         (run_dir / "assistant_response.md").write_text(text_out, encoding="utf-8")
@@ -1827,7 +2027,6 @@ class AntigravityExecutor(AntigravitySubstrate):
                         self.workspace_root, required_files=required_files
                     )
                     deliv_ok = bench.delivered(run_dir, required_files)
-                    verifier_ran = bool(validator_cmd)
                     traj_payload = {
                         "run_id": f"{task_id}-{candidate.candidate_id}",
                         "run_dir": str(run_dir),
@@ -1843,9 +2042,9 @@ class AntigravityExecutor(AntigravitySubstrate):
                         "task_id": task_id,
                         "run_dir": str(run_dir),
                         "executed": True,
-                        "verifier_executed": verifier_ran,
+                        "verifier_executed": False,
                         "synthetic": False,
-                        "status": "delivered_unverified" if (deliv_ok and not verifier_ran) else ("succeeded" if deliv_ok else "failed"),
+                        "status": "delivered_unverified" if deliv_ok else "failed",
                         "passed_verification": False,
                         "verification_score": 0.0,
                         "delivered": deliv_ok,
@@ -1862,12 +2061,7 @@ class AntigravityExecutor(AntigravitySubstrate):
                     )
                     passed_ver = bool(scored and scored.get("passed"))
                     ver_score = float(scored.get("score", 0.0)) if scored else 0.0
-                    saved_tok = max(0, unoptimized_baseline_tokens - tot_tok) if (has_observed_usage and tot_tok > 0) else 0
-                    saved_pct = (
-                        round((saved_tok / unoptimized_baseline_tokens) * 100.0, 1)
-                        if (has_observed_usage and tot_tok > 0)
-                        else 0.0
-                    )
+                    verifier_ran = bool(scored and scored.get("verifier_executed"))
                     return ProbeTrajectoryResult(
                         candidate_id=candidate.candidate_id,
                         snapshot_id=snapshot_id,
@@ -1885,9 +2079,9 @@ class AntigravityExecutor(AntigravitySubstrate):
                         model_tier=candidate.model_tier,
                         thinking_budget_tokens=thinking_cap,
                         total_tokens=tot_tok,
-                        unoptimized_tokens=unoptimized_baseline_tokens if has_observed_usage else 0,
-                        tokens_saved=saved_tok,
-                        tokens_saved_pct=saved_pct,
+                        unoptimized_tokens=0,
+                        tokens_saved=0,
+                        tokens_saved_pct=0.0,
                         synthetic=False,
                         execution_mode="verified" if passed_ver else ("delivered_unverified" if deliv_ok else "failed"),
                         verifier_executed=verifier_ran,
@@ -2056,6 +2250,7 @@ class AntigravityExecutor(AntigravitySubstrate):
         command: Optional[Union[str, List[str]]] = None,
         required_files: Optional[List[str]] = None,
         validator_cmd: Optional[Union[str, List[str]]] = None,
+        baseline_tokens: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Runs a full Propose -> Probe -> Compose cycle with Snapshot Isolation and Reasoning Depth Guardrails."""
         stop_check = self._check_task_stop_state(task_id)
@@ -2260,8 +2455,8 @@ class AntigravityExecutor(AntigravitySubstrate):
                     "tokenEfficiency": {
                         "totalActualTokens": None,
                         "totalUnoptimizedTokens": None,
-                        "totalTokensSaved": 0,
-                        "totalTokensSavedPct": 0.0,
+                        "totalTokensSaved": None,
+                        "totalTokensSavedPct": None,
                     },
                     "snapshotLock": compact_lock,
                     "winner": {
@@ -2276,12 +2471,26 @@ class AntigravityExecutor(AntigravitySubstrate):
 
             total_actual_tokens = sum(r.total_tokens for r in probe_results)
             has_complete_usage = all(getattr(r, "usage_complete", False) for r in active_results)
-            total_unoptimized_tokens = 16700 * k if is_simulated_run or total_actual_tokens > 0 else 0
-            total_saved = max(0, total_unoptimized_tokens - total_actual_tokens)
+            measured_baseline = int(baseline_tokens) if (baseline_tokens is not None and int(baseline_tokens) > 0) else None
+            total_unoptimized_tokens = (
+                measured_baseline
+                if measured_baseline is not None
+                else (16700 * k if is_simulated_run else None)
+            )
+            has_baseline_comparison = (
+                total_unoptimized_tokens is not None
+                and total_unoptimized_tokens > 0
+                and (is_simulated_run or (has_complete_usage and total_actual_tokens > 0))
+            )
+            total_saved = (
+                max(0, total_unoptimized_tokens - total_actual_tokens)
+                if has_baseline_comparison and total_unoptimized_tokens is not None
+                else None
+            )
             total_saved_pct = (
                 round((total_saved / max(1, total_unoptimized_tokens)) * 100.0, 1)
-                if total_unoptimized_tokens > 0
-                else 0.0
+                if has_baseline_comparison and total_saved is not None and total_unoptimized_tokens is not None
+                else None
             )
 
             recorded_info = None
@@ -2310,11 +2519,12 @@ class AntigravityExecutor(AntigravitySubstrate):
                     )
                     eval_receipt_id = rcpt_res.get("receiptId")
                 rec_status = "active" if (not is_simulated_run and eval_receipt_id) else "candidate"
+                title_suffix = f" · {total_saved_pct}% Tokens Saved" if total_saved_pct is not None else ""
                 recorded_info = self.record_experience(
                     {
                         "task_id": task_id,
                         "domain": domain,
-                        "title": f"EXPERIENCE: {task_id} ({winning_spec.candidate_id} · {total_saved_pct}% Tokens Saved)",
+                        "title": f"EXPERIENCE: {task_id} ({winning_spec.candidate_id}{title_suffix})",
                         "cue": (
                             f"When tackling '{problem[:80]}' in {domain}, use {winning_spec.candidate_id} "
                             f"(depth={profile['reasoning_depth']}, thinkingCap={thinking_cap}, model={model_tier}) "
@@ -2324,8 +2534,7 @@ class AntigravityExecutor(AntigravitySubstrate):
                         "observed_behavior": (
                             f"Compared K={k} candidates ({mode}, depth={profile['reasoning_depth']}) under snapshot lock {snapshot_id}. "
                             f"Winning candidate '{winner.candidate_id}' achieved score={winner.verification_score} "
-                            f"with {winner.tool_errors} tool errors using {total_actual_tokens} total tokens "
-                            f"({total_saved_pct}% saved vs unbounded baseline)."
+                            f"with {winner.tool_errors} tool errors."
                         ),
                         "supporting_evidence": winner.evidence_paths,
                         "status": rec_status,
@@ -2338,9 +2547,9 @@ class AntigravityExecutor(AntigravitySubstrate):
                             "reasoning_profile": profile,
                             "token_efficiency": {
                                 "total_actual_tokens": total_actual_tokens if (is_simulated_run or has_complete_usage) else None,
-                                "total_unoptimized_tokens": total_unoptimized_tokens if is_simulated_run else None,
-                                "total_tokens_saved": total_saved if is_simulated_run else None,
-                                "total_tokens_saved_pct": total_saved_pct if is_simulated_run else None,
+                                "total_unoptimized_tokens": total_unoptimized_tokens,
+                                "total_tokens_saved": total_saved,
+                                "total_tokens_saved_pct": total_saved_pct,
                             },
                         },
                     }
@@ -2363,7 +2572,7 @@ class AntigravityExecutor(AntigravitySubstrate):
                 "reasoningProfile": profile,
                 "tokenEfficiency": {
                     "totalActualTokens": total_actual_tokens if (is_simulated_run or has_complete_usage) else None,
-                    "totalUnoptimizedTokens": total_unoptimized_tokens if is_simulated_run else None,
+                    "totalUnoptimizedTokens": total_unoptimized_tokens,
                     "totalTokensSaved": total_saved,
                     "totalTokensSavedPct": total_saved_pct,
                 },
@@ -2411,10 +2620,11 @@ class AntigravityExecutor(AntigravitySubstrate):
 
 def build_sdk_agent_config(
     workspace_root: Optional[Union[str, Path]] = None,
-    model: str = "auto",
+    model: str = "gemini-3-flash-preview",
     candidate: Optional[HarnessCandidateSpec] = None,
     snapshot_id: str = "SNAP-PUBLIC",
     task_id: str = "task-probe",
+    candidate_workspace: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Any]:
     ex = AntigravityExecutor(workspace_root or Path.cwd())
     cand = candidate or HarnessCandidateSpec(
@@ -2422,18 +2632,188 @@ def build_sdk_agent_config(
         hypothesis="Public SDK config",
         model_tier=model,
     )
-    return ex.build_sdk_agent_config(cand, snapshot_id, task_id=task_id)
+    return ex.build_sdk_agent_config(
+        cand,
+        snapshot_id,
+        task_id=task_id,
+        candidate_workspace=candidate_workspace or (workspace_root or Path.cwd()),
+    )
 
 
 def validate_sdk_agent_config(config_dict: Mapping[str, Any]) -> Dict[str, Any]:
-    unknown = [
+    unknown: List[str] = [
         k for k in config_dict.keys() if k not in AntigravityExecutor.PUBLIC_SDK_LOCAL_AGENT_CONFIG_FIELDS
     ]
+    invalid_fields: List[str] = []
+
+    model_val = config_dict.get("model")
+    if not isinstance(model_val, str) or not model_dict_clean(model_val) or model_dict_clean(model_val) == "inherit":
+        invalid_fields.append("model")
+        if model_val == "inherit":
+            unknown.append("model=inherit")
+
+    workspaces_val = config_dict.get("workspaces")
+    if not isinstance(workspaces_val, (list, tuple)) or len(workspaces_val) == 0:
+        invalid_fields.append("workspaces")
+    else:
+        for ws_item in workspaces_val:
+            if not isinstance(ws_item, (str, Path)) or not Path(ws_item).exists() or not Path(ws_item).is_dir():
+                invalid_fields.append(f"workspaces:{ws_item}")
+
+    budget_val = config_dict.get("budget")
+    if budget_val is not None:
+        budget_map = (
+            dataclasses.asdict(budget_val)
+            if dataclasses.is_dataclass(budget_val)
+            else (dict(budget_val) if isinstance(budget_val, Mapping) else None)
+        )
+        if budget_map is None:
+            invalid_fields.append("budget")
+        else:
+            for bk, bv in budget_map.items():
+                if bk not in AntigravityExecutor.PUBLIC_SDK_BUDGET_CONFIG_FIELDS:
+                    unknown.append(f"budget.{bk}")
+                    unknown.append(bk)
+                elif bk in ("max_model_calls", "max_tool_calls", "max_total_tokens"):
+                    if bv is not None and (not isinstance(bv, int) or isinstance(bv, bool) or bv <= 0):
+                        invalid_fields.append(f"budget.{bk}")
+                elif bk == "scope":
+                    scope_str = str(getattr(bv, "value", bv)).lower()
+                    if scope_str not in ("lifetime", "invocation", "budgetscope.lifetime", "budgetscope.invocation"):
+                        invalid_fields.append("budget.scope")
+
+    compaction_val = config_dict.get("compaction")
+    if compaction_val is not None:
+        comp_map = (
+            dataclasses.asdict(compaction_val)
+            if dataclasses.is_dataclass(compaction_val)
+            else (dict(compaction_val) if isinstance(compaction_val, Mapping) else None)
+        )
+        if comp_map is None:
+            invalid_fields.append("compaction")
+        else:
+            for ck, cv in comp_map.items():
+                if ck not in AntigravityExecutor.PUBLIC_SDK_COMPACTION_CONFIG_FIELDS:
+                    unknown.append(f"compaction.{ck}")
+                    unknown.append(ck)
+                elif ck == "token_threshold":
+                    if not isinstance(cv, int) or isinstance(cv, bool) or cv < 1000:
+                        invalid_fields.append("compaction.token_threshold")
+
+    cont_mode = str(config_dict.get("session_continuation_mode", "create_only")).lower()
+    if "resume" in cont_mode and not config_dict.get("conversation_id"):
+        invalid_fields.append("conversation_id")
+
+    all_unsupported = list(dict.fromkeys(unknown + invalid_fields))
     return {
-        "ok": len(unknown) == 0,
+        "ok": len(all_unsupported) == 0,
         "unknown_fields": unknown,
-        "unsupported_keys": unknown,
+        "invalid_fields": invalid_fields,
+        "unsupported_keys": all_unsupported,
         "allowed_fields": list(AntigravityExecutor.PUBLIC_SDK_LOCAL_AGENT_CONFIG_FIELDS),
+        "allowed_budget_fields": list(AntigravityExecutor.PUBLIC_SDK_BUDGET_CONFIG_FIELDS),
+        "allowed_compaction_fields": list(AntigravityExecutor.PUBLIC_SDK_COMPACTION_CONFIG_FIELDS),
+    }
+
+
+def model_dict_clean(val: Any) -> str:
+    return str(val or "").strip()
+
+
+def parse_agy_stream_json_events(lines: Any) -> Dict[str, Any]:
+    """
+    Parses JSONL output lines from `agy --input-format stream-json --output-format stream-json`
+    into structured conversation ID, assistant text, tool calls, usage, and terminal status.
+    """
+    conversation_id: Optional[str] = None
+    assistant_chunks: List[str] = []
+    tool_calls: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    prompt_tokens: Optional[int] = None
+    candidates_tokens: Optional[int] = None
+    thoughts_tokens: Optional[int] = None
+    explicit_total_tokens: Optional[int] = None
+    done = False
+
+    if isinstance(lines, str):
+        raw_lines = lines.splitlines()
+    else:
+        raw_lines = list(lines or [])
+
+    for raw_line in raw_lines:
+        text = str(raw_line or "").strip()
+        if not text:
+            continue
+        try:
+            ev = json.loads(text)
+        except Exception:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("conversation_id") or ev.get("conversationId"):
+            conversation_id = str(ev.get("conversation_id") or ev.get("conversationId"))
+        ev_type = str(ev.get("type") or ev.get("event") or "").lower()
+        if ev_type in ("text", "content", "assistant", "message", "delta"):
+            chunk = ev.get("text") or ev.get("content") or ev.get("delta") or ""
+            if isinstance(chunk, str) and chunk:
+                assistant_chunks.append(chunk)
+        if ev_type in ("tool_call", "tool_use") or isinstance(ev.get("tool_calls"), list):
+            if isinstance(ev.get("tool_calls"), list):
+                tool_calls.extend(c for c in ev["tool_calls"] if isinstance(c, dict))
+            else:
+                tool_calls.append(ev)
+        usage_obj = ev.get("usage") or ev.get("total_usage")
+        if isinstance(usage_obj, dict):
+            if usage_obj.get("prompt_token_count") is not None or usage_obj.get("prompt_tokens") is not None:
+                prompt_tokens = int(
+                    usage_obj.get("prompt_token_count")
+                    if usage_obj.get("prompt_token_count") is not None
+                    else usage_obj.get("prompt_tokens")
+                )
+            if usage_obj.get("candidates_token_count") is not None or usage_obj.get("completion_tokens") is not None:
+                candidates_tokens = int(
+                    usage_obj.get("candidates_token_count")
+                    if usage_obj.get("candidates_token_count") is not None
+                    else usage_obj.get("completion_tokens")
+                )
+            if usage_obj.get("thoughts_token_count") is not None or usage_obj.get("reasoning_tokens") is not None:
+                thoughts_tokens = int(
+                    usage_obj.get("thoughts_token_count")
+                    if usage_obj.get("thoughts_token_count") is not None
+                    else usage_obj.get("reasoning_tokens")
+                )
+            if usage_obj.get("total_token_count") is not None or usage_obj.get("total_tokens") is not None:
+                explicit_total_tokens = int(
+                    usage_obj.get("total_token_count")
+                    if usage_obj.get("total_token_count") is not None
+                    else usage_obj.get("total_tokens")
+                )
+        if ev_type in ("error", "failed") or ev.get("error"):
+            errors.append(str(ev.get("error") or ev.get("message") or "CLI_STREAM_ERROR"))
+        if ev_type in ("done", "complete", "completed", "result", "turn_complete", "turn_end") or ev.get("done") is True:
+            done = True
+
+    has_usage = any(v is not None for v in (prompt_tokens, candidates_tokens, thoughts_tokens, explicit_total_tokens))
+    total_tokens = (
+        int(prompt_tokens or 0) + int(candidates_tokens or 0) + int(thoughts_tokens or 0)
+        if any(v is not None for v in (prompt_tokens, candidates_tokens, thoughts_tokens))
+        else explicit_total_tokens
+    )
+    return {
+        "ok": len(errors) == 0,
+        "done": done,
+        "conversation_id": conversation_id,
+        "text": "".join(assistant_chunks),
+        "tool_calls": tool_calls,
+        "observed_tokens": total_tokens,
+        "usage": {
+            "prompt_token_count": prompt_tokens,
+            "candidates_token_count": candidates_tokens,
+            "thoughts_token_count": thoughts_tokens,
+            "total_tokens": total_tokens,
+            "usage_complete": has_usage,
+        },
+        "errors": errors,
     }
 
 

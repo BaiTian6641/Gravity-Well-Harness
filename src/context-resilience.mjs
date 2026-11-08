@@ -477,7 +477,12 @@ export class ContextResilienceManager {
           typeof evRef === 'string'
             ? evRef.trim()
             : String(evRef?.file || evRef?.receiptId || '').trim();
-        const evCheck = this._inspectEvidenceRef(evRef);
+        const evCheck = this._inspectEvidenceRef(evRef, {
+          expectedTaskId: taskId,
+          expectedReqId: req.id,
+          expectedRequirementRevision: req.requirementRevision ?? null,
+          requiredAcceptanceChecks: req.acceptanceChecks,
+        });
         if (!evCheck.exists || !evCheck.validVerdict) {
           reasons.push(`invalid_or_missing_evidence:${refKey}`);
           continue;
@@ -561,7 +566,15 @@ export class ContextResilienceManager {
     return { file: '', symbol: null };
   }
 
-  _inspectEvidenceRef(evRef) {
+  _inspectEvidenceRef(
+    evRef,
+    {
+      expectedTaskId = null,
+      expectedReqId = null,
+      expectedRequirementRevision = null,
+      requiredAcceptanceChecks = null,
+    } = {}
+  ) {
     const refStr =
       typeof evRef === 'string'
         ? evRef.trim()
@@ -580,11 +593,17 @@ export class ContextResilienceManager {
           exists: false,
           validVerdict: false,
           digest: null,
-          reason: 'Receipt file does not exist on disk'
+          reason: 'Receipt file does not exist on disk',
         };
       }
       const rawText = fs.readFileSync(receiptPath, 'utf8');
-      const rcptCheck = engine.verifyEvaluationReceipt(refStr);
+      const rcptCheck = engine.verifyEvaluationReceipt(refStr, {
+        expectedTaskId,
+        expectedReqId,
+        expectedRequirementRevision,
+        requiredAcceptanceChecks,
+        mode: 'current_workspace',
+      });
       return {
         exists: true,
         validVerdict: rcptCheck.valid === true,
@@ -602,7 +621,7 @@ export class ContextResilienceManager {
         exists: false,
         validVerdict: false,
         digest: null,
-        reason: 'Evidence file does not exist on disk'
+        reason: 'Evidence file does not exist on disk',
       };
     }
     if (!cleanFile.toLowerCase().endsWith('.json')) {
@@ -622,25 +641,36 @@ export class ContextResilienceManager {
         exists: true,
         validVerdict: false,
         digest: fileDigest,
-        reason: 'Evidence JSON is malformed or not an object'
+        reason: 'Evidence JSON is malformed or not an object',
       };
     }
 
     // If the JSON file is a stored evaluation receipt, verify its receipt HMAC & artifacts
     if (typeof parsed.receiptId === 'string' && /^RCPT-[A-Z0-9_-]+$/i.test(parsed.receiptId)) {
-      const rcptCheck = engine.verifyEvaluationReceipt(parsed.receiptId);
+      const rcptCheck = engine.verifyEvaluationReceipt(parsed.receiptId, {
+        expectedTaskId,
+        expectedReqId,
+        expectedRequirementRevision,
+        requiredAcceptanceChecks,
+        mode: 'current_workspace',
+      });
       return {
         exists: true,
         validVerdict: rcptCheck.valid === true,
         digest: fileDigest,
         reason: rcptCheck.valid
           ? 'Valid evaluation receipt file'
-          : `Receipt file failed cryptographic verification (${rcptCheck.error || 'INVALID_RECEIPT'})`
+          : `Receipt file failed cryptographic verification (${rcptCheck.error || 'INVALID_RECEIPT'})`,
       };
     }
 
     // Otherwise require an HMAC-authenticated verifier verdict (reject unsigned caller-authored JSON)
-    const vCheck = engine.verifySignedVerdict(parsed);
+    const vCheck = engine.verifySignedVerdict(parsed, {
+      expectedTaskId,
+      expectedReqId,
+      expectedRequirementRevision,
+      requiredAcceptanceChecks,
+    });
     return {
       exists: true,
       validVerdict: vCheck.valid === true,
@@ -651,8 +681,8 @@ export class ContextResilienceManager {
     };
   }
 
-  _verifyEvidenceRefExists(evRef) {
-    const check = this._inspectEvidenceRef(evRef);
+  _verifyEvidenceRefExists(evRef, expectedOpts = {}) {
+    const check = this._inspectEvidenceRef(evRef, expectedOpts);
     return check.exists && check.validVerdict;
   }
 
@@ -717,7 +747,12 @@ export class ContextResilienceManager {
           }
           const evidenceDigests = {};
           for (const evRef of merged.evidenceRefs) {
-            const evCheck = this._inspectEvidenceRef(evRef);
+            const evCheck = this._inspectEvidenceRef(evRef, {
+              expectedTaskId: taskId,
+              expectedReqId: req.id,
+              expectedRequirementRevision: merged.requirementRevision ?? null,
+              requiredAcceptanceChecks: merged.acceptanceChecks,
+            });
             const evLabel =
               typeof evRef === 'string'
                 ? evRef.trim()
@@ -883,13 +918,13 @@ export class ContextResilienceManager {
       const driftedSymbols = new Set();
 
       for (const c of reg.contracts) {
+        const prevStatus = c.status;
         let contractValid = true;
         if (c.producerFile) {
           const fullProd = this._resolveWorkspaceFile(c.producerFile);
           if (!fs.existsSync(fullProd) || !fs.statSync(fullProd).isFile()) {
             c.status = 'stale_invalidated';
             contractValid = false;
-            mutated = true;
             driftedFiles.add(c.producerFile);
             driftedSymbols.add(c.symbolName);
             issues.push({
@@ -903,7 +938,6 @@ export class ContextResilienceManager {
             if (c.producerDigest && currentProducerDigest !== c.producerDigest) {
               c.status = 'stale_invalidated';
               contractValid = false;
-              mutated = true;
               driftedFiles.add(c.producerFile);
               driftedSymbols.add(c.symbolName);
               issues.push({
@@ -918,7 +952,6 @@ export class ContextResilienceManager {
               if (!text.includes(c.storageKey)) {
                 c.status = 'key_drift_invalidated';
                 contractValid = false;
-                mutated = true;
                 driftedFiles.add(c.producerFile);
                 driftedSymbols.add(c.symbolName);
                 issues.push({
@@ -938,7 +971,6 @@ export class ContextResilienceManager {
           if (!fs.existsSync(fullCons) || !fs.statSync(fullCons).isFile()) {
             c.status = 'stale_invalidated';
             contractValid = false;
-            mutated = true;
             driftedFiles.add(c.consumerFile);
             driftedSymbols.add(c.symbolName);
             issues.push({
@@ -952,7 +984,6 @@ export class ContextResilienceManager {
             if (c.consumerDigest && currentConsumerDigest !== c.consumerDigest) {
               c.status = 'stale_invalidated';
               contractValid = false;
-              mutated = true;
               driftedFiles.add(c.consumerFile);
               driftedSymbols.add(c.symbolName);
               issues.push({
@@ -967,7 +998,6 @@ export class ContextResilienceManager {
               if (!text.includes(c.storageKey)) {
                 c.status = 'key_drift_invalidated';
                 contractValid = false;
-                mutated = true;
                 driftedFiles.add(c.consumerFile);
                 driftedSymbols.add(c.symbolName);
                 issues.push({
@@ -984,6 +1014,8 @@ export class ContextResilienceManager {
 
         if (contractValid && c.status !== 'valid') {
           c.status = 'valid';
+        }
+        if (c.status !== prevStatus) {
           mutated = true;
         }
       }
@@ -1051,8 +1083,327 @@ export class ContextResilienceManager {
   }
 
   // =========================================================================
-  // 3. ATOMIC RESUMABLE CHECKPOINTS & SUBAGENT RECOVERY (CTX-04, CTX-09, CTX-10)
+  // 3. ATOMIC RESUMABLE CHECKPOINTS, CONTROLLER-OWNED SESSIONS & SUBAGENT RECOVERY (CTX-04, CTX-09, CTX-10)
   // =========================================================================
+  getExecutorSessionsPath(taskId) {
+    return resolveContainedRealPath(
+      this.workspaceRoot,
+      path.join(this._resolveSafeTaskDir(taskId), 'executor-sessions.json')
+    );
+  }
+
+  loadExecutorSessions(taskId) {
+    const file = this.getExecutorSessionsPath(taskId);
+    return (
+      readJsonSafe(file, null) || {
+        schemaVersion: 1,
+        taskId,
+        sessions: {},
+        updatedAt: null,
+      }
+    );
+  }
+
+  /**
+   * WP7 / F07: Registers a controller-owned executor session for a worker (`subagent | sdk | cli | mcp | local_process`).
+   * Only sessions registered in `executor-sessions.json` can receive or acknowledge recovery packets.
+   */
+  registerExecutorSession(taskId, workerIdOrOptions = {}, maybeOptions = {}) {
+    return this._withTaskLock(taskId, () => {
+      const opts =
+        typeof workerIdOrOptions === 'string'
+          ? { ...(maybeOptions || {}), workerId: workerIdOrOptions }
+          : workerIdOrOptions || {};
+      const {
+        workerId,
+        executorSessionId,
+        executor_session_id,
+        transport = 'subagent',
+        pid = null,
+        conversationId = null,
+        metadata = {},
+      } = opts;
+      const cleanWorkerId = String(workerId || '').trim();
+      const cleanSessionId = String(executorSessionId ?? executor_session_id ?? '').trim();
+      if (!cleanWorkerId || !cleanSessionId) {
+        return {
+          ok: false,
+          error: 'WORKER_ID_AND_EXECUTOR_SESSION_ID_REQUIRED',
+        };
+      }
+      const allowedTransports = new Set([
+        'subagent',
+        'sdk',
+        'cli',
+        'mcp',
+        'local_process',
+        'in_process',
+      ]);
+      const cleanTransport = String(transport || 'subagent').toLowerCase();
+      if (!allowedTransports.has(cleanTransport)) {
+        return {
+          ok: false,
+          error: 'UNSUPPORTED_SESSION_TRANSPORT',
+          transport: cleanTransport,
+        };
+      }
+      const state = this.loadExecutorSessions(taskId);
+      state.sessions = state.sessions || {};
+      const existing = state.sessions[cleanSessionId];
+      const nowIso = new Date().toISOString();
+      state.sessions[cleanSessionId] = {
+        sessionId: cleanSessionId,
+        executorSessionId: cleanSessionId,
+        workerId: cleanWorkerId,
+        taskId,
+        transport: cleanTransport,
+        pid: pid ?? existing?.pid ?? null,
+        conversationId: conversationId ?? existing?.conversationId ?? null,
+        metadata: { ...(existing?.metadata || {}), ...(metadata || {}) },
+        status: 'ACTIVE',
+        registeredAt: existing?.registeredAt || nowIso,
+        updatedAt: nowIso,
+        deliveredPackets: existing?.deliveredPackets || {},
+        acknowledgedPackets: existing?.acknowledgedPackets || {},
+        cancelRequestedAt: null,
+        stoppedAt: null,
+      };
+      state.updatedAt = nowIso;
+      writeJsonAtomic(this.getExecutorSessionsPath(taskId), state);
+      return {
+        ok: true,
+        taskId,
+        workerId: cleanWorkerId,
+        executorSessionId: cleanSessionId,
+        transport: cleanTransport,
+        status: 'ACTIVE',
+        registeredAt: state.sessions[cleanSessionId].registeredAt,
+      };
+    });
+  }
+
+  /**
+   * WP7 / F07: Records controller-verified transport delivery of a recovery packet to a registered executor session.
+   */
+  deliverRecoveryPacket(
+    taskId,
+    workerId,
+    {
+      executorSessionId,
+      executor_session_id,
+      recoveryToken,
+      recovery_token,
+      packetDigest,
+      packet_digest,
+      checkpointRevision,
+      checkpoint_revision,
+      ledgerRevision,
+      ledger_revision,
+      contractRevision,
+      contract_revision,
+      deliveredVia = 'controller_transport',
+    } = {}
+  ) {
+    return this._withTaskLock(taskId, () => {
+      const cleanWorkerId = String(workerId || '').trim();
+      const acksFile = resolveContainedRealPath(
+        this.workspaceRoot,
+        path.join(this._resolveSafeTaskDir(taskId), 'recovery-acks.json')
+      );
+      const acksState = readJsonSafe(acksFile, { taskId, workers: {} });
+      const entry = acksState.workers?.[cleanWorkerId];
+      if (!entry) {
+        return {
+          ok: false,
+          delivered: false,
+          error: 'NO_PENDING_RECOVERY_PACKET',
+        };
+      }
+      const cleanSessionId = String(
+        executorSessionId ?? executor_session_id ?? entry.executorSessionId ?? ''
+      ).trim();
+      if (!cleanSessionId) {
+        return {
+          ok: false,
+          delivered: false,
+          error: 'EXECUTOR_SESSION_ID_REQUIRED',
+        };
+      }
+      if (entry.executorSessionId && entry.executorSessionId !== cleanSessionId) {
+        return {
+          ok: false,
+          delivered: false,
+          error: 'EXECUTOR_SESSION_ID_MISMATCH',
+        };
+      }
+
+      const sessionsState = this.loadExecutorSessions(taskId);
+      const regSession = sessionsState.sessions?.[cleanSessionId];
+      if (!regSession || regSession.workerId !== cleanWorkerId) {
+        return {
+          ok: false,
+          delivered: false,
+          status: 'RECOVERY_PENDING',
+          error: 'NO_REGISTERED_EXECUTOR_SESSION',
+        };
+      }
+      if (
+        regSession.status === 'CANCELLED' ||
+        regSession.status === 'STOPPED' ||
+        regSession.status === 'CANCEL_REQUESTED'
+      ) {
+        return {
+          ok: false,
+          delivered: false,
+          status: regSession.status,
+          error: 'EXECUTOR_SESSION_NOT_ACTIVE',
+        };
+      }
+
+      const suppliedTok = String(
+        recoveryToken ?? recovery_token ?? entry.recoveryToken ?? ''
+      ).trim();
+      if (suppliedTok !== entry.recoveryToken) {
+        return {
+          ok: false,
+          delivered: false,
+          error: 'RECOVERY_TOKEN_MISMATCH',
+        };
+      }
+      const suppliedDigest = packetDigest ?? packet_digest;
+      if (suppliedDigest && String(suppliedDigest) !== String(entry.packetDigest)) {
+        return {
+          ok: false,
+          delivered: false,
+          error: 'PACKET_DIGEST_MISMATCH',
+        };
+      }
+
+      const nowIso = new Date().toISOString();
+      regSession.deliveredPackets = regSession.deliveredPackets || {};
+      regSession.deliveredPackets[entry.recoveryToken] = {
+        recoveryToken: entry.recoveryToken,
+        packetDigest: entry.packetDigest,
+        checkpointRevision: checkpointRevision ?? checkpoint_revision ?? entry.checkpointRevision,
+        ledgerRevision: ledgerRevision ?? ledger_revision ?? entry.ledgerRevision,
+        contractRevision: contractRevision ?? contract_revision ?? entry.contractRevision ?? 0,
+        deliveredVia: String(deliveredVia || 'controller_transport'),
+        deliveredAt: nowIso,
+      };
+      regSession.updatedAt = nowIso;
+      sessionsState.updatedAt = nowIso;
+      writeJsonAtomic(this.getExecutorSessionsPath(taskId), sessionsState);
+
+      entry.executorSessionId = cleanSessionId;
+      entry.delivered = true;
+      entry.deliveredAt = nowIso;
+      entry.deliveredVia = String(deliveredVia || 'controller_transport');
+      entry.status = 'packet_delivered';
+      writeJsonAtomic(acksFile, acksState);
+
+      return {
+        ok: true,
+        delivered: true,
+        status: 'PACKET_DELIVERED',
+        taskId,
+        workerId: cleanWorkerId,
+        executorSessionId: cleanSessionId,
+        recoveryToken: entry.recoveryToken,
+        packetDigest: entry.packetDigest,
+        deliveredAt: nowIso,
+      };
+    });
+  }
+
+  /**
+   * WP7 / F07: Requests cancellation of a registered executor session.
+   * Rejects nonexistent/unregistered sessions (`UNKNOWN_EXECUTOR_SESSION`) and transitions to
+   * `CANCEL_REQUESTED` until actual termination is observed via `observeSessionStopped`.
+   */
+  requestSessionCancel(
+    taskId,
+    { workerId = null, executorSessionId = null, executor_session_id = null, reason = 'user_requested' } = {}
+  ) {
+    return this._withTaskLock(taskId, () => {
+      const sessionsState = this.loadExecutorSessions(taskId);
+      const cleanSessionId = String(executorSessionId ?? executor_session_id ?? '').trim();
+      const cleanWorkerId = String(workerId ?? '').trim();
+      let target = cleanSessionId ? sessionsState.sessions?.[cleanSessionId] : null;
+      if (!target && cleanWorkerId) {
+        target = Object.values(sessionsState.sessions || {}).find(
+          (s) => s && s.workerId === cleanWorkerId
+        );
+      }
+      if (!target) {
+        return {
+          ok: false,
+          error: 'UNKNOWN_EXECUTOR_SESSION',
+          status: 'UNKNOWN',
+        };
+      }
+      const nowIso = new Date().toISOString();
+      if (target.status !== 'CANCELLED' && target.status !== 'STOPPED') {
+        target.status = 'CANCEL_REQUESTED';
+        target.cancelRequestedAt = nowIso;
+        target.cancelReason = String(reason || 'user_requested');
+        target.updatedAt = nowIso;
+        sessionsState.updatedAt = nowIso;
+        writeJsonAtomic(this.getExecutorSessionsPath(taskId), sessionsState);
+      }
+      return {
+        ok: true,
+        taskId,
+        workerId: target.workerId,
+        executorSessionId: target.sessionId,
+        status: target.status,
+        cancelRequestedAt: target.cancelRequestedAt,
+      };
+    });
+  }
+
+  /**
+   * WP7 / F07: Records observed termination of a registered executor session, transitioning
+   * `CANCEL_REQUESTED` -> `CANCELLED` (or `ACTIVE` -> `STOPPED`).
+   */
+  observeSessionStopped(
+    taskId,
+    { workerId = null, executorSessionId = null, executor_session_id = null, exitCode = null, signal = null } = {}
+  ) {
+    return this._withTaskLock(taskId, () => {
+      const sessionsState = this.loadExecutorSessions(taskId);
+      const cleanSessionId = String(executorSessionId ?? executor_session_id ?? '').trim();
+      const cleanWorkerId = String(workerId ?? '').trim();
+      let target = cleanSessionId ? sessionsState.sessions?.[cleanSessionId] : null;
+      if (!target && cleanWorkerId) {
+        target = Object.values(sessionsState.sessions || {}).find(
+          (s) => s && s.workerId === cleanWorkerId
+        );
+      }
+      if (!target) {
+        return {
+          ok: false,
+          error: 'UNKNOWN_EXECUTOR_SESSION',
+        };
+      }
+      const nowIso = new Date().toISOString();
+      target.status = target.status === 'CANCEL_REQUESTED' ? 'CANCELLED' : 'STOPPED';
+      target.stoppedAt = nowIso;
+      target.exitCode = exitCode;
+      target.signal = signal;
+      target.updatedAt = nowIso;
+      sessionsState.updatedAt = nowIso;
+      writeJsonAtomic(this.getExecutorSessionsPath(taskId), sessionsState);
+      return {
+        ok: true,
+        taskId,
+        workerId: target.workerId,
+        executorSessionId: target.sessionId,
+        status: target.status,
+        stoppedAt: nowIso,
+      };
+    });
+  }
+
   _allocateNextCheckpointRevision(checkpointsDir, prevCurrent) {
     let maxRev = Number(prevCurrent?.checkpointRevision || 0);
     if (fs.existsSync(checkpointsDir)) {
@@ -1067,6 +1418,15 @@ export class ContextResilienceManager {
       }
     }
     return maxRev + 1;
+  }
+
+  _computeContractDigest(contractReg) {
+    const normalized = (contractReg?.contracts || []).map((c) => {
+      if (!c || typeof c !== 'object') return c;
+      const { lastValidatedAt, ...rest } = c;
+      return rest;
+    });
+    return sha256Text(JSON.stringify(normalized));
   }
 
   writeCheckpoint(
@@ -1097,6 +1457,9 @@ export class ContextResilienceManager {
 
       // Validate contracts FIRST so any drift demotes affected verified requirements before reading ledger
       const contractCheck = this.validateContracts(taskId);
+      const contractReg = this.loadContractRegistry(taskId);
+      const contractRevision = Number(contractReg.revision || 0);
+      const contractDigest = this._computeContractDigest(contractReg);
       const ledger = this.loadRequirementLedger(taskId);
 
       const openRequirements = (ledger.requirements || [])
@@ -1136,7 +1499,9 @@ export class ContextResilienceManager {
         openRequirements,
         completedEvidenceRefs,
         materialUserCorrections: ledger.userCorrections || [],
-        contractRegistryRevision: contractCheck.contracts.length,
+        contractRevision,
+        contractDigest,
+        contractRegistryRevision: contractRevision || contractCheck.contracts.length,
         staleContractIssues: contractCheck.issues,
         allRequirementsVerified: openRequirements.length === 0 && !hasContractDrift,
         activeWorkers: activeWorkers.map((w) => ({
@@ -1184,6 +1549,9 @@ export class ContextResilienceManager {
       const current = readJsonSafe(currentPointerPath, null);
       if (!current) return null;
       const contractValidation = this.validateContracts(taskId);
+      const contractReg = this.loadContractRegistry(taskId);
+      const contractRevision = Number(contractReg.revision || 0);
+      const contractDigest = this._computeContractDigest(contractReg);
       const ledger = this.loadRequirementLedger(taskId);
       const liveOpenRequirements = (ledger.requirements || [])
         .filter((r) => r.state !== 'verified')
@@ -1192,6 +1560,8 @@ export class ContextResilienceManager {
         ...current,
         openRequirements: liveOpenRequirements,
         materialUserCorrections: ledger.userCorrections || [],
+        contractRevision,
+        contractDigest,
         staleContractIssues: contractValidation.issues,
         allRequirementsVerified:
           liveOpenRequirements.length === 0 && contractValidation.issues.length === 0,
@@ -1245,6 +1615,8 @@ export class ContextResilienceManager {
         worker.executor_session_id ||
         null;
 
+      const contractRevision = Number(cp.contractRevision ?? 0);
+      const contractDigest = cp.contractDigest || null;
       const recoveryToken = `REC-${taskId}-${workerId}-L${liveLedger.revision}-C${cp.checkpointRevision}`;
       const packetDigest = sha256Text(
         JSON.stringify({
@@ -1252,6 +1624,8 @@ export class ContextResilienceManager {
           workerId,
           checkpointRevision: cp.checkpointRevision,
           ledgerRevision: liveLedger.revision,
+          contractRevision,
+          contractDigest,
           openRequirements: liveOpenRequirements,
           invalidatedRequirements,
           materialUserCorrections: liveCorrections,
@@ -1269,6 +1643,10 @@ export class ContextResilienceManager {
         packetDigest,
         checkpointRevision: cp.checkpointRevision,
         ledgerRevision: liveLedger.revision,
+        contractRevision,
+        contractDigest,
+        delivered: false,
+        deliveredAt: null,
         status: 'pending_acknowledgment',
         issuedAt: new Date().toISOString(),
         acknowledgedAt: null,
@@ -1286,6 +1664,10 @@ export class ContextResilienceManager {
         checkpoint_revision: cp.checkpointRevision,
         ledgerRevision: liveLedger.revision,
         ledger_revision: liveLedger.revision,
+        contractRevision,
+        contract_revision: contractRevision,
+        contractDigest,
+        contract_digest: contractDigest,
         packetDigest,
         packet_digest: packetDigest,
         ownership: worker.ownership,
@@ -1304,9 +1686,9 @@ export class ContextResilienceManager {
 
   /**
    * Confirms that a resumed worker received and acknowledged its authoritative recovery packet.
-   * Requires a matching `recoveryToken`, a bound `executorSessionId`, verifies that the live ledger
-   * and checkpoint have not advanced past the issued packet (`STALE_RECOVERY_PACKET`), and validates
-   * both camelCase and snake_case revision/digest/session fields.
+   * Requires a matching `recoveryToken`, a controller-registered `executorSessionId`, confirmed packet
+   * delivery (`deliverRecoveryPacket`), and verifies that the live ledger, contracts, and checkpoint
+   * have not advanced past the issued packet (`STALE_RECOVERY_PACKET`).
    */
   acknowledgeRecoveryPacket(taskId, workerId, recoveryTokenOrOptions = null) {
     return this._withTaskLock(taskId, () => {
@@ -1320,6 +1702,7 @@ export class ContextResilienceManager {
         return {
           ok: false,
           acknowledged: false,
+          status: 'RECOVERY_PENDING',
           error: `No pending recovery packet found for worker "${workerId}".`,
         };
       }
@@ -1335,6 +1718,7 @@ export class ContextResilienceManager {
         return {
           ok: false,
           acknowledged: false,
+          status: 'RECOVERY_PENDING',
           error: 'RECOVERY_TOKEN_REQUIRED',
           expectedToken: entry.recoveryToken,
         };
@@ -1343,6 +1727,7 @@ export class ContextResilienceManager {
         return {
           ok: false,
           acknowledged: false,
+          status: 'RECOVERY_PENDING',
           error: 'RECOVERY_TOKEN_MISMATCH',
           expectedToken: entry.recoveryToken,
         };
@@ -1357,6 +1742,7 @@ export class ContextResilienceManager {
         return {
           ok: false,
           acknowledged: false,
+          status: 'RECOVERY_PENDING',
           error: 'CHECKPOINT_REVISION_MISMATCH',
         };
       }
@@ -1370,6 +1756,7 @@ export class ContextResilienceManager {
         return {
           ok: false,
           acknowledged: false,
+          status: 'RECOVERY_PENDING',
           error: 'LEDGER_REVISION_MISMATCH',
         };
       }
@@ -1384,6 +1771,7 @@ export class ContextResilienceManager {
         return {
           ok: false,
           acknowledged: false,
+          status: 'RECOVERY_PENDING',
           error: 'PACKET_DIGEST_MISMATCH',
         };
       }
@@ -1393,19 +1781,58 @@ export class ContextResilienceManager {
         return {
           ok: false,
           acknowledged: false,
+          status: 'RECOVERY_PENDING',
           error: 'EXECUTOR_SESSION_REQUIRED_FOR_ACKNOWLEDGMENT',
         };
       }
-      if (String(suppliedSessionId).trim() !== String(entry.executorSessionId).trim()) {
+      const cleanSessionId = String(suppliedSessionId).trim();
+      if (cleanSessionId !== String(entry.executorSessionId).trim()) {
         return {
           ok: false,
           acknowledged: false,
+          status: 'RECOVERY_PENDING',
           error: 'EXECUTOR_SESSION_ID_MISMATCH',
         };
       }
 
-      // Verify that neither the requirement ledger nor checkpoint has advanced since the recovery packet was issued
+      // F07 / WP7: Verify controller-registered executor session & transport-backed packet delivery
+      const sessionsState = this.loadExecutorSessions(taskId);
+      const regSession = sessionsState.sessions?.[cleanSessionId];
+      if (!regSession || regSession.workerId !== workerId) {
+        return {
+          ok: false,
+          acknowledged: false,
+          status: 'RECOVERY_PENDING',
+          error: 'NO_REGISTERED_EXECUTOR_SESSION',
+        };
+      }
+      if (
+        regSession.status === 'CANCELLED' ||
+        regSession.status === 'STOPPED' ||
+        regSession.status === 'CANCEL_REQUESTED'
+      ) {
+        return {
+          ok: false,
+          acknowledged: false,
+          status: regSession.status,
+          error: 'EXECUTOR_SESSION_NOT_ACTIVE',
+        };
+      }
+      const deliveryRecord = regSession.deliveredPackets?.[entry.recoveryToken];
+      if (!entry.delivered && !deliveryRecord) {
+        return {
+          ok: false,
+          acknowledged: false,
+          status: 'RECOVERY_PENDING',
+          error: 'RECOVERY_PACKET_DELIVERY_UNCONFIRMED',
+        };
+      }
+
+      // Verify that neither the requirement ledger, contracts, nor checkpoint has advanced since the recovery packet was issued
       const contractValidation = this.validateContracts(taskId);
+      const contractReg = this.loadContractRegistry(taskId);
+      const liveContractRev = Number(contractReg.revision || 0);
+      const liveContractDigest = this._computeContractDigest(contractReg);
       const liveLedger = this.loadRequirementLedger(taskId);
       const currentPointerPath = resolveContainedRealPath(
         this.workspaceRoot,
@@ -1414,23 +1841,37 @@ export class ContextResilienceManager {
       const latestCp = readJsonSafe(currentPointerPath, null);
       if (
         Number(liveLedger.revision) !== Number(entry.ledgerRevision) ||
-        (latestCp && Number(latestCp.checkpointRevision) !== Number(entry.checkpointRevision))
+        (latestCp && Number(latestCp.checkpointRevision) !== Number(entry.checkpointRevision)) ||
+        (entry.contractRevision !== undefined &&
+          Number(liveContractRev) !== Number(entry.contractRevision)) ||
+        (entry.contractDigest && liveContractDigest !== entry.contractDigest)
       ) {
         return {
           ok: false,
           acknowledged: false,
+          status: 'RECOVERY_PENDING',
           error: 'STALE_RECOVERY_PACKET',
           packetLedgerRevision: entry.ledgerRevision,
           currentLedgerRevision: liveLedger.revision,
           packetCheckpointRevision: entry.checkpointRevision,
           currentCheckpointRevision: latestCp?.checkpointRevision ?? null,
+          packetContractRevision: entry.contractRevision ?? 0,
+          currentContractRevision: liveContractRev,
           contractIssuesCount: contractValidation.issues.length,
         };
       }
 
+      const nowIso = new Date().toISOString();
       entry.status = 'acknowledged';
-      entry.acknowledgedAt = new Date().toISOString();
+      entry.acknowledgedAt = nowIso;
       writeJsonAtomic(acksFile, acksState);
+
+      regSession.acknowledgedPackets = regSession.acknowledgedPackets || {};
+      regSession.acknowledgedPackets[entry.recoveryToken] = nowIso;
+      regSession.updatedAt = nowIso;
+      sessionsState.updatedAt = nowIso;
+      writeJsonAtomic(this.getExecutorSessionsPath(taskId), sessionsState);
+
       return {
         ok: true,
         acknowledged: true,
@@ -1442,6 +1883,7 @@ export class ContextResilienceManager {
         recoveryToken: entry.recoveryToken,
         checkpointRevision: entry.checkpointRevision,
         ledgerRevision: entry.ledgerRevision,
+        contractRevision: entry.contractRevision ?? 0,
         packetDigest: entry.packetDigest,
         acknowledgedAt: entry.acknowledgedAt,
       };

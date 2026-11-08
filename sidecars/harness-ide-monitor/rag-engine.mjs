@@ -1983,15 +1983,73 @@ export class HarnessKnowledgeEngine {
     }
   }
 
+  _canonicalizeChecks(checks) {
+    if (!Array.isArray(checks)) return [];
+    return checks.map((chk) => {
+      if (chk === null || chk === undefined) return { raw: null, passed: false };
+      if (typeof chk === 'string' || typeof chk === 'number' || typeof chk === 'boolean') {
+        const s = String(chk);
+        const endsFalse = s.endsWith(':false') || s === 'false';
+        return { raw: s, passed: !endsFalse };
+      }
+      if (typeof chk === 'object') {
+        const sorted = {};
+        for (const k of Object.keys(chk).sort()) {
+          sorted[k] = chk[k];
+        }
+        return sorted;
+      }
+      return { raw: String(chk), passed: true };
+    });
+  }
+
+  _hasFailedCheckEntry(checks) {
+    if (!Array.isArray(checks)) return false;
+    for (const chk of checks) {
+      if (chk && typeof chk === 'object' && chk.passed === false) {
+        return true;
+      }
+      if (typeof chk === 'string' && (chk.endsWith(':false') || chk === 'false')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   _signVerdictPayload(core) {
+    const sortedArtifactHashes = {};
+    if (
+      core.artifactHashes &&
+      typeof core.artifactHashes === 'object' &&
+      !Array.isArray(core.artifactHashes)
+    ) {
+      for (const k of Object.keys(core.artifactHashes).sort()) {
+        sortedArtifactHashes[k] = core.artifactHashes[k];
+      }
+    }
     const canonical = JSON.stringify({
+      evidenceSchemaVersion: '2.0',
       verdictId: String(core.verdictId || ''),
       taskId: String(core.taskId || ''),
+      reqId: core.reqId ? String(core.reqId) : null,
+      requirementRevision:
+        core.requirementRevision !== undefined && core.requirementRevision !== null
+          ? Number(core.requirementRevision)
+          : null,
+      attemptId: core.attemptId ? String(core.attemptId) : null,
+      lessonRevisionId: core.lessonRevisionId ? String(core.lessonRevisionId) : null,
+      phase: String(core.phase || 'candidate'),
+      workerId: core.workerId ? String(core.workerId) : null,
       passed: core.passed === true,
       score: typeof core.score === 'number' ? Number(core.score.toFixed(4)) : 1,
       synthetic: Boolean(core.synthetic),
       verifierId: String(core.verifierId || 'context-verifier'),
-      receiptId: core.receiptId ? String(core.receiptId) : null
+      receiptId: core.receiptId ? String(core.receiptId) : null,
+      inputTreeHash: core.inputTreeHash ? String(core.inputTreeHash) : null,
+      outputTreeHash: core.outputTreeHash ? String(core.outputTreeHash) : null,
+      changeKind: String(core.changeKind || 'modified'),
+      artifactHashes: sortedArtifactHashes,
+      checks: this._canonicalizeChecks(core.checks),
     });
     const key = this._getOrCreateReceiptKey();
     return crypto.createHmac('sha256', key).update(canonical, 'utf8').digest('hex');
@@ -2000,24 +2058,87 @@ export class HarnessKnowledgeEngine {
   createSignedVerdict({
     verdictId = null,
     taskId = 'default',
+    task_id = null,
+    reqId = null,
+    req_id = null,
+    requirementRevision = null,
+    requirement_revision = null,
+    attemptId = null,
+    attempt_id = null,
+    lessonRevisionId = null,
+    lesson_revision_id = null,
+    phase = 'candidate',
+    workerId = null,
+    worker_id = null,
     passed = true,
     score = 1.0,
     synthetic = false,
     verifierId = 'context-verifier',
+    verifier_id = null,
     receiptId = null,
-    checks = []
+    receipt_id = null,
+    inputTreeHash = null,
+    input_tree_hash = null,
+    outputTreeHash = null,
+    output_tree_hash = null,
+    changeKind = 'modified',
+    change_kind = null,
+    artifactHashes = {},
+    artifact_hashes = null,
+    checks = [],
+    acceptanceCheckIds = null,
+    acceptance_check_ids = null
   } = {}) {
     const resolvedVerdictId =
       verdictId || `VRD-${Date.now()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+    const resolvedTaskId = String(taskId || task_id || 'default')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]/g, '-');
+    const resolvedReqId = reqId || req_id || null;
+    const resolvedReqRev = requirementRevision ?? requirement_revision ?? null;
+    const resolvedAttemptId = attemptId || attempt_id || null;
+    const resolvedLessonRevId = lessonRevisionId || lesson_revision_id || null;
+    const resolvedWorkerId = workerId || worker_id || null;
+    const resolvedVerifierId = String(verifierId || verifier_id || 'context-verifier');
+    const resolvedReceiptId = receiptId || receipt_id || null;
+    const resolvedInputTreeHash = inputTreeHash || input_tree_hash || null;
+    const resolvedOutputTreeHash = outputTreeHash || output_tree_hash || null;
+    const resolvedChangeKind = String(changeKind || change_kind || 'modified');
+    const resolvedArtifactHashes =
+      artifactHashes && Object.keys(artifactHashes).length > 0
+        ? artifactHashes
+        : artifact_hashes || {};
+    const suppliedCheckIds = acceptanceCheckIds || acceptance_check_ids;
+    const normalizedChecks =
+      Array.isArray(checks) && checks.length > 0
+        ? checks
+        : Array.isArray(suppliedCheckIds)
+          ? suppliedCheckIds.map((id) => (typeof id === 'string' ? { id, passed: true } : id))
+          : [];
+    const hasFailedCheck = this._hasFailedCheckEntry(normalizedChecks);
+
     const core = {
+      evidenceSchemaVersion: '2.0',
       verdictId: resolvedVerdictId,
-      taskId: String(taskId || 'default'),
-      passed: passed === true && synthetic !== true,
+      taskId: resolvedTaskId,
+      reqId: resolvedReqId ? String(resolvedReqId) : null,
+      requirementRevision:
+        resolvedReqRev !== null && resolvedReqRev !== undefined ? Number(resolvedReqRev) : null,
+      attemptId: resolvedAttemptId ? String(resolvedAttemptId) : null,
+      lessonRevisionId: resolvedLessonRevId ? String(resolvedLessonRevId) : null,
+      phase: String(phase || 'candidate'),
+      workerId: resolvedWorkerId ? String(resolvedWorkerId) : null,
+      passed: passed === true && synthetic !== true && !hasFailedCheck,
       score: typeof score === 'number' ? Number(score.toFixed(4)) : passed === true ? 1.0 : 0.0,
       synthetic: Boolean(synthetic),
-      verifierId: String(verifierId || 'context-verifier'),
-      receiptId: receiptId ? String(receiptId) : null,
-      checks: Array.isArray(checks) ? checks : [],
+      verifierId: resolvedVerifierId,
+      receiptId: resolvedReceiptId ? String(resolvedReceiptId) : null,
+      inputTreeHash: resolvedInputTreeHash ? String(resolvedInputTreeHash) : null,
+      outputTreeHash: resolvedOutputTreeHash ? String(resolvedOutputTreeHash) : null,
+      changeKind: resolvedChangeKind,
+      artifactHashes: resolvedArtifactHashes,
+      checks: normalizedChecks,
       createdAt: new Date().toISOString()
     };
     const signature = this._signVerdictPayload(core);
@@ -2027,12 +2148,24 @@ export class HarnessKnowledgeEngine {
     };
   }
 
-  verifySignedVerdict(verdictObj) {
+  verifySignedVerdict(
+    verdictObj,
+    {
+      expectedTaskId = null,
+      expectedReqId = null,
+      expectedRequirementRevision = null,
+      expectedPhase = null,
+      requiredAcceptanceChecks = null
+    } = {}
+  ) {
     if (!verdictObj || typeof verdictObj !== 'object' || Array.isArray(verdictObj)) {
       return { valid: false, error: 'INVALID_VERDICT_OBJECT' };
     }
     if (verdictObj.synthetic === true || verdictObj.passed !== true) {
       return { valid: false, error: 'VERDICT_NOT_PASSED_OR_SYNTHETIC' };
+    }
+    if (this._hasFailedCheckEntry(verdictObj.checks)) {
+      return { valid: false, error: 'VERDICT_CHECK_FAILED' };
     }
     if (typeof verdictObj.signature !== 'string' || verdictObj.signature.length !== 64) {
       return { valid: false, error: 'UNSIGNED_VERDICT_EVIDENCE' };
@@ -2047,8 +2180,62 @@ export class HarnessKnowledgeEngine {
     } catch {
       return { valid: false, error: 'VERDICT_SIGNATURE_MISMATCH' };
     }
+    if (expectedTaskId) {
+      const normExpected = String(expectedTaskId).trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+      const normActual = String(verdictObj.taskId || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+      if (!normActual || normExpected !== normActual) {
+        return { valid: false, error: 'VERDICT_TASK_ID_MISMATCH' };
+      }
+    }
+    if (expectedReqId && verdictObj.reqId && String(verdictObj.reqId) !== String(expectedReqId)) {
+      return { valid: false, error: 'VERDICT_REQ_ID_MISMATCH' };
+    }
+    if (
+      expectedRequirementRevision !== null &&
+      expectedRequirementRevision !== undefined &&
+      verdictObj.requirementRevision !== null &&
+      verdictObj.requirementRevision !== undefined &&
+      Number(verdictObj.requirementRevision) !== Number(expectedRequirementRevision)
+    ) {
+      return { valid: false, error: 'VERDICT_REQUIREMENT_REVISION_MISMATCH' };
+    }
+    if (expectedPhase && verdictObj.phase && String(verdictObj.phase) !== String(expectedPhase)) {
+      return { valid: false, error: 'VERDICT_PHASE_MISMATCH' };
+    }
+    if (Array.isArray(requiredAcceptanceChecks) && requiredAcceptanceChecks.length > 0) {
+      const rawCheckList = [
+        ...(Array.isArray(verdictObj.checks) ? verdictObj.checks : []),
+        ...(Array.isArray(verdictObj.acceptanceCheckIds)
+          ? verdictObj.acceptanceCheckIds.map((id) => ({ id, passed: true }))
+          : [])
+      ];
+      const coveredIds = new Set(
+        rawCheckList
+          .filter((c) => c && typeof c === 'object' && c.passed !== false)
+          .map((c) => String(c.id || c.checkId || '').trim())
+          .filter(Boolean)
+      );
+      if (coveredIds.size > 0) {
+        const missingChecks = requiredAcceptanceChecks
+          .map((c) =>
+            typeof c === 'string'
+              ? c.trim()
+              : String(c?.id || c?.checkId || c?.name || '').trim()
+          )
+          .filter((id) => id && !coveredIds.has(id));
+        if (missingChecks.length > 0) {
+          return {
+            valid: false,
+            error: `MISSING_ACCEPTANCE_CHECK_COVERAGE:${missingChecks.join(',')}`
+          };
+        }
+      }
+    }
     if (verdictObj.receiptId) {
-      const rcptCheck = this.verifyEvaluationReceipt(verdictObj.receiptId);
+      const rcptCheck = this.verifyEvaluationReceipt(verdictObj.receiptId, {
+        expectedTaskId: expectedTaskId || verdictObj.taskId || null,
+        requiredAcceptanceChecks
+      });
       if (!rcptCheck.valid) {
         return { valid: false, error: rcptCheck.error || 'INVALID_VERDICT_RECEIPT' };
       }
@@ -2064,14 +2251,21 @@ export class HarnessKnowledgeEngine {
       }
     }
     const canonical = JSON.stringify({
+      evidenceSchemaVersion: '2.0',
       receiptId: String(core.receiptId || ''),
       taskId: String(core.taskId || ''),
+      attemptId: core.attemptId ? String(core.attemptId) : null,
+      lessonRevisionId: core.lessonRevisionId ? String(core.lessonRevisionId) : null,
       candidateId: String(core.candidateId || ''),
       domain: String(core.domain || 'software-engineering'),
       gitRevision: String(core.gitRevision || 'HEAD'),
+      phase: String(core.phase || 'candidate'),
+      inputTreeHash: core.inputTreeHash ? String(core.inputTreeHash) : null,
+      outputTreeHash: core.outputTreeHash ? String(core.outputTreeHash) : null,
+      changeKind: String(core.changeKind || 'modified'),
       harnessDigest: core.harnessDigest ? String(core.harnessDigest) : null,
       evaluatorId: String(core.evaluatorId || 'custom-evaluator'),
-      checks: Array.isArray(core.checks) ? core.checks : [],
+      checks: this._canonicalizeChecks(core.checks),
       score: Number(core.score),
       passed: core.passed === true,
       artifactHashes: sortedArtifactHashes,
@@ -2097,6 +2291,13 @@ export class HarnessKnowledgeEngine {
     domain = 'software-engineering',
     gitRevision = null,
     git_revision = null,
+    phase = 'candidate',
+    inputTreeHash = null,
+    input_tree_hash = null,
+    outputTreeHash = null,
+    output_tree_hash = null,
+    changeKind = 'modified',
+    change_kind = null,
     harnessDigest = null,
     harness_digest = null,
     lessonDigest = null,
@@ -2130,10 +2331,12 @@ export class HarnessKnowledgeEngine {
     const resolvedArtifactHashes = artifactHashes && Object.keys(artifactHashes).length > 0
       ? artifactHashes
       : artifact_hashes || {};
+    const normalizedChecks = Array.isArray(checks) ? checks : [];
 
     if (
       synthetic === true ||
       passed !== true ||
+      this._hasFailedCheckEntry(normalizedChecks) ||
       typeof score !== 'number' ||
       Number.isNaN(score) ||
       score < 0 ||
@@ -2150,9 +2353,16 @@ export class HarnessKnowledgeEngine {
       };
     }
 
+    const receiptId = `RCPT-${Date.now()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+    const receiptArchiveDir = path.join(this.receiptsDir, 'artifacts', receiptId);
+    this.assertContainedPath(receiptArchiveDir, 'receiptArchiveDir');
+    fs.mkdirSync(receiptArchiveDir, { recursive: true });
+
     const verifiedHashes = {};
+    const rawBuffersByRel = new Map();
     for (const [relPath, expectedSha256] of Object.entries(resolvedArtifactHashes)) {
-      const absPath = path.resolve(this.workspaceRoot, String(relPath));
+      const cleanRel = String(relPath).replace(/\\/g, '/');
+      const absPath = path.resolve(this.workspaceRoot, cleanRel);
       if (
         !this._isPathInsideWorkspace(absPath) ||
         !fs.existsSync(absPath) ||
@@ -2161,19 +2371,20 @@ export class HarnessKnowledgeEngine {
         return {
           ok: false,
           error: 'ARTIFACT_VERIFICATION_FAILED',
-          relPath: String(relPath)
+          relPath: cleanRel
         };
       }
+      const rawBuf = fs.readFileSync(absPath);
       const actualSha256 = crypto
         .createHash('sha256')
-        .update(fs.readFileSync(absPath))
+        .update(rawBuf)
         .digest('hex');
       if (typeof expectedSha256 === 'string' && expectedSha256.length === 64) {
         if (actualSha256.toLowerCase() !== expectedSha256.toLowerCase()) {
           return {
             ok: false,
             error: 'ARTIFACT_HASH_MISMATCH',
-            relPath: String(relPath),
+            relPath: cleanRel,
             expectedSha256,
             actualSha256
           };
@@ -2182,14 +2393,22 @@ export class HarnessKnowledgeEngine {
         return {
           ok: false,
           error: 'INVALID_EVALUATION_RECEIPT_INPUT',
-          relPath: String(relPath)
+          relPath: cleanRel
         };
       }
-      verifiedHashes[String(relPath).replace(/\\/g, '/')] = actualSha256;
+      verifiedHashes[cleanRel] = actualSha256;
+      rawBuffersByRel.set(cleanRel, rawBuf);
     }
 
-    // Do NOT pre-bind new receipts to old EXPERIENCE.md or manifest.json files from previous runs;
-    // recordExperience() seals the receipt to the newly generated lesson revision.
+    // Persist immutable artifact copies inside .harness/receipts/artifacts/<receiptId>/
+    for (const [cleanRel, rawBuf] of rawBuffersByRel.entries()) {
+      const archiveTarget = path.resolve(receiptArchiveDir, cleanRel);
+      if (this._isPathInsideWorkspace(archiveTarget)) {
+        fs.mkdirSync(path.dirname(archiveTarget), { recursive: true });
+        fs.writeFileSync(archiveTarget, rawBuf);
+      }
+    }
+
     const resolvedHarnessDigest = harnessDigest || harness_digest || null;
     const resolvedLessonDigest = lessonDigest || lesson_digest || null;
     const resolvedAttemptId =
@@ -2197,19 +2416,26 @@ export class HarnessKnowledgeEngine {
       attempt_id ||
       `ATT-${Date.now()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
     const resolvedLessonRevId = lessonRevisionId || lesson_revision_id || null;
+    const resolvedInputTreeHash = inputTreeHash || input_tree_hash || null;
+    const resolvedOutputTreeHash = outputTreeHash || output_tree_hash || null;
+    const resolvedChangeKind = String(changeKind || change_kind || 'modified');
 
-    const receiptId = `RCPT-${Date.now()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
     const normScore = Number(score.toFixed(4));
     const corePayload = {
+      evidenceSchemaVersion: '2.0',
       receiptId,
       taskId: resolvedTaskId,
       attemptId: resolvedAttemptId,
       candidateId: resolvedCandidateId,
       domain: resolvedDomain,
       gitRevision: resolvedGitRev,
+      phase: String(phase || 'candidate'),
+      inputTreeHash: resolvedInputTreeHash ? String(resolvedInputTreeHash) : null,
+      outputTreeHash: resolvedOutputTreeHash ? String(resolvedOutputTreeHash) : null,
+      changeKind: resolvedChangeKind,
       harnessDigest: resolvedHarnessDigest ? String(resolvedHarnessDigest) : null,
       evaluatorId: resolvedEvaluatorId,
-      checks: Array.isArray(checks) ? checks : [],
+      checks: normalizedChecks,
       score: normScore,
       passed: true,
       artifactHashes: verifiedHashes,
@@ -2238,6 +2464,39 @@ export class HarnessKnowledgeEngine {
     return storedReceipt;
   }
 
+  checkReceiptApplicability(receiptIdOrObj) {
+    const hist = this.verifyEvaluationReceipt(receiptIdOrObj, { mode: 'historical' });
+    if (!hist.valid) {
+      return {
+        ok: false,
+        historicalValid: false,
+        applicableToCurrentWorkspace: false,
+        error: hist.error,
+        driftedArtifacts: []
+      };
+    }
+    const stored = hist.receipt;
+    const driftedArtifacts = [];
+    for (const [relPath, expectedSha256] of Object.entries(stored.artifactHashes || {})) {
+      const absPath = path.resolve(this.workspaceRoot, String(relPath));
+      if (!this._isPathInsideWorkspace(absPath) || !fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) {
+        driftedArtifacts.push({ relPath, reason: 'missing_in_workspace', expectedSha256, actualSha256: null });
+        continue;
+      }
+      const actualSha256 = crypto.createHash('sha256').update(fs.readFileSync(absPath)).digest('hex');
+      if (actualSha256.toLowerCase() !== String(expectedSha256).toLowerCase()) {
+        driftedArtifacts.push({ relPath, reason: 'hash_changed_in_workspace', expectedSha256, actualSha256 });
+      }
+    }
+    return {
+      ok: true,
+      historicalValid: true,
+      applicableToCurrentWorkspace: driftedArtifacts.length === 0,
+      driftedArtifacts,
+      receipt: stored
+    };
+  }
+
   verifyEvaluationReceipt(
     receiptIdOrObj,
     {
@@ -2245,7 +2504,9 @@ export class HarnessKnowledgeEngine {
       expectedCandidateId = null,
       expectedDomain = null,
       expectedLessonDigest = null,
-      expectedHarnessDigest = null
+      expectedHarnessDigest = null,
+      requiredAcceptanceChecks = null,
+      mode = 'current_workspace'
     } = {}
   ) {
     if (!receiptIdOrObj || typeof receiptIdOrObj === 'boolean') {
@@ -2291,6 +2552,7 @@ export class HarnessKnowledgeEngine {
         stored.receiptId !== receiptId ||
         stored.passed !== true ||
         stored.synthetic !== false ||
+        this._hasFailedCheckEntry(stored.checks) ||
         typeof stored.score !== 'number' ||
         Number.isNaN(stored.score) ||
         stored.score < 0 ||
@@ -2349,32 +2611,117 @@ export class HarnessKnowledgeEngine {
         };
       }
 
-      const artifactHashes = stored.artifactHashes || {};
-      for (const [relPath, expectedSha256] of Object.entries(artifactHashes)) {
-        const absPath = path.resolve(this.workspaceRoot, String(relPath));
-        if (
-          !this._isPathInsideWorkspace(absPath) ||
-          !fs.existsSync(absPath) ||
-          !fs.statSync(absPath).isFile()
-        ) {
-          return {
-            ok: false,
-            valid: false,
-            error: 'RECEIPT_ARTIFACT_MISSING',
-            relPath
-          };
+      if (Array.isArray(requiredAcceptanceChecks) && requiredAcceptanceChecks.length > 0) {
+        const rawCheckList = [
+          ...(Array.isArray(stored.checks) ? stored.checks : []),
+          ...(Array.isArray(stored.acceptanceCheckIds)
+            ? stored.acceptanceCheckIds.map((id) => ({ id, passed: true }))
+            : [])
+        ];
+        const coveredIds = new Set(
+          rawCheckList
+            .filter((c) => c && typeof c === 'object' && c.passed !== false)
+            .map((c) => String(c.id || c.checkId || '').trim())
+            .filter(Boolean)
+        );
+        if (coveredIds.size > 0) {
+          const missingChecks = requiredAcceptanceChecks
+            .map((c) =>
+              typeof c === 'string'
+                ? c.trim()
+                : String(c?.id || c?.checkId || c?.name || '').trim()
+            )
+            .filter((id) => id && !coveredIds.has(id));
+          if (missingChecks.length > 0) {
+            return {
+              valid: false,
+              error: `MISSING_ACCEPTANCE_CHECK_COVERAGE:${missingChecks.join(',')}`
+            };
+          }
         }
-        const actualSha256 = crypto
-          .createHash('sha256')
-          .update(fs.readFileSync(absPath))
-          .digest('hex');
-        if (actualSha256.toLowerCase() !== String(expectedSha256).toLowerCase()) {
-          return {
-            ok: false,
-            valid: false,
-            error: 'RECEIPT_ARTIFACT_HASH_MISMATCH',
-            relPath
-          };
+      }
+
+      const artifactHashes = stored.artifactHashes || {};
+      const receiptArchiveDir = path.join(this.receiptsDir, 'artifacts', receiptId);
+      const revArchiveDir =
+        stored.lessonRevisionId && stored.taskId && stored.domain
+          ? path.join(
+              this.harnessDir,
+              'library',
+              String(stored.domain),
+              'harnesses',
+              String(stored.taskId),
+              'revisions',
+              String(stored.lessonRevisionId),
+              'artifacts'
+            )
+          : null;
+
+      let applicableToCurrentWorkspace = true;
+      for (const [relPath, expectedSha256] of Object.entries(artifactHashes)) {
+        const cleanRel = String(relPath).replace(/\\/g, '/');
+        const wsPath = path.resolve(this.workspaceRoot, cleanRel);
+        const wsExists =
+          this._isPathInsideWorkspace(wsPath) &&
+          fs.existsSync(wsPath) &&
+          fs.statSync(wsPath).isFile();
+        const wsSha256 = wsExists
+          ? crypto.createHash('sha256').update(fs.readFileSync(wsPath)).digest('hex')
+          : null;
+        if (!wsSha256 || wsSha256.toLowerCase() !== String(expectedSha256).toLowerCase()) {
+          applicableToCurrentWorkspace = false;
+        }
+
+        if (mode === 'historical') {
+          const revArtifactPath = revArchiveDir ? path.resolve(revArchiveDir, cleanRel) : null;
+          const rcptArtifactPath = path.resolve(receiptArchiveDir, cleanRel);
+          const histFile =
+            revArtifactPath &&
+            this._isPathInsideWorkspace(revArtifactPath) &&
+            fs.existsSync(revArtifactPath) &&
+            fs.statSync(revArtifactPath).isFile()
+              ? revArtifactPath
+              : this._isPathInsideWorkspace(rcptArtifactPath) &&
+                  fs.existsSync(rcptArtifactPath) &&
+                  fs.statSync(rcptArtifactPath).isFile()
+                ? rcptArtifactPath
+                : wsExists
+                  ? wsPath
+                  : null;
+          if (!histFile) {
+            return {
+              ok: false,
+              valid: false,
+              error: 'RECEIPT_ARTIFACT_MISSING',
+              relPath: cleanRel
+            };
+          }
+          const histSha = crypto.createHash('sha256').update(fs.readFileSync(histFile)).digest('hex');
+          if (histSha.toLowerCase() !== String(expectedSha256).toLowerCase()) {
+            return {
+              ok: false,
+              valid: false,
+              error: 'RECEIPT_ARTIFACT_HASH_MISMATCH',
+              relPath: cleanRel
+            };
+          }
+        } else {
+          if (!wsExists) {
+            return {
+              ok: false,
+              valid: false,
+              error: 'RECEIPT_ARTIFACT_MISSING',
+              relPath: cleanRel
+            };
+          }
+          if (wsSha256.toLowerCase() !== String(expectedSha256).toLowerCase()) {
+            return {
+              ok: false,
+              valid: false,
+              error: 'RECEIPT_ARTIFACT_HASH_MISMATCH',
+              relPath: cleanRel
+            };
+          }
         }
       }
 
@@ -2402,18 +2749,16 @@ export class HarnessKnowledgeEngine {
           } catch {}
         }
         const isSupersededRevision =
-          stored.lessonRevisionId &&
-          activePointer &&
-          activePointer.activeRevisionId &&
-          activePointer.activeRevisionId !== stored.lessonRevisionId &&
-          Array.isArray(activePointer.previousRevisions) &&
-          activePointer.previousRevisions.some(
-            (r) => (typeof r === 'string' ? r : r?.revisionId) === stored.lessonRevisionId
-          );
+          mode === 'historical' ||
+          (stored.lessonRevisionId &&
+            activePointer &&
+            activePointer.activeRevisionId &&
+            activePointer.activeRevisionId !== stored.lessonRevisionId);
 
-        const boundExpPath = isSupersededRevision
-          ? path.join(taskDir, 'revisions', String(stored.lessonRevisionId), 'EXPERIENCE.md')
-          : path.join(taskDir, 'EXPERIENCE.md');
+        const boundExpPath =
+          isSupersededRevision && stored.lessonRevisionId
+            ? path.join(taskDir, 'revisions', String(stored.lessonRevisionId), 'EXPERIENCE.md')
+            : path.join(taskDir, 'EXPERIENCE.md');
 
         if (this._isPathInsideWorkspace(boundExpPath) && fs.existsSync(boundExpPath)) {
           const liveLessonDigest = crypto
@@ -2433,6 +2778,7 @@ export class HarnessKnowledgeEngine {
       return {
         ok: true,
         valid: true,
+        applicableToCurrentWorkspace,
         receiptId: stored.receiptId,
         receipt: stored
       };
@@ -2763,8 +3109,38 @@ export class HarnessKnowledgeEngine {
     const revExpPath = path.join(revDir, 'EXPERIENCE.md');
     const revManifestPath = path.join(revHarnessDir, 'manifest.json');
     const revMetaPath = path.join(revDir, 'revision.json');
+    const revArtifactsDir = path.join(revDir, 'artifacts');
     fs.writeFileSync(revManifestPath, built.manifestStr, 'utf8');
     fs.writeFileSync(revExpPath, built.expMd, 'utf8');
+
+    // Archive immutable copies of verified artifacts and receipt inside the revision directory
+    if (verifiedReceipt) {
+      fs.writeFileSync(
+        path.join(revDir, 'receipt.json'),
+        JSON.stringify(verifiedReceipt, null, 2) + '\n',
+        'utf8'
+      );
+      const receiptArchiveDir = path.join(this.receiptsDir, 'artifacts', verifiedReceipt.receiptId);
+      for (const relPath of Object.keys(verifiedReceipt.artifactHashes || {})) {
+        const cleanRel = String(relPath).replace(/\\/g, '/');
+        const srcArchive = path.resolve(receiptArchiveDir, cleanRel);
+        const wsSource = path.resolve(this.workspaceRoot, cleanRel);
+        const srcToCopy =
+          this._isPathInsideWorkspace(srcArchive) && fs.existsSync(srcArchive)
+            ? srcArchive
+            : this._isPathInsideWorkspace(wsSource) && fs.existsSync(wsSource)
+              ? wsSource
+              : null;
+        if (srcToCopy) {
+          const destArtifact = path.resolve(revArtifactsDir, cleanRel);
+          if (this._isPathInsideWorkspace(destArtifact)) {
+            fs.mkdirSync(path.dirname(destArtifact), { recursive: true });
+            fs.copyFileSync(srcToCopy, destArtifact);
+          }
+        }
+      }
+    }
+
     const lessonDigest = crypto.createHash('sha256').update(built.expMd, 'utf8').digest('hex');
     const harnessDigest = crypto.createHash('sha256').update(built.manifestStr, 'utf8').digest('hex');
     fs.writeFileSync(
@@ -2775,9 +3151,12 @@ export class HarnessKnowledgeEngine {
           attemptId: resolvedAttemptId,
           taskId: safeTaskId,
           domain: safeDomain,
+          title: expTitle,
+          cue: expCue,
           status: effectiveStatus,
           synthetic: isSynthetic,
           receiptId: verifiedReceipt?.receiptId || null,
+          artifactHashes: verifiedReceipt?.artifactHashes || {},
           lessonDigest,
           harnessDigest,
           createdAt: nowIso
@@ -2833,47 +3212,9 @@ export class HarnessKnowledgeEngine {
     fs.writeFileSync(tmpActive, JSON.stringify(activeState, null, 2) + '\n', 'utf8');
     fs.renameSync(tmpActive, activePointerPath);
 
-    // Update domain INDEX.md and root INDEX.md only when effectiveStatus === 'active' and not synthetic
+    // Update domain INDEX.md and root INDEX.md transactionally when effectiveStatus === 'active' and not synthetic
     if (effectiveStatus === 'active' && !isSynthetic && verifiedReceipt) {
-      const domainIndexPath = path.join(this.harnessDir, 'library', safeDomain, 'INDEX.md');
-      this.assertContainedPath(domainIndexPath, 'domainIndexPath');
-      if (!fs.existsSync(domainIndexPath)) {
-        fs.writeFileSync(
-          domainIndexPath,
-          [
-            '---',
-            `docid: LIB-INDEX-${safeDomain.toUpperCase()}`,
-            `title: "Harness² Experience Library Index — ${safeDomain}"`,
-            'collection: experiment-knowledge',
-            `domain: ${safeDomain}`,
-            'status: active',
-            `created_at: "${nowIso}"`,
-            `tags: [index, ${safeDomain}, harness2, experience-library]`,
-            '---',
-            '',
-            `# Domain Index: \`${safeDomain}\` (\`INDEX.md\`)`,
-            '',
-            '## Entries',
-            ''
-          ].join('\n'),
-          'utf8'
-        );
-      }
-      const existingDomainIndex = fs.readFileSync(domainIndexPath, 'utf8');
-      if (!existingDomainIndex.includes(safeTaskId)) {
-        const entryBlock = `\n- **[${safeTaskId}](./harnesses/${safeTaskId}/EXPERIENCE.md)** (\`${nowIso}\`, \`status: active\`)\n  - **Cue**: *${expCue}*\n  - **Adopted Harness**: [\`./harnesses/${safeTaskId}/harness/manifest.json\`](./harnesses/${safeTaskId}/harness/manifest.json)\n`;
-        fs.writeFileSync(domainIndexPath, existingDomainIndex.trimEnd() + '\n' + entryBlock, 'utf8');
-      }
-
-      const rootIndexPath = path.join(this.harnessDir, 'library', 'INDEX.md');
-      this.assertContainedPath(rootIndexPath, 'rootIndexPath');
-      if (fs.existsSync(rootIndexPath)) {
-        const rootContent = fs.readFileSync(rootIndexPath, 'utf8');
-        if (!rootContent.includes(safeTaskId)) {
-          const tableRow = `| \`${safeTaskId}\` | \`${safeDomain}\` | ${expCue} | ${expTitle} | \`active\` | [\`${safeDomain}/harnesses/${safeTaskId}/EXPERIENCE.md\`](./${safeDomain}/harnesses/${safeTaskId}/EXPERIENCE.md) |`;
-          fs.writeFileSync(rootIndexPath, rootContent.trimEnd() + '\n' + tableRow + '\n', 'utf8');
-        }
-      }
+      this._upsertDomainAndRootIndexCue(safeDomain, safeTaskId, expCue, expTitle, nowIso);
     }
 
     const relExpPath = path
@@ -2920,6 +3261,68 @@ export class HarnessKnowledgeEngine {
     return recordResult;
   }
 
+  _upsertDomainAndRootIndexCue(safeDomain, safeTaskId, expCue, expTitle, nowIso) {
+    const domainIndexPath = path.join(this.harnessDir, 'library', safeDomain, 'INDEX.md');
+    this.assertContainedPath(domainIndexPath, 'domainIndexPath');
+    if (!fs.existsSync(domainIndexPath)) {
+      fs.writeFileSync(
+        domainIndexPath,
+        [
+          '---',
+          `docid: LIB-INDEX-${safeDomain.toUpperCase()}`,
+          `title: "Harness² Experience Library Index — ${safeDomain}"`,
+          'collection: experiment-knowledge',
+          `domain: ${safeDomain}`,
+          'status: active',
+          `created_at: "${nowIso}"`,
+          `tags: [index, ${safeDomain}, harness2, experience-library]`,
+          '---',
+          '',
+          `# Domain Index: \`${safeDomain}\` (\`INDEX.md\`)`,
+          '',
+          '## Entries',
+          ''
+        ].join('\n'),
+        'utf8'
+      );
+    }
+    const existingDomainIndex = fs.readFileSync(domainIndexPath, 'utf8');
+    const newEntryLines = [
+      `- **[${safeTaskId}](./harnesses/${safeTaskId}/EXPERIENCE.md)** (\`${nowIso}\`, \`status: active\`)`,
+      `  - **Cue**: *${expCue}*`,
+      `  - **Adopted Harness**: [\`./harnesses/${safeTaskId}/harness/manifest.json\`](./harnesses/${safeTaskId}/harness/manifest.json)`
+    ].join('\n');
+
+    const escapedTask = safeTaskId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const existingBlockRe = new RegExp(
+      `^- \\*\\*\\[${escapedTask}\\]\\(\\./harnesses/${escapedTask}/EXPERIENCE\\.md\\)\\*\\*.*(?:\\r?\\n  - .*)*`,
+      'm'
+    );
+    let updatedDomainContent;
+    if (existingBlockRe.test(existingDomainIndex)) {
+      updatedDomainContent = existingDomainIndex.replace(existingBlockRe, newEntryLines);
+    } else {
+      updatedDomainContent = existingDomainIndex.trimEnd() + '\n\n' + newEntryLines + '\n';
+    }
+    const tmpDomIdx = `${domainIndexPath}.tmp.${process.pid}.${Date.now()}`;
+    fs.writeFileSync(tmpDomIdx, updatedDomainContent, 'utf8');
+    fs.renameSync(tmpDomIdx, domainIndexPath);
+
+    const rootIndexPath = path.join(this.harnessDir, 'library', 'INDEX.md');
+    this.assertContainedPath(rootIndexPath, 'rootIndexPath');
+    if (fs.existsSync(rootIndexPath)) {
+      const rootContent = fs.readFileSync(rootIndexPath, 'utf8');
+      const tableRow = `| \`${safeTaskId}\` | \`${safeDomain}\` | ${expCue} | ${expTitle} | \`active\` | [\`${safeDomain}/harnesses/${safeTaskId}/EXPERIENCE.md\`](./${safeDomain}/harnesses/${safeTaskId}/EXPERIENCE.md) |`;
+      const rowRe = new RegExp(`^\\|\\s*\`${escapedTask}\`\\s*\\|.*$`, 'm');
+      const updatedRootContent = rowRe.test(rootContent)
+        ? rootContent.replace(rowRe, tableRow)
+        : rootContent.trimEnd() + '\n' + tableRow + '\n';
+      const tmpRootIdx = `${rootIndexPath}.tmp.${process.pid}.${Date.now()}`;
+      fs.writeFileSync(tmpRootIdx, updatedRootContent, 'utf8');
+      fs.renameSync(tmpRootIdx, rootIndexPath);
+    }
+  }
+
   rollbackActiveLesson(arg1 = {}, arg2 = null, arg3 = null) {
     const opts =
       typeof arg1 === 'string'
@@ -2930,7 +3333,8 @@ export class HarnessKnowledgeEngine {
       task_id,
       domain = 'software-engineering',
       targetRevisionId,
-      target_revision_id
+      target_revision_id,
+      restoreArtifacts = true
     } = opts;
     const safeDomain = String(domain || 'software-engineering')
       .toLowerCase()
@@ -2948,6 +3352,7 @@ export class HarnessKnowledgeEngine {
     const revExpPath = path.join(revDir, 'EXPERIENCE.md');
     const revManifestPath = path.join(revDir, 'harness', 'manifest.json');
     const revMetaPath = path.join(revDir, 'revision.json');
+    const revArtifactsDir = path.join(revDir, 'artifacts');
     if (
       !this._isPathInsideWorkspace(revDir) ||
       !fs.existsSync(revExpPath) ||
@@ -2960,19 +3365,73 @@ export class HarnessKnowledgeEngine {
     if (revMeta.status !== 'active' || revMeta.synthetic === true || !revMeta.receiptId) {
       return { ok: false, error: 'TARGET_REVISION_NOT_VERIFIED_ACTIVE', targetRevisionId: targetRev };
     }
+
+    // Verify historical integrity of the target revision's receipt and archived artifacts
     const check = this.verifyEvaluationReceipt(revMeta.receiptId, {
       expectedTaskId: safeTaskId,
       expectedDomain: safeDomain,
       expectedLessonDigest: revMeta.lessonDigest,
-      expectedHarnessDigest: revMeta.harnessDigest
+      expectedHarnessDigest: revMeta.harnessDigest,
+      mode: 'historical'
     });
     if (!check.valid) {
       return { ok: false, error: check.error || 'TARGET_REVISION_RECEIPT_INVALID' };
     }
+
+    // Restore archived artifacts into workspace when requested so post-rollback receipt is also applicable to current workspace
+    const restoredArtifacts = [];
+    if (restoreArtifacts !== false) {
+      const receiptArchiveDir = path.join(this.receiptsDir, 'artifacts', revMeta.receiptId);
+      const artifactHashes = check.receipt?.artifactHashes || revMeta.artifactHashes || {};
+      for (const relPath of Object.keys(artifactHashes)) {
+        const cleanRel = String(relPath).replace(/\\/g, '/');
+        const revFile = path.resolve(revArtifactsDir, cleanRel);
+        const rcptFile = path.resolve(receiptArchiveDir, cleanRel);
+        const srcFile =
+          this._isPathInsideWorkspace(revFile) && fs.existsSync(revFile)
+            ? revFile
+            : this._isPathInsideWorkspace(rcptFile) && fs.existsSync(rcptFile)
+              ? rcptFile
+              : null;
+        if (srcFile) {
+          const destFile = path.resolve(this.workspaceRoot, cleanRel);
+          if (this._isPathInsideWorkspace(destFile)) {
+            fs.mkdirSync(path.dirname(destFile), { recursive: true });
+            fs.copyFileSync(srcFile, destFile);
+            restoredArtifacts.push(cleanRel);
+          }
+        }
+      }
+    }
+
     const expFilePath = path.join(taskDir, 'EXPERIENCE.md');
     const manifestPath = path.join(taskDir, 'harness', 'manifest.json');
-    fs.writeFileSync(expFilePath, fs.readFileSync(revExpPath, 'utf8'), 'utf8');
-    fs.writeFileSync(manifestPath, fs.readFileSync(revManifestPath, 'utf8'), 'utf8');
+    const revExpContent = fs.readFileSync(revExpPath, 'utf8');
+    const revManifestContent = fs.readFileSync(revManifestPath, 'utf8');
+    const tmpExp = `${expFilePath}.tmp.${process.pid}.${Date.now()}`;
+    const tmpManifest = `${manifestPath}.tmp.${process.pid}.${Date.now()}`;
+    fs.writeFileSync(tmpExp, revExpContent, 'utf8');
+    fs.writeFileSync(tmpManifest, revManifestContent, 'utf8');
+    fs.renameSync(tmpExp, expFilePath);
+    fs.renameSync(tmpManifest, manifestPath);
+
+    const parsedRevDoc = parseFrontmatter(revExpContent);
+    const rolledBackCue =
+      revMeta.cue ||
+      parsedRevDoc.metadata?.cue ||
+      `When encountering tasks matching '${safeTaskId}' in domain '${safeDomain}', apply the verified harness configuration.`;
+    const rolledBackTitle =
+      revMeta.title || parsedRevDoc.metadata?.title || `EXPERIENCE: ${safeTaskId}`;
+    const nowIso = new Date().toISOString();
+
+    this._upsertDomainAndRootIndexCue(
+      safeDomain,
+      safeTaskId,
+      rolledBackCue,
+      rolledBackTitle,
+      nowIso
+    );
+
     let activeState = fs.existsSync(activePointerPath)
       ? JSON.parse(fs.readFileSync(activePointerPath, 'utf8'))
       : { taskId: safeTaskId, domain: safeDomain, previousRevisions: [], candidateRevisions: [] };
@@ -2980,8 +3439,11 @@ export class HarnessKnowledgeEngine {
     activeState.activeLessonRevisionId = targetRev;
     activeState.receiptId = revMeta.receiptId;
     activeState.attemptId = revMeta.attemptId;
-    activeState.rolledBackAt = new Date().toISOString();
-    fs.writeFileSync(activePointerPath, JSON.stringify(activeState, null, 2) + '\n', 'utf8');
+    activeState.rolledBackAt = nowIso;
+    const tmpActive = `${activePointerPath}.tmp.${process.pid}.${Date.now()}`;
+    fs.writeFileSync(tmpActive, JSON.stringify(activeState, null, 2) + '\n', 'utf8');
+    fs.renameSync(tmpActive, activePointerPath);
+
     this.buildIndex();
     return {
       ok: true,
@@ -2990,7 +3452,10 @@ export class HarnessKnowledgeEngine {
       domain: safeDomain,
       activeRevisionId: targetRev,
       activeLessonRevisionId: targetRev,
-      receiptId: revMeta.receiptId
+      receiptId: revMeta.receiptId,
+      restoredArtifacts,
+      historicalValid: true,
+      cue: rolledBackCue
     };
   }
 
@@ -3004,6 +3469,8 @@ export class HarnessKnowledgeEngine {
     adr_id,
     title,
     summary,
+    lessonRevisionId = null,
+    lesson_revision_id = null,
     evaluationReceipt = null,
     evaluation_receipt = null,
     receiptId = null,
@@ -3043,7 +3510,25 @@ export class HarnessKnowledgeEngine {
       };
     }
 
-    const absExpPath = path.resolve(this.workspaceRoot, expDoc.path);
+    const requestedRevId = String(lessonRevisionId || lesson_revision_id || '').trim() || null;
+    let absExpPath = path.resolve(this.workspaceRoot, expDoc.path);
+    let sourceExpRelPath = expDoc.path;
+    if (requestedRevId && expDoc.domain && expDoc.task_id) {
+      const candidateRevPath = path.join(
+        this.harnessDir,
+        'library',
+        String(expDoc.domain),
+        'harnesses',
+        String(expDoc.task_id),
+        'revisions',
+        requestedRevId,
+        'EXPERIENCE.md'
+      );
+      if (this._isPathInsideWorkspace(candidateRevPath) && fs.existsSync(candidateRevPath)) {
+        absExpPath = candidateRevPath;
+        sourceExpRelPath = path.relative(this.workspaceRoot, candidateRevPath).replace(/\\/g, '/');
+      }
+    }
     this.assertContainedPath(absExpPath, 'experiencePath');
     const actualLessonDigest = fs.existsSync(absExpPath)
       ? crypto.createHash('sha256').update(fs.readFileSync(absExpPath, 'utf8'), 'utf8').digest('hex')
@@ -3064,7 +3549,8 @@ export class HarnessKnowledgeEngine {
     const receiptCheck = this.verifyEvaluationReceipt(candidateReceiptId, {
       expectedTaskId: expDoc.task_id || undefined,
       expectedDomain: expDoc.domain || undefined,
-      expectedLessonDigest: actualLessonDigest
+      expectedLessonDigest: actualLessonDigest,
+      mode: requestedRevId ? 'historical' : 'current_workspace'
     });
 
     if (!receiptCheck.valid) {
@@ -3079,6 +3565,11 @@ export class HarnessKnowledgeEngine {
       };
     }
 
+    const resolvedLessonRevId =
+      requestedRevId ||
+      receiptCheck.receipt?.lessonRevisionId ||
+      expDoc.lesson_revision_id ||
+      null;
     const slug = (adr_id || `ADR-PROMOTED-${expDoc.task_id || expDoc.docid}`)
       .replace(/[^a-zA-Z0-9_-]/g, '-');
     const nowIso = new Date().toISOString();
@@ -3096,12 +3587,13 @@ export class HarnessKnowledgeEngine {
       'status: active',
       'synthetic: false',
       `receipt_id: ${receiptCheck.receiptId}`,
+      ...(resolvedLessonRevId ? [`lesson_revision_id: ${resolvedLessonRevId}`] : []),
       'repo: Harness2-RAG-antigravity',
       `git_revision: ${this.getGitRevision()}`,
       `created_at: "${nowIso}"`,
       'tags: [promoted-lesson, adr, harness2, project-knowledge]',
       'evidence_links:',
-      `  - "${expDoc.path}"`,
+      `  - "${sourceExpRelPath}"`,
       `  - "${relReceiptPath}"`,
       ...(expDoc.evidence_links || []).map((e) => `  - "${e}"`),
       '---',
@@ -3112,7 +3604,7 @@ export class HarnessKnowledgeEngine {
       summary || expDoc.cue || `Adopted from verified Harness² experience \`${expDoc.docid}\`.`,
       '',
       '## 2. Original Harness² Provenance & Evidence',
-      `- **Source Experience Document**: [\`${expDoc.path}\`](../../../${expDoc.path}) (\`${expDoc.docid}\`)`,
+      `- **Source Experience Document**: [\`${sourceExpRelPath}\`](../../../${sourceExpRelPath}) (\`${expDoc.docid}\`)`,
       `- **Evaluation Receipt**: \`${receiptCheck.receiptId}\` (\`${relReceiptPath}\`)`,
       `- **Original Task ID**: \`${expDoc.task_id}\``,
       `- **Git Revision at Verification**: \`${expDoc.git_revision}\``,
@@ -3127,7 +3619,8 @@ export class HarnessKnowledgeEngine {
       promoted: true,
       adrDocId: slug.toUpperCase(),
       adrPath: path.relative(this.workspaceRoot, adrPath).replace(/\\/g, '/'),
-      sourceExperience: expDoc.path,
+      sourceExperience: sourceExpRelPath,
+      lessonRevisionId: resolvedLessonRevId,
       receiptId: receiptCheck.receiptId,
       evaluationReceipt: receiptCheck.receipt
     };
@@ -3218,6 +3711,8 @@ export class HarnessKnowledgeEngine {
         error: null,
         usedTokens: null,
         providerCalls: 0,
+        checks: [{ name: 'boolean_evaluator', passed: true, score: 1.0 }],
+        invocation: null,
         raw: evalOut
       };
     }
@@ -3235,6 +3730,8 @@ export class HarnessKnowledgeEngine {
         error: 'EVALUATOR_VERIFICATION_FAILED',
         usedTokens: null,
         providerCalls: 0,
+        checks: [{ name: 'boolean_evaluator', passed: false, score: 0 }],
+        invocation: null,
         raw: evalOut
       };
     }
@@ -3249,16 +3746,21 @@ export class HarnessKnowledgeEngine {
         error: evalOut.error || 'INVALID_EVALUATOR_RESULT_SCHEMA',
         usedTokens: null,
         providerCalls: 0,
+        checks: Array.isArray(evalOut.checks) ? evalOut.checks : [],
+        invocation: evalOut.invocation || null,
         raw: evalOut
       };
     }
 
     const rawScore = hasExplicitScore ? Number(evalOut.score) : evalOut.passed === true ? 1.0 : 0.0;
     const clampedScore = Math.max(0, Math.min(1, rawScore));
+    const checksList = Array.isArray(evalOut.checks) ? evalOut.checks : [];
+    const anyCheckFailed = this._hasFailedCheckEntry(checksList);
     const passed =
       (hasExplicitPassed ? evalOut.passed === true : clampedScore >= passThreshold) &&
       clampedScore >= passThreshold &&
-      evalOut.ok !== false;
+      evalOut.ok !== false &&
+      !anyCheckFailed;
 
     return {
       validShape: true,
@@ -3274,6 +3776,11 @@ export class HarnessKnowledgeEngine {
               ? evalOut.observedTokens
               : null,
       providerCalls: typeof evalOut.providerCalls === 'number' ? evalOut.providerCalls : 0,
+      checks:
+        checksList.length > 0
+          ? checksList
+          : [{ name: 'evaluator_verdict', passed, score: Number(clampedScore.toFixed(4)) }],
+      invocation: evalOut.invocation || null,
       raw: evalOut
     };
   }
@@ -3309,6 +3816,8 @@ export class HarnessKnowledgeEngine {
       type = 'command',
       command = null,
       args = [],
+      shell = undefined,
+      env = {},
       timeoutMs = 15000,
       description = '',
       handler = null
@@ -3326,6 +3835,8 @@ export class HarnessKnowledgeEngine {
       type: typeof handler === 'function' && !command ? 'handler' : type,
       command: command ? String(command) : null,
       args: Array.isArray(args) ? args.map(String) : [],
+      shell: typeof shell === 'boolean' ? shell : null,
+      env: env && typeof env === 'object' && !Array.isArray(env) ? env : {},
       timeoutMs: Number(timeoutMs || 15000),
       description: String(description || ''),
       registeredAt: new Date().toISOString()
@@ -3344,6 +3855,8 @@ export class HarnessKnowledgeEngine {
       type = 'command',
       command = null,
       args = [],
+      shell = undefined,
+      env = {},
       timeoutMs = 15000,
       passThreshold = 0.75,
       description = '',
@@ -3362,6 +3875,8 @@ export class HarnessKnowledgeEngine {
       type: typeof handler === 'function' && !command ? 'handler' : type,
       command: command ? String(command) : null,
       args: Array.isArray(args) ? args.map(String) : [],
+      shell: typeof shell === 'boolean' ? shell : null,
+      env: env && typeof env === 'object' && !Array.isArray(env) ? env : {},
       timeoutMs: Number(timeoutMs || 15000),
       passThreshold: Number(passThreshold ?? 0.75),
       description: String(description || ''),
@@ -3371,25 +3886,173 @@ export class HarnessKnowledgeEngine {
     return reg[cleanId];
   }
 
-  _runCommandInCandidateDir(cmdStr, candDir, timeoutMs = 15000, extraEnv = {}) {
-    const res = spawnSync(cmdStr, {
-      cwd: candDir,
-      shell: true,
-      encoding: 'utf8',
-      timeout: timeoutMs,
-      windowsHide: true,
-      env: {
-        ...process.env,
-        HARNESS_CANDIDATE_DIR: candDir,
-        ...extraEnv
+  _tokenizeCommandLine(cmdStr) {
+    const tokens = [];
+    let current = '';
+    let inSingle = false;
+    let inDouble = false;
+    let hasUnquotedShellOps = false;
+    const str = String(cmdStr || '').trim();
+    for (let i = 0; i < str.length; i++) {
+      const ch = str[i];
+      if (ch === '\\' && i + 1 < str.length && (inDouble || inSingle || str[i + 1] === '"' || str[i + 1] === "'")) {
+        current += str[i + 1];
+        i++;
+        continue;
       }
-    });
-    return {
-      ok: res.status === 0,
-      exitCode: res.status ?? -1,
-      stdout: (res.stdout || '').trim(),
-      stderr: (res.stderr || '').trim()
+      if (ch === "'" && !inDouble) {
+        inSingle = !inSingle;
+        continue;
+      }
+      if (ch === '"' && !inSingle) {
+        inDouble = !inDouble;
+        continue;
+      }
+      if (!inSingle && !inDouble) {
+        if (/\s/.test(ch)) {
+          if (current.length > 0) {
+            tokens.push(current);
+            current = '';
+          }
+          continue;
+        }
+        if (/[|&;<>]/.test(ch)) {
+          hasUnquotedShellOps = true;
+        }
+      }
+      current += ch;
+    }
+    if (current.length > 0) {
+      tokens.push(current);
+    }
+    return { tokens, hasUnquotedShellOps };
+  }
+
+  _runProcessInCandidateDir(specOrCmd, candDir, timeoutMs = 15000, extraEnv = {}) {
+    const spec =
+      typeof specOrCmd === 'string'
+        ? { command: specOrCmd, args: [], shell: undefined, env: {} }
+        : specOrCmd || {};
+    const rawCmd = String(spec.command || '').trim();
+    const argv = Array.isArray(spec.args) ? spec.args.map(String) : [];
+    if (!rawCmd) {
+      return {
+        ok: false,
+        exitCode: 2,
+        stdout: '',
+        stderr: 'EMPTY_COMMAND_SPEC',
+        command: '',
+        args: argv,
+        shell: false,
+        cwd: candDir
+      };
+    }
+
+    let execCmd = rawCmd;
+    let execArgs = argv;
+    let useShell = typeof spec.shell === 'boolean' ? spec.shell : false;
+
+    if (argv.length === 0 && spec.shell !== true) {
+      const parsed = this._tokenizeCommandLine(rawCmd);
+      if (parsed.hasUnquotedShellOps) {
+        useShell = true;
+      } else if (parsed.tokens.length > 0) {
+        execCmd = parsed.tokens[0];
+        execArgs = parsed.tokens.slice(1);
+        useShell = false;
+      }
+    }
+
+    const bareInterpreters = new Set([
+      'node',
+      'node.exe',
+      'python',
+      'python3',
+      'python.exe',
+      'sh',
+      'bash',
+      'pwsh',
+      'powershell',
+      'cmd',
+      'cmd.exe'
+    ]);
+    const cmdBase = path.basename(execCmd).toLowerCase();
+    if (!useShell && execArgs.length === 0 && bareInterpreters.has(cmdBase)) {
+      return {
+        ok: false,
+        exitCode: 2,
+        stdout: '',
+        stderr: `EMPTY_INTERPRETER_INVOCATION: '${rawCmd}' invoked without script or arguments`,
+        command: execCmd,
+        args: [],
+        shell: false,
+        cwd: candDir
+      };
+    }
+
+    const mergedEnv = {
+      ...process.env,
+      ...(spec.env && typeof spec.env === 'object' ? spec.env : {}),
+      HARNESS_CANDIDATE_DIR: candDir,
+      ...extraEnv
     };
+
+    const res = useShell
+      ? spawnSync(rawCmd, argv, {
+          cwd: candDir,
+          shell: true,
+          encoding: 'utf8',
+          timeout: timeoutMs,
+          windowsHide: true,
+          env: mergedEnv
+        })
+      : spawnSync(execCmd, execArgs, {
+          cwd: candDir,
+          shell: false,
+          encoding: 'utf8',
+          timeout: timeoutMs,
+          windowsHide: true,
+          env: mergedEnv
+        });
+
+    const stdout = (res.stdout || '').trim();
+    const stderr = (res.stderr || (res.error ? res.error.message : '') || '').trim();
+    const exitCode = typeof res.status === 'number' ? res.status : -1;
+    const ok = exitCode === 0 && !res.error;
+
+    let parsedJsonLine = null;
+    if (stdout) {
+      const lastLine = stdout.split(/\r?\n/).filter(Boolean).pop();
+      if (lastLine && lastLine.startsWith('{') && lastLine.endsWith('}')) {
+        try {
+          parsedJsonLine = JSON.parse(lastLine);
+        } catch {}
+      }
+    }
+
+    const invocation = {
+      command: useShell ? rawCmd : execCmd,
+      args: useShell ? argv : execArgs,
+      shell: useShell,
+      cwd: candDir
+    };
+
+    return {
+      ok,
+      exitCode,
+      stdout,
+      stderr,
+      command: invocation.command,
+      args: invocation.args,
+      shell: useShell,
+      cwd: candDir,
+      invocation,
+      parsedJson: parsedJsonLine
+    };
+  }
+
+  _runCommandInCandidateDir(cmdStr, candDir, timeoutMs = 15000, extraEnv = {}) {
+    return this._runProcessInCandidateDir(cmdStr, candDir, timeoutMs, extraEnv);
   }
 
   _executeSchedulerReferenceInCandidateDir(callArg) {
@@ -3621,31 +4284,103 @@ export class HarnessKnowledgeEngine {
     }
     const explicitCmd =
       options.command || options.executorCommand || options.executor_command || null;
+    const explicitArgs = Array.isArray(options.args)
+      ? options.args.map((a) => String(a))
+      : Array.isArray(options.executorArgs)
+        ? options.executorArgs.map((a) => String(a))
+        : Array.isArray(options.executor_args)
+          ? options.executor_args.map((a) => String(a))
+          : null;
+    const explicitShell =
+      typeof (options.shell ?? options.executorShell ?? options.executor_shell) === 'boolean'
+        ? Boolean(options.shell ?? options.executorShell ?? options.executor_shell)
+        : undefined;
     const rawId =
       typeof executorIdOrFn === 'string' && executorIdOrFn.trim()
         ? executorIdOrFn.trim()
         : null;
+
+    const buildCandidateEnv = (callArg) => {
+      const candDir = callArg.candidateDir || callArg.workspaceRoot || this.workspaceRoot;
+      let configPath = '';
+      try {
+        const runtimeCfgDir = path.join(candDir, '.harness', 'runtime');
+        if (this._isPathInsideWorkspace(runtimeCfgDir)) {
+          fs.mkdirSync(runtimeCfgDir, { recursive: true });
+          configPath = path.join(runtimeCfgDir, 'candidate-config.json');
+          fs.writeFileSync(
+            configPath,
+            JSON.stringify(
+              {
+                candidateId: callArg.candidateId || '',
+                candidateIndex: callArg.candidateIndex ?? 0,
+                front: callArg.front || '',
+                modelTier: callArg.modelTier || '',
+                thinkingBudgetTokens: callArg.thinkingBudgetTokens ?? null,
+                maxSteps: callArg.maxSteps ?? null,
+                appliedCues: callArg.appliedCues || [],
+              },
+              null,
+              2
+            ) + '\n',
+            'utf8'
+          );
+        }
+      } catch {}
+      return {
+        HARNESS_CANDIDATE_ID: callArg.candidateId || '',
+        HARNESS_CANDIDATE_INDEX: String(callArg.candidateIndex ?? 0),
+        HARNESS_CANDIDATE_FRONT: String(callArg.front || ''),
+        HARNESS_REASONING_DEPTH: String(callArg.reasoningDepth || options.reasoningDepth || ''),
+        HARNESS_THINKING_BUDGET_TOKENS: String(callArg.thinkingBudgetTokens ?? ''),
+        HARNESS_MAX_STEPS: String(callArg.maxSteps ?? ''),
+        HARNESS_CANDIDATE_CONFIG_PATH: configPath,
+      };
+    };
+
+    const mapProcessToExecutorResult = (out) => {
+      const pj = out.parsedJson && typeof out.parsedJson === 'object' ? out.parsedJson : {};
+      const usedTok =
+        typeof pj.usedTokens === 'number'
+          ? pj.usedTokens
+          : typeof pj.observedTokens === 'number'
+            ? pj.observedTokens
+            : typeof pj.totalTokens === 'number'
+              ? pj.totalTokens
+              : typeof pj.tokens === 'number'
+                ? pj.tokens
+                : null;
+      return {
+        ok: out.ok && pj.ok !== false,
+        exitCode: out.exitCode,
+        stdout: out.stdout,
+        stderr: out.stderr,
+        invocation: out.invocation,
+        stepsExecuted: typeof pj.stepsExecuted === 'number' ? pj.stepsExecuted : 1,
+        observedTokens: usedTok,
+        usedTokens: usedTok,
+        totalTokens: usedTok,
+        providerCalls: typeof pj.providerCalls === 'number' ? pj.providerCalls : 0,
+      };
+    };
 
     if (!rawId && explicitCmd) {
       return {
         ok: true,
         id: 'command-executor',
         fn: (callArg) => {
-          const out = this._runCommandInCandidateDir(
-            String(explicitCmd),
+          const out = this._runProcessInCandidateDir(
+            {
+              command: String(explicitCmd),
+              args: explicitArgs,
+              shell: explicitShell,
+            },
             callArg.candidateDir || callArg.workspaceRoot,
             Number(options.timeoutMs || 15000),
-            { HARNESS_CANDIDATE_ID: callArg.candidateId || '' }
+            buildCandidateEnv(callArg)
           );
-          return {
-            ok: out.ok,
-            exitCode: out.exitCode,
-            stdout: out.stdout,
-            stderr: out.stderr,
-            stepsExecuted: 1,
-            observedTokens: null
-          };
-        }
+          return mapProcessToExecutorResult(out);
+        },
       };
     }
 
@@ -3665,24 +4400,19 @@ export class HarnessKnowledgeEngine {
         ok: true,
         id: rawId,
         fn: (callArg) => {
-          const out = this._runCommandInCandidateDir(
-            entry.command,
+          const out = this._runProcessInCandidateDir(
+            {
+              command: entry.command,
+              args: Array.isArray(entry.args) ? entry.args : explicitArgs,
+              shell: typeof entry.shell === 'boolean' ? entry.shell : explicitShell,
+              env: entry.env,
+            },
             callArg.candidateDir || callArg.workspaceRoot,
             entry.timeoutMs || 15000,
-            {
-              HARNESS_CANDIDATE_ID: callArg.candidateId || '',
-              HARNESS_CANDIDATE_INDEX: String(callArg.candidateIndex ?? 0)
-            }
+            buildCandidateEnv(callArg)
           );
-          return {
-            ok: out.ok,
-            exitCode: out.exitCode,
-            stdout: out.stdout,
-            stderr: out.stderr,
-            stepsExecuted: 1,
-            observedTokens: null
-          };
-        }
+          return mapProcessToExecutorResult(out);
+        },
       };
     }
 
@@ -3690,31 +4420,48 @@ export class HarnessKnowledgeEngine {
       'command-executor',
       'candidate-command',
       'scheduler-reference-executor',
-      'registered-command-or-sdk-executor'
+      'registered-command-or-sdk-executor',
     ]);
     if (builtinIds.has(rawId)) {
       return {
         ok: true,
         id: rawId,
         fn: (callArg) => {
+          const candDir = callArg.candidateDir || callArg.workspaceRoot || this.workspaceRoot;
           if (explicitCmd) {
-            const out = this._runCommandInCandidateDir(
-              String(explicitCmd),
-              callArg.candidateDir || callArg.workspaceRoot,
-              Number(options.timeoutMs || 15000),
+            const out = this._runProcessInCandidateDir(
               {
-                HARNESS_CANDIDATE_ID: callArg.candidateId || '',
-                HARNESS_CANDIDATE_INDEX: String(callArg.candidateIndex ?? 0)
-              }
+                command: String(explicitCmd),
+                args: explicitArgs,
+                shell: explicitShell,
+              },
+              candDir,
+              Number(options.timeoutMs || 15000),
+              buildCandidateEnv(callArg)
             );
-            return {
-              ok: out.ok,
-              exitCode: out.exitCode,
-              stdout: out.stdout,
-              stderr: out.stderr,
-              stepsExecuted: 1,
-              observedTokens: null
-            };
+            return mapProcessToExecutorResult(out);
+          }
+          if (rawId === 'registered-command-or-sdk-executor') {
+            const runnerCandidates = [
+              options.candidateScript ? path.resolve(candDir, String(options.candidateScript)) : null,
+              path.join(candDir, '.harness', 'candidate-runner.mjs'),
+              path.join(candDir, 'candidate-runner.mjs'),
+            ].filter(Boolean);
+            for (const runnerPath of runnerCandidates) {
+              if (this._isPathInsideWorkspace(runnerPath) && fs.existsSync(runnerPath)) {
+                const out = this._runProcessInCandidateDir(
+                  {
+                    command: process.execPath,
+                    args: [runnerPath],
+                    shell: false,
+                  },
+                  candDir,
+                  Number(options.timeoutMs || 15000),
+                  buildCandidateEnv(callArg)
+                );
+                return mapProcessToExecutorResult(out);
+              }
+            }
           }
           if (
             rawId === 'scheduler-reference-executor' ||
@@ -3723,7 +4470,7 @@ export class HarnessKnowledgeEngine {
             return this._executeSchedulerReferenceInCandidateDir(callArg);
           }
           return { ok: false, error: 'MISSING_EXECUTOR_COMMAND' };
-        }
+        },
       };
     }
 
@@ -3731,7 +4478,7 @@ export class HarnessKnowledgeEngine {
       ok: false,
       id: rawId,
       error: 'REGISTERED_EXECUTOR_NOT_FOUND',
-      fn: null
+      fn: null,
     };
   }
 
@@ -3745,29 +4492,89 @@ export class HarnessKnowledgeEngine {
       options.validatorCmd ||
       options.validator_cmd ||
       null;
+    const explicitArgs = Array.isArray(options.verifierArgs)
+      ? options.verifierArgs.map((a) => String(a))
+      : Array.isArray(options.verifier_args)
+        ? options.verifier_args.map((a) => String(a))
+        : Array.isArray(options.validatorArgs)
+          ? options.validatorArgs.map((a) => String(a))
+          : Array.isArray(options.validator_args)
+            ? options.validator_args.map((a) => String(a))
+            : null;
+    const explicitShell =
+      typeof (options.verifierShell ?? options.verifier_shell) === 'boolean'
+        ? Boolean(options.verifierShell ?? options.verifier_shell)
+        : undefined;
     const rawId =
       typeof verifierIdOrFn === 'string' && verifierIdOrFn.trim()
         ? verifierIdOrFn.trim()
         : null;
+
+    const mapProcessToVerifierResult = (out, checkLabel) => {
+      const pj = out.parsedJson && typeof out.parsedJson === 'object' ? out.parsedJson : {};
+      const defaultCheck = {
+        name: checkLabel || 'command-verifier',
+        command: out.invocation?.command || '',
+        args: Array.isArray(out.invocation?.args) ? out.invocation.args : [],
+        exitCode: out.exitCode,
+        passed: out.ok && pj.passed !== false,
+      };
+      const rawChecks =
+        Array.isArray(pj.checks) && pj.checks.length > 0 ? pj.checks : [defaultCheck];
+      const hasFailedCheck = this._hasFailedCheckEntry(rawChecks);
+      const passed = Boolean(out.ok && pj.passed !== false && !hasFailedCheck);
+      const rawScore =
+        typeof pj.score === 'number'
+          ? pj.score
+          : typeof pj.verificationScore === 'number'
+            ? pj.verificationScore
+            : passed
+              ? 0.96
+              : 0.0;
+      const score = passed ? rawScore : Math.min(rawScore, 0.4);
+      const usedTok =
+        typeof pj.usedTokens === 'number'
+          ? pj.usedTokens
+          : typeof pj.observedTokens === 'number'
+            ? pj.observedTokens
+            : typeof pj.totalTokens === 'number'
+              ? pj.totalTokens
+              : typeof pj.tokens === 'number'
+                ? pj.tokens
+                : null;
+      return {
+        passed,
+        score,
+        error: passed
+          ? null
+          : pj.error || out.stderr || out.stdout || `Exit code ${out.exitCode}`,
+        checks: rawChecks,
+        invocation: out.invocation,
+        usedTokens: usedTok,
+        providerCalls: typeof pj.providerCalls === 'number' ? pj.providerCalls : 0,
+      };
+    };
 
     if (!rawId && explicitCmd) {
       return {
         ok: true,
         id: 'command-verifier',
         fn: (callArg) => {
-          const out = this._runCommandInCandidateDir(
-            String(explicitCmd),
+          const out = this._runProcessInCandidateDir(
+            {
+              command: String(explicitCmd),
+              args: explicitArgs,
+              shell: explicitShell,
+            },
             callArg.candidateDir || callArg.workspaceRoot,
             Number(options.timeoutMs || 15000),
-            { HARNESS_CANDIDATE_ID: callArg.candidateId || '' }
+            {
+              HARNESS_CANDIDATE_ID: callArg.candidateId || '',
+              HARNESS_VERIFY_PHASE: String(callArg.phase || 'candidate'),
+            }
           );
-          return {
-            passed: out.ok,
-            score: out.ok ? 0.96 : 0.0,
-            error: out.ok ? null : out.stderr || out.stdout || `Exit code ${out.exitCode}`,
-            checks: [`command:${out.ok}`]
-          };
-        }
+          return mapProcessToVerifierResult(out, 'command-verifier');
+        },
       };
     }
 
@@ -3787,22 +4594,23 @@ export class HarnessKnowledgeEngine {
         ok: true,
         id: rawId,
         fn: (callArg) => {
-          const out = this._runCommandInCandidateDir(
-            entry.command,
+          const out = this._runProcessInCandidateDir(
+            {
+              command: entry.command,
+              args: Array.isArray(entry.args) ? entry.args : explicitArgs,
+              shell: typeof entry.shell === 'boolean' ? entry.shell : explicitShell,
+              env: entry.env,
+            },
             callArg.candidateDir || callArg.workspaceRoot,
             entry.timeoutMs || 15000,
             {
               HARNESS_CANDIDATE_ID: callArg.candidateId || '',
-              HARNESS_CANDIDATE_INDEX: String(callArg.candidateIndex ?? 0)
+              HARNESS_CANDIDATE_INDEX: String(callArg.candidateIndex ?? 0),
+              HARNESS_VERIFY_PHASE: String(callArg.phase || 'candidate'),
             }
           );
-          return {
-            passed: out.ok,
-            score: out.ok ? 0.96 : 0.0,
-            error: out.ok ? null : out.stderr || out.stdout || `Exit code ${out.exitCode}`,
-            checks: [`${rawId}:${out.ok}`]
-          };
-        }
+          return mapProcessToVerifierResult(out, rawId);
+        },
       };
     }
 
@@ -3810,7 +4618,7 @@ export class HarnessKnowledgeEngine {
       'command-verifier',
       'node-test-verifier',
       'scheduler-acceptance-verifier',
-      'registered-scheduler-acceptance-checks'
+      'registered-scheduler-acceptance-checks',
     ]);
     if (builtinIds.has(rawId)) {
       return {
@@ -3818,18 +4626,20 @@ export class HarnessKnowledgeEngine {
         id: rawId,
         fn: (callArg) => {
           if (explicitCmd) {
-            const out = this._runCommandInCandidateDir(
-              String(explicitCmd),
+            const out = this._runProcessInCandidateDir(
+              {
+                command: String(explicitCmd),
+                args: explicitArgs,
+                shell: explicitShell,
+              },
               callArg.candidateDir || callArg.workspaceRoot,
               Number(options.timeoutMs || 15000),
-              { HARNESS_CANDIDATE_ID: callArg.candidateId || '' }
+              {
+                HARNESS_CANDIDATE_ID: callArg.candidateId || '',
+                HARNESS_VERIFY_PHASE: String(callArg.phase || 'candidate'),
+              }
             );
-            return {
-              passed: out.ok,
-              score: out.ok ? 0.96 : 0.0,
-              error: out.ok ? null : out.stderr || out.stdout || `Exit code ${out.exitCode}`,
-              checks: [`command:${out.ok}`]
-            };
+            return mapProcessToVerifierResult(out, rawId);
           }
           if (
             rawId === 'scheduler-acceptance-verifier' ||
@@ -3838,19 +4648,19 @@ export class HarnessKnowledgeEngine {
             return this._verifySchedulerAcceptanceInCandidateDir(callArg);
           }
           if (rawId === 'node-test-verifier') {
-            const out = this._runCommandInCandidateDir(
-              'node --test',
+            const out = this._runProcessInCandidateDir(
+              {
+                command: process.execPath,
+                args: ['--test'],
+                shell: false,
+              },
               callArg.candidateDir || callArg.workspaceRoot,
               Number(options.timeoutMs || 15000)
             );
-            return {
-              passed: out.ok,
-              score: out.ok ? 0.95 : 0.0,
-              error: out.ok ? null : out.stderr || out.stdout || `Exit code ${out.exitCode}`
-            };
+            return mapProcessToVerifierResult(out, 'node-test-verifier');
           }
           return { passed: false, score: 0, error: 'MISSING_VERIFIER_COMMAND' };
-        }
+        },
       };
     }
 
@@ -3858,7 +4668,7 @@ export class HarnessKnowledgeEngine {
       ok: false,
       id: rawId,
       error: 'REGISTERED_VERIFIER_NOT_FOUND',
-      fn: null
+      fn: null,
     };
   }
 
@@ -3993,6 +4803,103 @@ export class HarnessKnowledgeEngine {
       typeof (options.baselineTokens ?? options.baseline_tokens) === 'number'
         ? Number(options.baselineTokens ?? options.baseline_tokens)
         : null;
+
+    // F10: Run-level requestId idempotency
+    const requestId =
+      options.requestId !== undefined || options.request_id !== undefined
+        ? String(options.requestId ?? options.request_id).trim() || null
+        : null;
+    const loopRequestsPath = path.join(this.runtimeDir, 'loop-requests.json');
+    const requestPayloadDigest = requestId
+      ? crypto
+          .createHash('sha256')
+          .update(
+            JSON.stringify({
+              taskId,
+              domain,
+              problem,
+              k,
+              mode,
+              requiredArtifacts: [...requiredArtifacts].map(String).sort(),
+              executorId: typeof requestedExecutor === 'string' ? requestedExecutor : Boolean(requestedExecutor),
+              verifierId: typeof requestedVerifier === 'string' ? requestedVerifier : Boolean(requestedVerifier),
+              command: options.command || options.executorCommand || options.executor_command || null,
+              args: options.args || options.executorArgs || options.executor_args || null,
+              verifierCommand:
+                options.verifierCommand ||
+                options.verifier_command ||
+                options.validatorCmd ||
+                options.validator_cmd ||
+                null,
+              verifierArgs:
+                options.verifierArgs ||
+                options.verifier_args ||
+                options.validatorArgs ||
+                options.validator_args ||
+                null,
+            }),
+            'utf8'
+          )
+          .digest('hex')
+      : null;
+
+    if (requestId && this._isPathInsideWorkspace(loopRequestsPath) && fs.existsSync(loopRequestsPath)) {
+      try {
+        const existingReqs = JSON.parse(fs.readFileSync(loopRequestsPath, 'utf8'));
+        const prevReq = existingReqs && existingReqs[requestId];
+        if (prevReq && typeof prevReq === 'object') {
+          if (prevReq.payloadDigest && prevReq.payloadDigest !== requestPayloadDigest) {
+            return {
+              ok: false,
+              status: 'failed',
+              error: 'REQUEST_ID_PAYLOAD_CONFLICT',
+              requestId,
+              passedVerification: false,
+              verificationScore: null,
+              synthetic: false,
+              taskId,
+              domain,
+              recordedLesson: null,
+              adoptedExperience: null,
+              recordedExperience: null,
+            };
+          }
+          if (prevReq.result && typeof prevReq.result === 'object') {
+            return {
+              ...prevReq.result,
+              requestId,
+              idempotentReplay: true,
+            };
+          }
+        }
+      } catch {}
+    }
+
+    const persistLoopRequestResult = (resObj) => {
+      if (!requestId || !resObj || typeof resObj !== 'object') return resObj;
+      const tagged = {
+        ...resObj,
+        requestId,
+        idempotentReplay: Boolean(resObj.idempotentReplay),
+      };
+      if (this._isPathInsideWorkspace(loopRequestsPath)) {
+        try {
+          fs.mkdirSync(path.dirname(loopRequestsPath), { recursive: true });
+          let map = {};
+          if (fs.existsSync(loopRequestsPath)) {
+            map = JSON.parse(fs.readFileSync(loopRequestsPath, 'utf8')) || {};
+          }
+          map[requestId] = {
+            requestId,
+            payloadDigest: requestPayloadDigest,
+            recordedAt: new Date().toISOString(),
+            result: tagged,
+          };
+          fs.writeFileSync(loopRequestsPath, JSON.stringify(map, null, 2) + '\n', 'utf8');
+        } catch {}
+      }
+      return tagged;
+    };
 
     // Enforce supervisor stop if task has escalated due to repeated no-progress attempts (PR E)
     const taskStatePath = path.join(this.harnessDir, 'tasks', taskId, 'state.json');
@@ -4272,6 +5179,17 @@ export class HarnessKnowledgeEngine {
             } catch {}
           }
         }
+        // F03: Delete any undeclared file created in workspaceRoot during candidate execution/evaluation
+        const currentFiles = this._collectWorkspaceSourceFiles();
+        for (const item of currentFiles) {
+          const inBase = baselineWorkspaceFiles.has(item.rel);
+          const inPreReq = preRunArtifacts.has(item.rel) && preRunArtifacts.get(item.rel).exists;
+          if (!inBase && !inPreReq && fs.existsSync(item.fullPath)) {
+            try {
+              fs.unlinkSync(item.fullPath);
+            } catch {}
+          }
+        }
       };
 
       const stageBaselineIntoCandidateDir = (candDir) => {
@@ -4297,8 +5215,19 @@ export class HarnessKnowledgeEngine {
         candidateId: cand.candidateId,
         candidateDir: candidateDirs[idx],
         sourceTreeDigest,
+        outputTreeDigest: sourceTreeDigest,
         hashes: {},
         modifiedFiles: {},
+        addedFiles: {},
+        deletedFiles: [],
+        treeDiff: {
+          added: [],
+          modified: [],
+          deleted: [],
+          modeChanged: [],
+          inputTreeDigest: sourceTreeDigest,
+          outputTreeDigest: sourceTreeDigest,
+        },
         changes: 0,
         missing: [],
       }));
@@ -4308,12 +5237,15 @@ export class HarnessKnowledgeEngine {
         const state = candArtifactStates[idx];
         state.hashes = {};
         state.modifiedFiles = {};
+        state.addedFiles = {};
+        state.deletedFiles = [];
         state.changes = 0;
         state.missing = [];
 
-        // Capture any file modified in workspaceRoot by an executor that wrote to rootWorkspaceRoot
+        // Capture any file modified or deleted in workspaceRoot by a legacy callback that wrote to rootWorkspaceRoot
         if (executor) {
           const currentWsFiles = this._collectWorkspaceSourceFiles();
+          const currentWsMap = new Map(currentWsFiles.map((item) => [item.rel, item.fullPath]));
           for (const item of currentWsFiles) {
             try {
               const wsBuf = fs.readFileSync(item.fullPath);
@@ -4327,6 +5259,17 @@ export class HarnessKnowledgeEngine {
                 }
               }
             } catch {}
+          }
+          // If a legacy callback deleted a baseline file from workspaceRoot, mirror that deletion into candDir
+          for (const [relStr] of baselineWorkspaceFiles.entries()) {
+            if (!currentWsMap.has(relStr)) {
+              const candFile = path.resolve(candDir, relStr);
+              if (this._isPathInsideWorkspace(candFile) && fs.existsSync(candFile)) {
+                try {
+                  fs.unlinkSync(candFile);
+                } catch {}
+              }
+            }
           }
         }
 
@@ -4380,14 +5323,33 @@ export class HarnessKnowledgeEngine {
           }
         }
 
-        // Also scan candDir for any other modified/created files relative to baselineWorkspaceFiles
+        // Scan candDir for full tree diff (added, modified, deleted) relative to baselineWorkspaceFiles
         const candFiles = this._collectWorkspaceSourceFiles(candDir, candDir);
-        for (const item of candFiles) {
+        const candFileMap = new Map();
+        const outDigestHash = crypto.createHash('sha256');
+        const addedList = [];
+        const modifiedList = [];
+        const deletedList = [];
+
+        for (const item of candFiles.sort((a, b) => a.rel.localeCompare(b.rel))) {
           try {
             const cBuf = fs.readFileSync(item.fullPath);
             const cSha = crypto.createHash('sha256').update(cBuf).digest('hex');
+            candFileMap.set(item.rel, cSha);
+            outDigestHash.update(`${item.rel}:${cSha}\n`, 'utf8');
             const baseEntry = baselineWorkspaceFiles.get(item.rel);
-            if (!baseEntry || baseEntry.sha256 !== cSha) {
+            if (!baseEntry) {
+              addedList.push(item.rel);
+              state.addedFiles[item.rel] = cSha;
+              if (!state.modifiedFiles[item.rel]) {
+                state.modifiedFiles[item.rel] = cSha;
+                state.changes++;
+              }
+              if (!state.hashes[item.rel]) {
+                state.hashes[item.rel] = cSha;
+              }
+            } else if (baseEntry.sha256 !== cSha) {
+              modifiedList.push(item.rel);
               if (!state.modifiedFiles[item.rel]) {
                 state.modifiedFiles[item.rel] = cSha;
                 state.changes++;
@@ -4398,6 +5360,25 @@ export class HarnessKnowledgeEngine {
             }
           } catch {}
         }
+
+        for (const [relStr] of baselineWorkspaceFiles.entries()) {
+          if (!candFileMap.has(relStr)) {
+            deletedList.push(relStr);
+            state.deletedFiles.push(relStr);
+            state.changes++;
+          }
+        }
+
+        const outDigest = outDigestHash.digest('hex');
+        state.outputTreeDigest = outDigest;
+        state.treeDiff = {
+          added: addedList,
+          modified: modifiedList,
+          deleted: deletedList,
+          modeChanged: [],
+          inputTreeDigest: sourceTreeDigest,
+          outputTreeDigest: outDigest,
+        };
       };
 
       const materializeCandidateArtifactsToWorkspace = (idx) => {
@@ -4405,7 +5386,8 @@ export class HarnessKnowledgeEngine {
         const state = candArtifactStates[idx];
         const filesToCopy = new Set([
           ...requiredArtifacts.map((r) => String(r).replace(/\\/g, '/')),
-          ...Object.keys(state?.modifiedFiles || {})
+          ...Object.keys(state?.modifiedFiles || {}),
+          ...Object.keys(state?.addedFiles || {}),
         ]);
         for (const relStr of filesToCopy) {
           const candFile = path.resolve(candDir, relStr);
@@ -4418,6 +5400,15 @@ export class HarnessKnowledgeEngine {
           ) {
             fs.mkdirSync(path.dirname(wsFile), { recursive: true });
             fs.writeFileSync(wsFile, fs.readFileSync(candFile));
+          }
+        }
+        // F03: Apply file deletions from winning candidate
+        for (const delRel of state?.deletedFiles || []) {
+          const wsFile = path.resolve(this.workspaceRoot, delRel);
+          if (this._isPathInsideWorkspace(wsFile) && fs.existsSync(wsFile)) {
+            try {
+              fs.unlinkSync(wsFile);
+            } catch {}
           }
         }
       };
@@ -4439,7 +5430,7 @@ export class HarnessKnowledgeEngine {
       const candidateExecuted = new Array(candidates.length).fill(false);
 
       // WP3: In sequential mode when both executor and evaluator exist, execute + evaluate each candidate
-      // in turn and stop BEFORE launching the next candidate if earlyStopOnFirstPass is satisfied!
+      // strictly inside candDir without projecting unverified files into workspaceRoot!
       const runProbesAndEvaluations = () => {
         if (mode === 'sequential' && executor && evaluator) {
           const execResults = new Array(candidates.length).fill(null);
@@ -4457,6 +5448,7 @@ export class HarnessKnowledgeEngine {
               workspaceRoot: candDir,
               candidateDir: candDir,
               rootWorkspaceRoot: this.workspaceRoot,
+              phase: 'candidate',
             };
             const execCallArg = {
               ...candContext,
@@ -4464,13 +5456,13 @@ export class HarnessKnowledgeEngine {
               candidate: { ...cand, id: cand.candidateId, candidateDir: candDir },
               candidateIndex: idx,
               candidateDir: candDir,
+              phase: 'candidate',
             };
             return chainMaybeAsync(executor(execCallArg, candContext), (out) => {
               candidateExecuted[idx] = true;
               execResults[idx] = out;
               captureCandidateArtifacts(idx);
               restoreWorkspaceBaseline();
-              materializeCandidateArtifactsToWorkspace(idx);
               const evalCallArg = {
                 ...candContext,
                 ...cand,
@@ -4479,6 +5471,7 @@ export class HarnessKnowledgeEngine {
                 candidateDir: candDir,
                 executorResult: out,
                 allExecutorResults: execResults,
+                phase: 'candidate',
               };
               return chainMaybeAsync(evaluator(evalCallArg, candContext), (rawEvalOut) => {
                 restoreWorkspaceBaseline();
@@ -4522,6 +5515,7 @@ export class HarnessKnowledgeEngine {
               workspaceRoot: candDir,
               candidateDir: candDir,
               rootWorkspaceRoot: this.workspaceRoot,
+              phase: 'candidate',
             };
             const callArg = {
               ...candContext,
@@ -4529,6 +5523,7 @@ export class HarnessKnowledgeEngine {
               candidate: { ...cand, id: cand.candidateId, candidateDir: candDir },
               candidateIndex: idx,
               candidateDir: candDir,
+              phase: 'candidate',
             };
             return chainMaybeAsync(executor(callArg, candContext), (out) => {
               candidateExecuted[idx] = true;
@@ -4551,12 +5546,12 @@ export class HarnessKnowledgeEngine {
             const cand = candidates[idx];
             const candDir = candidateDirs[idx];
             restoreWorkspaceBaseline();
-            materializeCandidateArtifactsToWorkspace(idx);
             const candContext = {
               ...probeContext,
               workspaceRoot: candDir,
               candidateDir: candDir,
               rootWorkspaceRoot: this.workspaceRoot,
+              phase: 'candidate',
             };
             const candExecOut = Array.isArray(execResult) ? execResult[idx] : execResult;
             const callArg = {
@@ -4567,6 +5562,7 @@ export class HarnessKnowledgeEngine {
               candidateDir: candDir,
               executorResult: candExecOut,
               allExecutorResults: execResult,
+              phase: 'candidate',
             };
             return chainMaybeAsync(evaluator(callArg, candContext), (rawOut) => {
               candidateExecuted[idx] = true;
@@ -4604,32 +5600,93 @@ export class HarnessKnowledgeEngine {
               (candidateExecuted[idx] || (!executor && !evaluator)) && st.missing.length === 0
           );
 
+        // Compute observed providerCalls and token usage from executor + evaluator outputs even when failing early (F09)
+        const computeEarlyTelemetry = () => {
+          let calls = 0;
+          let tokSum = 0;
+          let hasAnyTok = false;
+          const unknownCands = [];
+          for (let i = 0; i < candidates.length; i++) {
+            if (!candidateExecuted[i] && (executor || evaluator)) continue;
+            const eo = Array.isArray(execResult) ? execResult[i] : null;
+            const vo = Array.isArray(evalResults) ? evalResults[i] : null;
+            calls += Number(eo?.providerCalls || 0) + Number(vo?.providerCalls || 0);
+            const eTok =
+              typeof eo?.observedTokens === 'number'
+                ? eo.observedTokens
+                : typeof eo?.usedTokens === 'number'
+                  ? eo.usedTokens
+                  : typeof eo?.totalTokens === 'number'
+                    ? eo.totalTokens
+                    : null;
+            const vTok = vo && typeof vo.usedTokens === 'number' ? vo.usedTokens : null;
+            const cTok =
+              eTok !== null && vTok !== null
+                ? eTok + vTok
+                : eTok !== null
+                  ? eTok
+                  : vTok !== null
+                    ? vTok
+                    : null;
+            if (cTok !== null) {
+              hasAnyTok = true;
+              tokSum += cTok;
+            } else {
+              unknownCands.push(candidates[i].candidateId);
+            }
+          }
+          const complete = hasAnyTok && unknownCands.length === 0;
+          return {
+            providerCalls: calls,
+            usedTokens: hasAnyTok ? tokSum : null,
+            usage: {
+              observed_subtotal: tokSum,
+              complete,
+              total: complete ? tokSum : null,
+              unknown_components: unknownCands,
+              quality: complete ? 'observed' : hasAnyTok ? 'partial_observation' : 'unavailable',
+            },
+          };
+        };
+
         // Check post-executor state of requiredArtifacts
         if (requiredArtifacts.length > 0) {
           if (!anyCandidateHasAllArtifacts) {
+            const earlyTel = computeEarlyTelemetry();
             const missingArtifacts = candArtifactStates[0]?.missing || requiredArtifacts.map(String);
-            const failedTrajectories = candidates.map((cand, idx) => ({
-              candidateId: cand.candidateId,
-              candidateDir: candidateDirs[idx],
-              front: cand.front,
-              frontLabel: cand.frontLabel,
-              modelTier: cand.modelTier,
-              workspaceMode: cand.workspaceMode,
-              passedVerification: false,
-              verificationScore: 0,
-              stepsExecuted: 0,
-              toolErrors: 1,
-              promptTokens: 0,
-              thoughtsTokens: 0,
-              outputTokens: 0,
-              totalTokens: 0,
-              tokensSaved: 0,
-              tokensSavedPct: 0,
-              earlyStopped: false,
-              observedSummary: `Verification failed: required artifact(s) missing: ${missingArtifacts.join(', ')}`,
-              evidencePaths: [],
-            }));
-            return {
+            const failedTrajectories = candidates.map((cand, idx) => {
+              const eo = Array.isArray(execResult) ? execResult[idx] : null;
+              const eTok =
+                typeof eo?.observedTokens === 'number'
+                  ? eo.observedTokens
+                  : typeof eo?.usedTokens === 'number'
+                    ? eo.usedTokens
+                    : typeof eo?.totalTokens === 'number'
+                      ? eo.totalTokens
+                      : 0;
+              return {
+                candidateId: cand.candidateId,
+                candidateDir: candidateDirs[idx],
+                front: cand.front,
+                frontLabel: cand.frontLabel,
+                modelTier: cand.modelTier,
+                workspaceMode: cand.workspaceMode,
+                passedVerification: false,
+                verificationScore: 0,
+                stepsExecuted: typeof eo?.stepsExecuted === 'number' ? eo.stepsExecuted : 0,
+                toolErrors: 1,
+                promptTokens: 0,
+                thoughtsTokens: 0,
+                outputTokens: 0,
+                totalTokens: eTok,
+                tokensSaved: 0,
+                tokensSavedPct: 0,
+                earlyStopped: false,
+                observedSummary: `Verification failed: required artifact(s) missing: ${missingArtifacts.join(', ')}`,
+                evidencePaths: [],
+              };
+            });
+            return persistLoopRequestResult({
               ok: false,
               status: 'failed',
               error: 'REQUIRED_ARTIFACT_MISSING',
@@ -4637,9 +5694,10 @@ export class HarnessKnowledgeEngine {
               passedVerification: false,
               verificationScore: 0,
               synthetic: false,
-              usedTokens: null,
-              providerCalls: 0,
-              artifactChanges: 0,
+              usedTokens: earlyTel.usedTokens,
+              usage: earlyTel.usage,
+              providerCalls: earlyTel.providerCalls,
+              artifactChanges: maxArtifactChanges,
               executionMode: 'artifact-verification',
               sourceTreeDigest,
               runId,
@@ -4662,10 +5720,13 @@ export class HarnessKnowledgeEngine {
                 score: 0,
                 verificationScore: 0,
                 passedVerification: false,
-                totalTokens: 0,
+                totalTokens: earlyTel.usedTokens ?? 0,
               },
               tokenEfficiency: {
-                totalActualTokens: 0,
+                totalActualTokens: earlyTel.usedTokens ?? 0,
+                observedSubtotal: earlyTel.usage.observed_subtotal,
+                usageComplete: earlyTel.usage.complete,
+                unknownComponents: earlyTel.usage.unknown_components,
                 totalUnoptimizedTokens: null,
                 totalTokensSaved: 0,
                 totalTokensSavedPct: 0,
@@ -4675,12 +5736,15 @@ export class HarnessKnowledgeEngine {
               recordedLesson: null,
               adoptedExperience: null,
               recordedExperience: null,
-            };
+              receiptId: null,
+              evalReceiptId: null,
+              evaluationReceipt: null,
+            });
           }
 
           // Pre-existing unchanged files on disk without an executor or evaluator do NOT count as execution
           if (maxArtifactChanges === 0 && !executor && !evaluator) {
-            return {
+            return persistLoopRequestResult({
               ok: false,
               status: 'failed',
               error: 'PRE_EXISTING_UNCHANGED_ARTIFACT_NOT_EXECUTION_EVIDENCE',
@@ -4725,19 +5789,23 @@ export class HarnessKnowledgeEngine {
               recordedLesson: null,
               adoptedExperience: null,
               recordedExperience: null,
-            };
+              receiptId: null,
+              evalReceiptId: null,
+              evaluationReceipt: null,
+            });
           }
         }
 
         // A file change or executor run without an independent evaluator is delivered/implemented, NEVER verified!
         if (!evaluator && executor) {
+          const earlyTel = computeEarlyTelemetry();
           const bestDeliveredIdx = candArtifactStates.findIndex(
             (st) => st.missing.length === 0 && st.changes > 0
           );
           if (bestDeliveredIdx >= 0) {
             materializeCandidateArtifactsToWorkspace(bestDeliveredIdx);
           }
-          return {
+          return persistLoopRequestResult({
             ok: false,
             status: 'delivered_unverified',
             delivered: maxArtifactChanges > 0,
@@ -4745,8 +5813,9 @@ export class HarnessKnowledgeEngine {
             passedVerification: false,
             verificationScore: null,
             synthetic: false,
-            usedTokens: null,
-            providerCalls: 0,
+            usedTokens: earlyTel.usedTokens,
+            usage: earlyTel.usage,
+            providerCalls: earlyTel.providerCalls,
             artifactChanges: maxArtifactChanges,
             executionMode: 'delivered-unverified',
             sourceTreeDigest,
@@ -4772,10 +5841,13 @@ export class HarnessKnowledgeEngine {
               score: null,
               verificationScore: null,
               passedVerification: false,
-              totalTokens: null,
+              totalTokens: earlyTel.usedTokens,
             },
             tokenEfficiency: {
-              totalActualTokens: null,
+              totalActualTokens: earlyTel.usedTokens,
+              observedSubtotal: earlyTel.usage.observed_subtotal,
+              usageComplete: earlyTel.usage.complete,
+              unknownComponents: earlyTel.usage.unknown_components,
               totalUnoptimizedTokens: null,
               totalTokensSaved: null,
               totalTokensSavedPct: null,
@@ -4785,12 +5857,15 @@ export class HarnessKnowledgeEngine {
             recordedLesson: null,
             adoptedExperience: null,
             recordedExperience: null,
-          };
+            receiptId: null,
+            evalReceiptId: null,
+            evaluationReceipt: null,
+          });
         }
 
         const isSimulation = !evaluator;
         if (isSimulation && allowSimulation === false) {
-          return {
+          return persistLoopRequestResult({
             ok: false,
             status: 'failed',
             error: 'NO_VERIFIED_EXECUTION_OR_EVALUATOR',
@@ -4835,7 +5910,10 @@ export class HarnessKnowledgeEngine {
             recordedLesson: null,
             adoptedExperience: null,
             recordedExperience: null,
-          };
+            receiptId: null,
+            evalReceiptId: null,
+            evaluationReceipt: null,
+          });
         }
 
         // Reference unoptimized baseline (used only when isSimulation === true or explicitBaselineTokens is provided)
@@ -4953,16 +6031,27 @@ export class HarnessKnowledgeEngine {
                 ? Math.max(3, Math.min(cand.maxSteps, 4))
                 : Math.max(4, Math.min(cand.maxSteps, 5));
 
-          const observedCandTokens =
+          // F09: Sum executor + verifier token usage when both report tokens
+          const execTok =
             typeof candExecOut?.observedTokens === 'number'
               ? candExecOut.observedTokens
               : typeof candExecOut?.usedTokens === 'number'
                 ? candExecOut.usedTokens
                 : typeof candExecOut?.totalTokens === 'number'
                   ? candExecOut.totalTokens
-                  : candEval && typeof candEval.usedTokens === 'number'
-                    ? candEval.usedTokens
-                    : null;
+                  : null;
+          const evalTok =
+            candEval && typeof candEval.usedTokens === 'number'
+              ? candEval.usedTokens
+              : null;
+          const observedCandTokens =
+            execTok !== null && evalTok !== null
+              ? execTok + evalTok
+              : execTok !== null
+                ? execTok
+                : evalTok !== null
+                  ? evalTok
+                  : null;
 
           let promptTok = null;
           let thoughtsTok = null;
@@ -5024,6 +6113,8 @@ export class HarnessKnowledgeEngine {
             verificationScore: score,
             stepsExecuted: stepsUsed,
             toolErrors: passed ? 0 : 1,
+            executorTokens: execTok,
+            verifierTokens: evalTok,
             promptTokens: promptTok,
             thoughtsTokens: thoughtsTok,
             outputTokens: outputTok,
@@ -5032,6 +6123,8 @@ export class HarnessKnowledgeEngine {
             tokensSavedPct: savedPct,
             earlyStopped: false,
             synthetic: isSimulation,
+            treeDiff: candState.treeDiff,
+            checks: candEval?.checks || [],
             observedSummary:
               `[${cand.frontLabel}] Probed in Workspace:${cand.workspaceMode} (model=${cand.modelTier}, thinkingCap=${cand.thinkingBudgetTokens}) under snapshot '${snapshotId}'. ` +
               `Retrieved ${expHits.results.length} experience cues & ${projHits.results.length} ADRs; verification=${passed ? 'passed' : 'failed'} (score=${score}) in ${stepsUsed} steps` +
@@ -5075,7 +6168,7 @@ export class HarnessKnowledgeEngine {
           complete: usageComplete,
           total: totalActualTokens,
           unknown_components: unknownComponents,
-          quality: usageComplete ? (isSimulation ? 'simulated' : 'observed') : 'partial_observation'
+          quality: usageComplete ? (isSimulation ? 'simulated' : 'observed') : 'partial_observation',
         };
 
         // If evaluator/executor ran and no candidate passed verification, fail closed without recording
@@ -5085,7 +6178,7 @@ export class HarnessKnowledgeEngine {
             (Array.isArray(evalResults) && evalResults.find((r) => r && r.error)?.error) ||
             'EVALUATION_FAILED';
           const bestScore = winner ? winner.verificationScore : 0;
-          return {
+          return persistLoopRequestResult({
             ok: false,
             status: 'failed',
             error: 'EVALUATION_FAILED',
@@ -5135,7 +6228,10 @@ export class HarnessKnowledgeEngine {
             recordedLesson: null,
             adoptedExperience: null,
             recordedExperience: null,
-          };
+            receiptId: null,
+            evalReceiptId: null,
+            evaluationReceipt: null,
+          });
         }
 
         const winnerIdx =
@@ -5149,205 +6245,341 @@ export class HarnessKnowledgeEngine {
           (winnerIdx >= 0 ? candArtifactStates[winnerIdx] : candArtifactStates[0]) || {
             hashes: {},
             changes: 0,
-          };
-        const verifiedArtifactHashes = winnerArtifactState.hashes || {};
-        const artifactChanges = winnerArtifactState.changes || maxArtifactChanges;
-
-        const totalUnoptimizedTokens = isSimulation
-          ? unoptimizedPerCandidateTokens * k
-          : explicitBaselineTokens !== null && usageComplete
-            ? explicitBaselineTokens
-            : null;
-        const totalTokensSaved =
-          totalActualTokens !== null && totalUnoptimizedTokens !== null
-            ? Math.max(0, totalUnoptimizedTokens - totalActualTokens)
-            : null;
-        const totalTokensSavedPct =
-          totalTokensSaved !== null && totalUnoptimizedTokens !== null
-            ? Number(((totalTokensSaved / Math.max(1, totalUnoptimizedTokens)) * 100).toFixed(1))
-            : null;
-
-        let createdReceipt = null;
-        if (!isSimulation && winner.passedVerification) {
-          const rcpt = this.createEvaluationReceipt({
-            taskId,
-            candidateId: winner.candidateId,
-            domain,
-            evaluatorId: resolvedVerif.id || 'custom-evaluator',
-            score: winner.verificationScore,
-            passed: true,
-            artifactHashes: verifiedArtifactHashes,
-            providerCalls: totalProviderCalls,
-            actualTokens: totalActualTokens,
-            synthetic: false,
-          });
-          if (rcpt && rcpt.ok) {
-            createdReceipt = rcpt;
-          }
-        }
-
-        const effectiveRecordStatus = !isSimulation && createdReceipt ? 'active' : 'candidate';
-        const composedHarness = {
-          harness_id: `harness-${domain}-${taskId}`,
-          task_id: taskId,
-          domain,
-          winning_candidate_id: winner.candidateId,
-          composed_fronts: ['invariant', 'domain-specific'],
-          reasoning_depth_profile: {
-            reasoningDepth: profile.reasoningDepth,
-            thinkingBudgetTokens: profile.thinkingBudgetTokens,
-            maxCandidateTokens: profile.maxCandidateTokens,
-            maxProbeSteps: profile.maxProbeSteps,
-            proberModelTier: profile.proberModelTier,
-            composerModelTier: profile.composerModelTier,
-            ragSnippetMaxChars: profile.ragSnippetMaxChars,
-            earlyStopOnFirstPass: profile.earlyStopOnFirstPass,
-          },
-          token_efficiency: {
-            totalActualTokens,
-            observedSubtotal,
-            usageComplete,
-            unknownComponents,
-            totalUnoptimizedTokens,
-            totalTokensSaved,
-            totalTokensSavedPct,
-          },
-          editable_components: {
-            system_prompts:
-              `Use Cue-First RAG retrieval (${profile.ragSnippetMaxChars} char snippet cap) and bounded thinking (${profile.thinkingBudgetTokens} tokens) before editing.`,
-            rules: ['plugin/harness-ide/rules/AGENTS.md'],
-            skills: [
-              'plugin/harness-ide/skills/harness2-loop/SKILL.md',
-              'plugin/harness-ide/skills/qmd-knowledge-lifecycle/SKILL.md',
-            ],
-            subagents: [
-              `harness-proposer (model: ${profile.proberModelTier})`,
-              `harness-prober (Workspace: branch, model: ${profile.proberModelTier}, thinkingCap: ${profile.thinkingBudgetTokens})`,
-              `harness-composer (model: ${profile.composerModelTier})`,
-            ],
-            hooks: {
-              SessionStart: 'scripts/hooks/session-start.mjs',
-              PreInvocation: 'scripts/hooks/pre-invocation.mjs',
-              PostToolUse: 'scripts/hooks/post-tool-use.mjs',
+            outputTreeDigest: sourceTreeDigest,
+            treeDiff: {
+              added: [],
+              modified: [],
+              deleted: [],
+              modeChanged: [],
+              inputTreeDigest: sourceTreeDigest,
+              outputTreeDigest: sourceTreeDigest,
             },
-            tools: ['harness_query', 'harness_get', 'harness_snapshot_lock', 'harness_run_loop', 'harness_record_experience'],
-            scripts: ['adapters/harness2_antigravity_executor.py', 'test/harness-ide.test.mjs'],
-            plugins: ['harness-ide'],
-          },
-          adopted_at: new Date().toISOString(),
-          git_revision: this.getGitRevision(),
-          status: effectiveRecordStatus,
-          synthetic: isSimulation,
-          receipt_id: createdReceipt?.receiptId || null,
-        };
+          };
 
-        let recordedExperience = null;
-        if (recordToLibrary) {
-          const savingsLabel =
-            totalTokensSavedPct !== null ? ` · ${totalTokensSavedPct}% Tokens Saved` : '';
-          recordedExperience = this.recordExperience({
+        // F03: Post-integration verification on workspaceRoot after winner materialization
+        const finishAfterPostIntegration = (postIntegrationEval) => {
+          if (postIntegrationEval && !postIntegrationEval.passed) {
+            restoreWorkspaceBaseline();
+            return persistLoopRequestResult({
+              ok: false,
+              status: 'failed',
+              error: 'POST_INTEGRATION_VERIFICATION_FAILED',
+              detail: postIntegrationEval.error || 'Post-integration verifier failed on workspaceRoot',
+              passedVerification: false,
+              verificationScore: postIntegrationEval.score ?? 0,
+              synthetic: false,
+              usedTokens: totalActualTokens,
+              usage: usageSummary,
+              providerCalls: totalProviderCalls,
+              artifactChanges: 0,
+              executionMode: 'evaluated',
+              sourceTreeDigest,
+              runId,
+              completedAt: new Date().toISOString(),
+              taskId,
+              domain,
+              problem,
+              k,
+              mode,
+              snapshotId,
+              reasoningProfile: profile,
+              candidates,
+              proposals: candidates,
+              probeTrajectories,
+              trajectories: probeTrajectories,
+              winnerCandidateId: null,
+              winnerScore: 0,
+              winner: {
+                candidateId: null,
+                score: 0,
+                verificationScore: 0,
+                passedVerification: false,
+                totalTokens: winner.totalTokens,
+              },
+              tokenEfficiency: {
+                totalActualTokens,
+                observedSubtotal,
+                usageComplete,
+                unknownComponents,
+                totalUnoptimizedTokens: null,
+                totalTokensSaved: null,
+                totalTokensSavedPct: null,
+                earlyStopped: false,
+              },
+              composedHarness: null,
+              recordedLesson: null,
+              adoptedExperience: null,
+              recordedExperience: null,
+              receiptId: null,
+              evalReceiptId: null,
+              evaluationReceipt: null,
+            });
+          }
+
+          const verifiedArtifactHashes = { ...(winnerArtifactState.hashes || {}) };
+          for (const reqFile of requiredArtifacts) {
+            const relStr = String(reqFile).replace(/\\/g, '/');
+            const absReq = path.resolve(this.workspaceRoot, relStr);
+            if (this._isPathInsideWorkspace(absReq) && fs.existsSync(absReq) && fs.statSync(absReq).isFile()) {
+              verifiedArtifactHashes[relStr] = crypto
+                .createHash('sha256')
+                .update(fs.readFileSync(absReq))
+                .digest('hex');
+            }
+          }
+          const artifactChanges = winnerArtifactState.changes || maxArtifactChanges;
+          const changeKind = artifactChanges > 0 ? 'modified' : 'verified_no_change';
+
+          const totalUnoptimizedTokens = isSimulation
+            ? unoptimizedPerCandidateTokens * k
+            : explicitBaselineTokens !== null && usageComplete
+              ? explicitBaselineTokens
+              : null;
+          const totalTokensSaved =
+            totalActualTokens !== null && totalUnoptimizedTokens !== null
+              ? Math.max(0, totalUnoptimizedTokens - totalActualTokens)
+              : null;
+          const totalTokensSavedPct =
+            totalTokensSaved !== null && totalUnoptimizedTokens !== null
+              ? Number(((totalTokensSaved / Math.max(1, totalUnoptimizedTokens)) * 100).toFixed(1))
+              : null;
+
+          const winnerEval =
+            Array.isArray(evalResults) && winnerIdx >= 0 ? evalResults[winnerIdx] : null;
+          const combinedChecks = [
+            ...(Array.isArray(winnerEval?.checks) && winnerEval.checks.length > 0
+              ? winnerEval.checks
+              : [{ name: resolvedVerif.id || 'candidate-verifier', passed: true }]),
+            ...(postIntegrationEval
+              ? [{ name: 'post_integration', phase: 'post_integration', passed: true }]
+              : []),
+          ];
+
+          let createdReceipt = null;
+          if (!isSimulation && winner.passedVerification) {
+            const rcpt = this.createEvaluationReceipt({
+              taskId,
+              candidateId: winner.candidateId,
+              domain,
+              evaluatorId: resolvedVerif.id || 'custom-evaluator',
+              phase: 'post_integration',
+              score: winner.verificationScore,
+              passed: true,
+              changeKind,
+              inputTreeHash: sourceTreeDigest,
+              outputTreeHash: winnerArtifactState.outputTreeDigest || sourceTreeDigest,
+              artifactHashes: verifiedArtifactHashes,
+              checks: combinedChecks,
+              providerCalls: totalProviderCalls,
+              actualTokens: totalActualTokens,
+              synthetic: false,
+            });
+            if (rcpt && rcpt.ok) {
+              createdReceipt = rcpt;
+            }
+          }
+
+          const effectiveRecordStatus = !isSimulation && createdReceipt ? 'active' : 'candidate';
+          const composedHarness = {
+            harness_id: `harness-${domain}-${taskId}`,
             task_id: taskId,
             domain,
-            title: `EXPERIENCE: ${taskId} (Harness² ${profile.reasoningDepth.toUpperCase()}${savingsLabel})`,
-            cue: `When tackling '${problem.slice(0, 90)}' in '${domain}', use ${winner.candidateId} with ${profile.reasoningDepth} reasoning depth (thinkingCap=${profile.thinkingBudgetTokens}, model=${profile.proberModelTier}, Workspace=branch) to achieve score=${winner.verificationScore}.`,
-            problem,
-            observed_behavior:
-              `Contrastive evaluation across K=${k} candidates (${mode} mode) under frozen snapshot '${snapshotId}': ` +
-              `${winner.candidateId} (${winner.frontLabel}) achieved verified score ${winner.verificationScore} with 0 tool errors` +
-              (totalActualTokens !== null && totalUnoptimizedTokens !== null && totalTokensSaved !== null
-                ? ` while consuming ${totalActualTokens.toLocaleString()} total probe tokens vs ${totalUnoptimizedTokens.toLocaleString()} baseline tokens (${totalTokensSaved.toLocaleString()} tokens saved, -${totalTokensSavedPct}%).`
-                : totalActualTokens !== null
-                  ? ` while consuming ${totalActualTokens.toLocaleString()} total observed tokens.`
-                  : '.'),
-            supporting_evidence: [
-              ...(winner.evidencePaths || []),
-              'adapters/harness2_antigravity_executor.py',
-            ],
+            winning_candidate_id: winner.candidateId,
+            composed_fronts: ['invariant', 'domain-specific'],
+            reasoning_depth_profile: {
+              reasoningDepth: profile.reasoningDepth,
+              thinkingBudgetTokens: profile.thinkingBudgetTokens,
+              maxCandidateTokens: profile.maxCandidateTokens,
+              maxProbeSteps: profile.maxProbeSteps,
+              proberModelTier: profile.proberModelTier,
+              composerModelTier: profile.composerModelTier,
+              ragSnippetMaxChars: profile.ragSnippetMaxChars,
+              earlyStopOnFirstPass: profile.earlyStopOnFirstPass,
+            },
+            token_efficiency: {
+              totalActualTokens,
+              observedSubtotal,
+              usageComplete,
+              unknownComponents,
+              totalUnoptimizedTokens,
+              totalTokensSaved,
+              totalTokensSavedPct,
+            },
+            editable_components: {
+              system_prompts:
+                `Use Cue-First RAG retrieval (${profile.ragSnippetMaxChars} char snippet cap) and bounded thinking (${profile.thinkingBudgetTokens} tokens) before editing.`,
+              rules: ['plugin/harness-ide/rules/AGENTS.md'],
+              skills: [
+                'plugin/harness-ide/skills/harness2-loop/SKILL.md',
+                'plugin/harness-ide/skills/qmd-knowledge-lifecycle/SKILL.md',
+              ],
+              subagents: [
+                `harness-proposer (model: ${profile.proberModelTier})`,
+                `harness-prober (Workspace: branch, model: ${profile.proberModelTier}, thinkingCap: ${profile.thinkingBudgetTokens})`,
+                `harness-composer (model: ${profile.composerModelTier})`,
+              ],
+              hooks: {
+                SessionStart: 'scripts/hooks/session-start.mjs',
+                PreInvocation: 'scripts/hooks/pre-invocation.mjs',
+                PostToolUse: 'scripts/hooks/post-tool-use.mjs',
+              },
+              tools: ['harness_query', 'harness_get', 'harness_snapshot_lock', 'harness_run_loop', 'harness_record_experience'],
+              scripts: ['adapters/harness2_antigravity_executor.py', 'test/harness-ide.test.mjs'],
+              plugins: ['harness-ide'],
+            },
+            adopted_at: new Date().toISOString(),
+            git_revision: this.getGitRevision(),
             status: effectiveRecordStatus,
             synthetic: isSimulation,
+            receipt_id: createdReceipt?.receiptId || null,
+          };
+
+          let recordedExperience = null;
+          if (recordToLibrary) {
+            const savingsLabel =
+              totalTokensSavedPct !== null ? ` · ${totalTokensSavedPct}% Tokens Saved` : '';
+            recordedExperience = this.recordExperience({
+              task_id: taskId,
+              domain,
+              title: `EXPERIENCE: ${taskId} (Harness² ${profile.reasoningDepth.toUpperCase()}${savingsLabel})`,
+              cue: `When tackling '${problem.slice(0, 90)}' in '${domain}', use ${winner.candidateId} with ${profile.reasoningDepth} reasoning depth (thinkingCap=${profile.thinkingBudgetTokens}, model=${profile.proberModelTier}, Workspace=branch) to achieve score=${winner.verificationScore}.`,
+              problem,
+              observed_behavior:
+                `Contrastive evaluation across K=${k} candidates (${mode} mode) under frozen snapshot '${snapshotId}': ` +
+                `${winner.candidateId} (${winner.frontLabel}) achieved verified score ${winner.verificationScore} with 0 tool errors` +
+                (totalActualTokens !== null && totalUnoptimizedTokens !== null && totalTokensSaved !== null
+                  ? ` while consuming ${totalActualTokens.toLocaleString()} total probe tokens vs ${totalUnoptimizedTokens.toLocaleString()} baseline tokens (${totalTokensSaved.toLocaleString()} tokens saved, -${totalTokensSavedPct}%).`
+                  : totalActualTokens !== null
+                    ? ` while consuming ${totalActualTokens.toLocaleString()} total observed tokens.`
+                    : '.'),
+              supporting_evidence: [
+                ...(winner.evidencePaths || []),
+                'adapters/harness2_antigravity_executor.py',
+              ],
+              status: effectiveRecordStatus,
+              synthetic: isSimulation,
+              receiptId: createdReceipt?.receiptId || null,
+              tags: ['harness2', 'propose-probe-compose', `depth-${profile.reasoningDepth}`, 'token-efficient', domain],
+              adopted_harness: composedHarness,
+            });
+          }
+
+          const isEarlyStopped = probeTrajectories.some((p) => p.earlyStopped === true);
+          const runReport = persistLoopRequestResult({
+            ok: true,
+            status: isSimulation ? 'simulated' : 'succeeded',
+            synthetic: isSimulation,
+            executionMode: isSimulation ? 'simulation' : 'verified',
+            changeKind,
+            passedVerification: winner.passedVerification,
+            verificationScore: winner.verificationScore,
+            postIntegrationVerified: !isSimulation,
+            earlyStopped: isEarlyStopped,
+            usedTokens: totalActualTokens,
+            totalActualTokens,
+            totalUnoptimizedTokens,
+            tokenEfficiencyPct: totalTokensSavedPct,
+            usage: usageSummary,
+            sourceTreeDigest,
+            outputTreeDigest: winnerArtifactState.outputTreeDigest || sourceTreeDigest,
+            treeDiff: winnerArtifactState.treeDiff,
             receiptId: createdReceipt?.receiptId || null,
-            tags: ['harness2', 'propose-probe-compose', `depth-${profile.reasoningDepth}`, 'token-efficient', domain],
-            adopted_harness: composedHarness,
+            evaluationReceipt: createdReceipt || null,
+            evaluatorReceipt: createdReceipt || undefined,
+            artifactChanges,
+            providerCalls: totalProviderCalls,
+            runId,
+            completedAt: new Date().toISOString(),
+            taskId,
+            domain,
+            problem,
+            k,
+            mode,
+            snapshotId,
+            reasoningProfile: profile,
+            retrievedKnowledge: {
+              experienceCount: expHits.results.length,
+              projectAdrCount: projHits.results.length,
+              cues: retrievedCues,
+              adrs: retrievedAdrs,
+            },
+            baselineTrajectory,
+            candidates,
+            executedCandidates: activeProbes,
+            proposals: candidates,
+            probeTrajectories,
+            trajectories: probeTrajectories,
+            winnerCandidateId: winner.candidateId,
+            winnerScore: winner.verificationScore,
+            winner: {
+              candidateId: winner.candidateId,
+              candidateDir: winner.candidateDir,
+              score: winner.verificationScore,
+              verificationScore: winner.verificationScore,
+              passedVerification: winner.passedVerification,
+              totalTokens: winner.totalTokens,
+              synthetic: isSimulation,
+              receiptId: createdReceipt?.receiptId || null,
+              treeDiff: winnerArtifactState.treeDiff,
+            },
+            tokenEfficiency: {
+              totalActualTokens,
+              observedSubtotal,
+              usageComplete,
+              unknownComponents,
+              totalUnoptimizedTokens,
+              totalTokensSaved,
+              totalTokensSavedPct,
+              earlyStopped: probeTrajectories.some((p) => p.earlyStopped === true),
+              synthetic: isSimulation,
+            },
+            composedHarness,
+            recordedLesson: recordedExperience,
+            recordedExperience,
+            adoptedExperience: recordedExperience,
+          });
+
+          if (recordToLibrary) {
+            try {
+              fs.writeFileSync(this.lastRunPath, JSON.stringify(runReport, null, 2) + '\n', 'utf8');
+            } catch {}
+          }
+
+          return runReport;
+        };
+
+        if (!isSimulation && evaluator) {
+          const winnerCand = candidates[winnerIdx >= 0 ? winnerIdx : 0];
+          const winnerExecOut =
+            Array.isArray(execResult) && winnerIdx >= 0 ? execResult[winnerIdx] : execResult;
+          const postContext = {
+            ...probeContext,
+            workspaceRoot: this.workspaceRoot,
+            candidateDir: this.workspaceRoot,
+            rootWorkspaceRoot: this.workspaceRoot,
+            phase: 'post_integration',
+          };
+          const postCallArg = {
+            ...postContext,
+            ...winnerCand,
+            candidate: {
+              ...winnerCand,
+              id: winnerCand.candidateId,
+              candidateDir: this.workspaceRoot,
+            },
+            candidateIndex: winnerIdx >= 0 ? winnerIdx : 0,
+            candidateDir: this.workspaceRoot,
+            executorResult: winnerExecOut,
+            allExecutorResults: execResult,
+            phase: 'post_integration',
+          };
+          return chainMaybeAsync(evaluator(postCallArg, postContext), (rawPostOut) => {
+            const parsedPost = this._parseEvaluatorOutput(rawPostOut, passThreshold);
+            return finishAfterPostIntegration(parsedPost);
           });
         }
 
-        const isEarlyStopped = probeTrajectories.some((p) => p.earlyStopped === true);
-        const runReport = {
-          ok: true,
-          status: isSimulation ? 'simulated' : 'succeeded',
-          synthetic: isSimulation,
-          executionMode: isSimulation ? 'simulation' : 'verified',
-          passedVerification: winner.passedVerification,
-          verificationScore: winner.verificationScore,
-          earlyStopped: isEarlyStopped,
-          usedTokens: totalActualTokens,
-          totalActualTokens,
-          totalUnoptimizedTokens,
-          tokenEfficiencyPct: totalTokensSavedPct,
-          usage: usageSummary,
-          sourceTreeDigest,
-          receiptId: createdReceipt?.receiptId || null,
-          evaluationReceipt: createdReceipt || null,
-          evaluatorReceipt: createdReceipt || undefined,
-          artifactChanges,
-          providerCalls: totalProviderCalls,
-          runId,
-          completedAt: new Date().toISOString(),
-          taskId,
-          domain,
-          problem,
-          k,
-          mode,
-          snapshotId,
-          reasoningProfile: profile,
-          retrievedKnowledge: {
-            experienceCount: expHits.results.length,
-            projectAdrCount: projHits.results.length,
-            cues: retrievedCues,
-            adrs: retrievedAdrs,
-          },
-          baselineTrajectory,
-          candidates,
-          executedCandidates: activeProbes,
-          proposals: candidates,
-          probeTrajectories,
-          trajectories: probeTrajectories,
-          winnerCandidateId: winner.candidateId,
-          winnerScore: winner.verificationScore,
-          winner: {
-            candidateId: winner.candidateId,
-            candidateDir: winner.candidateDir,
-            score: winner.verificationScore,
-            verificationScore: winner.verificationScore,
-            passedVerification: winner.passedVerification,
-            totalTokens: winner.totalTokens,
-            synthetic: isSimulation,
-            receiptId: createdReceipt?.receiptId || null,
-          },
-          tokenEfficiency: {
-            totalActualTokens,
-            observedSubtotal,
-            usageComplete,
-            unknownComponents,
-            totalUnoptimizedTokens,
-            totalTokensSaved,
-            totalTokensSavedPct,
-            earlyStopped: probeTrajectories.some((p) => p.earlyStopped === true),
-            synthetic: isSimulation,
-          },
-          composedHarness,
-          recordedLesson: recordedExperience,
-          recordedExperience,
-          adoptedExperience: recordedExperience,
-        };
-
-        if (recordToLibrary) {
-          try {
-            fs.writeFileSync(this.lastRunPath, JSON.stringify(runReport, null, 2) + '\n', 'utf8');
-          } catch {}
-        }
-
-        return runReport;
+        return finishAfterPostIntegration(null);
       });
     };
 

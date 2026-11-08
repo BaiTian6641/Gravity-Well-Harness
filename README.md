@@ -53,7 +53,8 @@ Once installed, open the sidecar panel in Antigravity with one click:
 
 ### Smooth Workspace Switching
 - The top header includes an **Active Workspace Switcher** with **`⚡ Auto-Follow IDE`** enabled by default.
-- Whenever you switch workspaces or conversations in Antigravity IDE, the page smoothly transitions to the currently opened workspace (`GetAllCascadeTrajectories` + `resolveActiveWorkspace` + `window.sidecar.onWorkspaceChange` + hook telemetry).
+- Whenever you switch workspaces or conversations in Antigravity IDE, the page transitions to the currently active workspace via documented hook telemetry (`.harness/runtime/telemetry.json`) and registered workspace configurations.
+- For standalone local monitoring, launch `node sidecars/harness-ide-monitor/server.mjs` and open the authenticated URL written to `.harness/monitor-runtime.json`. The `[Harness² Swarm & RAG Monitor](sidecar://harness-ide-monitor/)` link is also available as an optional App sidecar navigation option.
 - If you open a brand-new project that does not yet have a `.harness/` directory, a 1-click **`✨ Initialize Gravity Well .harness/ Here`** banner lets you scaffold the 3 knowledge collections immediately.
 
 ### Five Interactive Tabs:

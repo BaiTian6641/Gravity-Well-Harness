@@ -2006,6 +2006,18 @@ export async function injectOrConveySwarmMessage(workspaceRoot, input = {}) {
     createdAt: nowIso,
     deliveredAt: null,
     replySummary: null,
+    payloadDigest: crypto
+      .createHash('sha256')
+      .update(
+        JSON.stringify({
+          fromAgent,
+          toAgent,
+          direction: messageType,
+          content,
+        }),
+        'utf8'
+      )
+      .digest('hex'),
   };
 
   if (
@@ -2053,8 +2065,30 @@ export async function injectOrConveySwarmMessage(workspaceRoot, input = {}) {
     workspaceRoot,
     () => {
       const bus = loadMessageBus(workspaceRoot);
+      bus.consumedPayloads =
+        bus.consumedPayloads && typeof bus.consumedPayloads === 'object'
+          ? bus.consumedPayloads
+          : {};
       const existing = bus.messages.find((m) => m && m.id === msgId);
       if (existing) {
+        const payloadConflict =
+          (existing.payloadDigest && existing.payloadDigest !== entry.payloadDigest) ||
+          (!existing.payloadDigest &&
+            (existing.content !== content ||
+              existing.fromAgent !== fromAgent ||
+              existing.toAgent !== toAgent ||
+              existing.direction !== messageType));
+        if (payloadConflict) {
+          return {
+            duplicate: true,
+            ok: false,
+            idempotentDuplicate: false,
+            status: 'conflict',
+            error: 'MESSAGE_ID_PAYLOAD_CONFLICT',
+            messageId: msgId,
+            busRevision: bus.revision,
+          };
+        }
         return {
           duplicate: true,
           ok: existing.status !== 'DELIVERY_FAILED',
@@ -2066,6 +2100,18 @@ export async function injectOrConveySwarmMessage(workspaceRoot, input = {}) {
         };
       }
       if (requestedId && Array.isArray(bus.consumedIds) && bus.consumedIds.includes(requestedId)) {
+        const prevDigest = bus.consumedPayloads?.[requestedId];
+        if (prevDigest && prevDigest !== entry.payloadDigest) {
+          return {
+            duplicate: true,
+            ok: false,
+            idempotentDuplicate: false,
+            status: 'conflict',
+            error: 'MESSAGE_ID_PAYLOAD_CONFLICT',
+            messageId: requestedId,
+            busRevision: bus.revision,
+          };
+        }
         const tombstoned = {
           id: requestedId,
           fromAgent,
@@ -2076,6 +2122,7 @@ export async function injectOrConveySwarmMessage(workspaceRoot, input = {}) {
           priority,
           reasoningDepth,
           content,
+          payloadDigest: entry.payloadDigest,
           workspaceRoot: path.resolve(workspaceRoot || process.cwd()),
           status: 'DELIVERED',
           dispatchState: 'recipient_acknowledged',
@@ -2093,6 +2140,9 @@ export async function injectOrConveySwarmMessage(workspaceRoot, input = {}) {
           message: tombstoned,
           busRevision: bus.revision,
         };
+      }
+      if (requestedId) {
+        bus.consumedPayloads[requestedId] = entry.payloadDigest;
       }
       bus.messages.unshift(entry);
       bus.revision = (bus.revision || 1) + 1;
@@ -3531,31 +3581,142 @@ export async function runSelfImprovementCoopCycle(
     content: `[Peer Cross-Verification from ${proberAModel} to ${proberBModel}] Verified isolated branch probe and token guardrail compliance.`,
   });
 
+  const heldOutVerifierId = options.heldOutVerifier ?? options.held_out_verifier ?? null;
+  const heldOutVerifierCmd =
+    options.heldOutVerifierCommand ??
+    options.held_out_verifier_command ??
+    options.heldOutCommand ??
+    options.held_out_command ??
+    null;
+  const heldOutArgs =
+    options.heldOutVerifierArgs ??
+    options.held_out_verifier_args ??
+    options.heldOutArgs ??
+    options.held_out_args ??
+    [];
+  const hasHeldOutVerifier = Boolean(heldOutVerifierId || heldOutVerifierCmd);
+
   // Step 2: Execute the Google Harness² Propose -> Probe -> Compose Loop
+  // Defer active library adoption until held-out verifier and efficiency gates pass
+  const deferLibraryAdoption = Boolean(
+    hasHeldOutVerifier || options.requireEfficiencyGain || options.require_efficiency_gain
+  );
   const loopResult = await ragEngine.runHarness2Loop({
     taskId,
     problem: taskDescription,
     domain,
     reasoningDepth,
-    k: Math.max(2, proberModels.length),
-    mode: 'sequential',
-    earlyStopOnFirstPass: true,
-    adoptWinner: recordToLibrary,
+    k: Number(options.k || Math.max(2, proberModels.length)),
+    mode: options.mode || 'sequential',
+    earlyStopOnFirstPass: options.earlyStopOnFirstPass ?? options.early_stop ?? true,
+    adoptWinner: Boolean(recordToLibrary && !deferLibraryAdoption),
+    record_to_library: Boolean(recordToLibrary && !deferLibraryAdoption),
     strictExecution: isStrict,
     allowSimulation: allowSim,
     executionMode: options.executionMode ?? options.execution_mode,
     demoMode: isDemo,
     executor: options.executor,
-    evaluator: options.evaluator,
+    executorId: options.executorId ?? options.executor_id,
+    executor_id: options.executor_id ?? options.executorId,
+    command: options.command ?? options.executorCommand ?? options.executor_command,
+    args: options.args ?? options.executorArgs ?? options.executor_args,
+    evaluator: options.evaluator ?? options.verifier,
+    verifierId:
+      options.verifierId ??
+      options.verifier_id ??
+      options.evaluatorId ??
+      options.evaluator_id,
+    verifier_id:
+      options.verifier_id ??
+      options.verifierId ??
+      options.evaluator_id ??
+      options.evaluatorId,
+    verifierCommand:
+      options.verifierCommand ??
+      options.verifier_command ??
+      options.validatorCmd ??
+      options.validator_cmd,
+    verifierArgs:
+      options.verifierArgs ??
+      options.verifier_args ??
+      options.validatorArgs ??
+      options.validator_args,
     requiredArtifacts: options.requiredArtifacts ?? options.required_artifacts,
+    requestId: options.requestId ?? options.request_id,
+    baselineTokens: options.baselineTokens ?? options.baseline_tokens,
+    passThreshold: options.passThreshold ?? options.pass_threshold,
   });
+
+  // Optional held-out regression / paired baseline gate (WP8 / WP10)
+  let heldOutCheckResult = null;
+  if (hasHeldOutVerifier && loopResult.ok && loopResult.passedVerification) {
+    let resolvedHeldOut = ragEngine.resolveVerifier(heldOutVerifierId || null, {
+      verifierCommand: heldOutVerifierCmd,
+      verifierArgs: heldOutArgs,
+    });
+    if (!resolvedHeldOut.ok && typeof heldOutVerifierId === 'string') {
+      resolvedHeldOut = ragEngine.resolveVerifier(null, {
+        verifierCommand: heldOutVerifierCmd || heldOutVerifierId,
+        verifierArgs: heldOutArgs,
+      });
+    }
+    if (resolvedHeldOut.ok && typeof resolvedHeldOut.fn === 'function') {
+      const rawHeld = await resolvedHeldOut.fn({
+        workspaceRoot,
+        candidateDir: workspaceRoot,
+        phase: 'held_out',
+        taskId,
+      });
+      heldOutCheckResult = ragEngine._parseEvaluatorOutput(rawHeld, 0.75);
+    } else {
+      heldOutCheckResult = {
+        passed: false,
+        score: 0,
+        error: resolvedHeldOut.error || 'HELD_OUT_VERIFIER_NOT_FOUND',
+      };
+    }
+  }
+
+  const requireEfficiencyGain = Boolean(
+    options.requireEfficiencyGain ?? options.require_efficiency_gain ?? false
+  );
+  const efficiencyGainSatisfied =
+    !requireEfficiencyGain ||
+    (typeof loopResult.tokenEfficiency?.totalTokensSaved === 'number' &&
+      loopResult.tokenEfficiency.totalTokensSaved > 0);
+  const heldOutSatisfied = !heldOutCheckResult || heldOutCheckResult.passed === true;
 
   const cycleVerified = Boolean(
     loopResult.ok === true &&
       loopResult.passedVerification === true &&
       !loopResult.synthetic &&
-      loopResult.receiptId
+      loopResult.receiptId &&
+      heldOutSatisfied &&
+      efficiencyGainSatisfied
   );
+
+  let adoptedExperience = loopResult.adoptedExperience || loopResult.recordedExperience || null;
+  if (recordToLibrary && deferLibraryAdoption && cycleVerified && !adoptedExperience) {
+    adoptedExperience = ragEngine.recordExperience({
+      task_id: taskId,
+      domain,
+      title: `EXPERIENCE: ${taskId} (Self-Improve Verified)`,
+      cue:
+        loopResult.winner?.cue ||
+        loopResult.winner?.distilledCue ||
+        `When tackling '${taskDescription.slice(0, 90)}' in '${domain}', apply verified self-improvement configuration.`,
+      problem: taskDescription,
+      observed_behavior: `Verified self-improvement cycle (score=${loopResult.verificationScore}) and passed held-out gate.`,
+      supporting_evidence: [loopResult.receiptId],
+      status: 'active',
+      synthetic: false,
+      receiptId: loopResult.receiptId,
+      adopted_harness: loopResult.composedHarness,
+    });
+    loopResult.adoptedExperience = adoptedExperience;
+    loopResult.recordedExperience = adoptedExperience;
+    loopResult.recordedLesson = adoptedExperience;
+  }
 
   // Step 3: Broadcast the newly adopted Self-Improvement Cue ONLY when verification actually succeeded (or in explicit demo mode)
   let cueBroadcast = null;
@@ -3569,7 +3730,7 @@ export async function runSelfImprovementCoopCycle(
       type: 'SELF_IMPROVE_CUE',
       priority: 'high',
       reasoningDepth,
-      content: `[Adopted Self-Improvement Lesson ${loopResult.adoptedExperience?.docid || 'EXP-RSI'}] Winner: ${loopResult.winner?.candidateId || 'none'} (score=${loopResult.winner?.score || 0}, saved=${loopResult.tokenEfficiency?.totalTokensSavedPct || 0}% tokens). Cue: ${loopResult.winner?.cue || loopResult.winner?.distilledCue || ''}`,
+      content: `[Adopted Self-Improvement Lesson ${adoptedExperience?.docid || 'EXP-RSI'}] Winner: ${loopResult.winner?.candidateId || 'none'} (score=${loopResult.winner?.score || 0}, saved=${loopResult.tokenEfficiency?.totalTokensSavedPct || 0}% tokens). Cue: ${loopResult.winner?.cue || loopResult.winner?.distilledCue || ''}`,
       executeTargetModel: false,
     });
     updatedCfg = saveHubConfig(workspaceRoot, {
@@ -3600,7 +3761,12 @@ export async function runSelfImprovementCoopCycle(
     status: cycleVerified ? 'succeeded' : allowSim && overallOk ? 'simulated' : 'failed',
     synthetic: Boolean(loopResult.synthetic || allowSim),
     passedVerification: cycleVerified,
-    receiptId: loopResult.receiptId || null,
+    heldOutPassed: heldOutCheckResult ? heldOutCheckResult.passed === true : null,
+    heldOutResult: heldOutCheckResult,
+    receiptId: cycleVerified ? loopResult.receiptId || null : null,
+    adoptedExperience,
+    recordedExperience: adoptedExperience,
+    recordedLesson: adoptedExperience,
     cycleNumber: updatedCfg.selfImprovement.completedCycles,
     taskId,
     task: taskDescription,
